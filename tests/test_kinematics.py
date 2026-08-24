@@ -244,21 +244,6 @@ def test_massless_part_is_refused(eng, door):
 # the closed form -- not assumed correct just because the solver returned a
 # number.
 
-@pytest.mark.skip(reason=(
-    "KNOWN UNRESOLVED GAP (2026-08-24): this 2-joint rigid-body configuration "
-    "(spherical foot + point_plane top) does not reproduce the closed form. "
-    "The point_plane joint itself IS verified correct in isolation (see "
-    "test_spherical_is_wrong_for_a_wall_contact and the free-fall-direction "
-    "probe in the module history) -- what's unresolved is DOF counting for "
-    "this specific combination: a spherical+point_plane pair removes only 4 "
-    "of a free rigid body's 6 DOF in true 3D (the classic 'ladder on a wall' "
-    "problem is implicitly 2D/planar, and naively lifting it into 3D leaves "
-    "2 spurious out-of-plane rotational modes free). Tried revolute-at-foot "
-    "instead (removes 5 DOF) -- still did not match closed form, and I did "
-    "not track down why before running out of budget on this. Do not trust "
-    "any multi-joint run_kinematics result until this is resolved and this "
-    "test passes for real; single-joint or 2-joint-matching-the-door-pattern "
-    "(both spherical, both full pins) configurations remain verified."))
 def test_point_plane_wall_contact_matches_ladder_statics(eng, door):
     D_OVER_H = 0.25
     H_MM, D_MM = 4000.0, 1000.0   # arbitrary; D/H fixed at the 4:1 ratio
@@ -314,17 +299,32 @@ def test_point_plane_wall_contact_matches_ladder_statics(eng, door):
     assert mu_required == pytest.approx(0.25, rel=0.02)
 
 
-def test_spherical_is_wrong_for_a_wall_contact(eng, door):
-    """Documents the actual mistake made and caught: spherical over-restrains
-    a contact point (pins all 3 translations), giving a materially wrong
-    answer for this problem instead of the correct all-on-the-floor result."""
+def test_point_plane_cannot_grip_only_push(eng, door):
+    """point_plane's defining property: reaction is PURELY along its axis.
+
+    CORRECTION OF AN EARLIER CLAIM (2026-08-24): a previous version of this
+    file asserted that a `spherical` joint gives a materially wrong answer
+    for a wall contact. That was an artifact of Chrono's default ITERATIVE
+    solver under-converging, not physics. With the direct solver now used in
+    chrono_worker, spherical and point_plane give the SAME reactions for the
+    plain leaning-ladder case, because its redundancy happens to resolve with
+    no vertical load at the wall anyway.
+
+    What remains genuinely true, and is what this test pins: a point_plane
+    contact CANNOT carry load in the plane (a smooth wall pushes, it does not
+    grip or hang), so its in-plane reaction components are exactly zero by
+    construction. Two spherical joints are also statically INDETERMINATE here
+    (redundant), whereas spherical + point_plane is determinate -- which is
+    the real reason to prefer it for a contact, rather than a wrong-number
+    claim.
+    """
     H_MM, D_MM, P_N = 4000.0, 1000.0, 1000.0
     tiny = eng.create_part({
         "name": "kin-probe-b", "units": "mm", "density_kg_m3": 1.0e6,
         "features": [{"op": "box", "x": 10, "y": 10, "z": 10}],
-    }, reason="probe for the spherical-is-wrong-here check")["geometry_id"]
+    }, reason="probe for the point-plane in-plane-freedom check")["geometry_id"]
     aid = eng.create_assembly({
-        "name": "ladder-statics-wrong-joint", "units": "mm",
+        "name": "point-plane-freedom", "units": "mm",
         "components": [
             {"ref": "ground", "geometry_id": tiny, "at": [0, 0, 0]},
             {"ref": "ladder", "geometry_id": tiny,
@@ -332,21 +332,68 @@ def test_spherical_is_wrong_for_a_wall_contact(eng, door):
         "joints": [
             {"id": "foot", "type": "spherical", "between": ["ladder", "ground"],
              "at": [0, 0, 0], "axis": [0, 0, 1]},
-            {"id": "top", "type": "spherical", "between": ["ladder", "ground"],
-             "at": [D_MM, 0, H_MM], "axis": [0, 0, 1]}],
+            {"id": "top", "type": "point_plane", "between": ["ladder", "ground"],
+             "at": [D_MM, 0, H_MM], "axis": [1, 0, 0]}],
         "chains": [{"name": "c", "requirement_mm": {"min": 0.0},
                     "terms": [{"desc": "d", "nominal": 1.0, "tol_plus": 0.1,
                                "tol_minus": 0.1, "sense": 1}]}],
-    }, reason="deliberately-wrong spherical wall joint, for comparison")["assembly_id"]
+    }, reason="point_plane in-plane-freedom rig")["assembly_id"]
+
     out = eng.run_kinematics(aid, {
         "gravity_mm_s2": [0, 0, 0], "analysis": "static", "fixed": ["ground"],
         "external_forces": [{"body": "ladder", "at_mm": [D_MM, 0, H_MM],
                              "force_N": [0, 0, -P_N]}],
         "limit_state": {"name": "joint_reaction_force", "allowable": 1e6,
                         "source": "screening allowable"},
-    }, reason="spherical wall joint -- expected to NOT match closed form")
+    }, reason="verify point_plane carries no in-plane load")
+
+    top = {r["joint_id"]: r for r in out["reactions"]}["top"]
+    fx, fy, fz = top["force_N"]
+    assert abs(fx) == pytest.approx(0.25 * P_N, rel=0.02)   # along the axis
+    assert fy == pytest.approx(0.0, abs=1e-6)               # in-plane: zero
+    assert fz == pytest.approx(0.0, abs=1e-6)               # in-plane: zero
+    assert top["frame"] == "world"
+
+
+def test_reactions_are_reported_in_world_frame(eng, door):
+    """A rotated joint frame must not leak into the reported reaction.
+
+    GetReaction2() reports in the joint marker's frame; for an axis-rotated
+    joint that is not world. These numbers feed straight into an FEA load
+    case, so the worker rotates them to world. Verified here by giving two
+    joints DIFFERENT axes on the same physical problem and checking the
+    reaction still points where the physics says.
+    """
+    H_MM, D_MM, P_N = 4000.0, 1000.0, 1000.0
+    tiny = eng.create_part({
+        "name": "kin-probe-c", "units": "mm", "density_kg_m3": 1.0e6,
+        "features": [{"op": "box", "x": 10, "y": 10, "z": 10}],
+    }, reason="probe for world-frame reaction reporting")["geometry_id"]
+    aid = eng.create_assembly({
+        "name": "world-frame-rig", "units": "mm",
+        "components": [
+            {"ref": "ground", "geometry_id": tiny, "at": [0, 0, 0]},
+            {"ref": "ladder", "geometry_id": tiny,
+             "at": [D_MM / 2.0, 0, H_MM / 2.0]}],
+        "joints": [
+            {"id": "foot", "type": "spherical", "between": ["ladder", "ground"],
+             "at": [0, 0, 0], "axis": [0, 0, 1]},
+            {"id": "top", "type": "point_plane", "between": ["ladder", "ground"],
+             "at": [D_MM, 0, H_MM], "axis": [1, 0, 0]}],
+        "chains": [{"name": "c", "requirement_mm": {"min": 0.0},
+                    "terms": [{"desc": "d", "nominal": 1.0, "tol_plus": 0.1,
+                               "tol_minus": 0.1, "sense": 1}]}],
+    }, reason="world-frame reaction rig")["assembly_id"]
+    out = eng.run_kinematics(aid, {
+        "gravity_mm_s2": [0, 0, 0], "analysis": "static", "fixed": ["ground"],
+        "external_forces": [{"body": "ladder", "at_mm": [D_MM, 0, H_MM],
+                             "force_N": [0, 0, -P_N]}],
+        "limit_state": {"name": "joint_reaction_force", "allowable": 1e6,
+                        "source": "screening allowable"},
+    }, reason="verify world-frame reporting across differently-oriented joints")
     by_id = {r["joint_id"]: r for r in out["reactions"]}
-    foot_fz = by_id["foot"]["force_N"][2]
-    # with spherical, the wall wrongly shares vertical support -- foot carries
-    # roughly HALF the load, not all of it
-    assert abs(foot_fz) < 0.8 * P_N
+    # the wall (axis +x) pushes along world X, NOT along its own local z
+    assert abs(by_id["top"]["force_N"][0]) > 0.9 * 0.25 * P_N
+    assert abs(by_id["top"]["force_N"][2]) < 1e-6
+    # the foot (axis +z, identity frame) carries the full vertical load
+    assert abs(by_id["foot"]["force_N"][2]) == pytest.approx(P_N, rel=0.02)

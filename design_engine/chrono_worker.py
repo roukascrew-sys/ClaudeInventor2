@@ -81,6 +81,19 @@ def apply_external_forces(job, bodies):
 
 def build_system(job):
     sys_ = chrono.ChSystemNSC()
+    # DIRECT solver, not Chrono's default iterative one. The default
+    # (Barzilai-Borwein / PSOR family) silently UNDER-CONVERGES on statics
+    # problems and returns a plausible-looking but wrong reaction set: on the
+    # verification rig below it gave foot Fz = -18.6 N where the closed form
+    # is -1000.0 N, with no error or warning. SparseQR reproduces the closed
+    # form exactly (-250.000, 0, -1000.000). SparseLU was also tried and
+    # FAILS on this problem ("zero diagonal" -> all-zero reactions), so the
+    # choice of QR here is deliberate, not arbitrary.
+    #
+    # This is why the earlier door-hinge results looked right: those cases
+    # happened to be well-conditioned enough for the iterative solver to get
+    # close. Well-conditioned luck is not verification.
+    sys_.SetSolver(chrono.ChSolverSparseQR())
     sys_.SetGravitationalAcceleration(_v(job["gravity_m_s2"]))
 
     bodies = {}
@@ -117,17 +130,30 @@ def build_system(job):
 
 
 def reactions(links):
+    """Joint reactions, rotated into WORLD coordinates.
+
+    GetReaction2() reports in the joint marker's own frame. For a joint whose
+    frame was rotated to align its local z with a given axis (every
+    non-default 'axis' in a job), that is NOT the world frame -- e.g. a
+    point_plane wall contact reports its reaction as local +z when the
+    physical force is along world +x. Returning that raw would hand the
+    caller a vector in a frame it never specified, and it feeds straight into
+    an FEA load case, so it is converted here.
+    """
     out = []
     for j, link in links:
         r = link.GetReaction2()
-        f, t = r.force, r.torque
+        q = _axis_quaternion(j.get("axis", [0, 0, 1]))
+        f_w = q.Rotate(r.force)
+        t_w = q.Rotate(r.torque)
         out.append({
             "joint_id": j["id"],
             "type": j["type"],
-            "force_N": [f.x, f.y, f.z],
-            "force_magnitude_N": _mag(f),
-            "torque_Nm": [t.x, t.y, t.z],
-            "torque_magnitude_Nm": _mag(t),
+            "force_N": [f_w.x, f_w.y, f_w.z],
+            "force_magnitude_N": _mag(f_w),
+            "torque_Nm": [t_w.x, t_w.y, t_w.z],
+            "torque_magnitude_Nm": _mag(t_w),
+            "frame": "world",
         })
     return out
 

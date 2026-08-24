@@ -306,61 +306,68 @@ D = H * D_over_H
 climber_N = DUTY_LB * 4.44822
 
 kin_asm = eng.create_assembly({
-    "name": "ladder-in-use", "units": "mm",
+    "name": "ladder-base-slip", "units": "mm",
     "components": [
-        {"ref": "ground", "geometry_id": rail, "at": [0, 0, -1000]},
-        {"ref": "ladder", "geometry_id": rail, "at": [0, 0, 0]},
+        {"ref": "ground", "geometry_id": rail, "at": [0, 0, -2000]},
+        {"ref": "ladder", "geometry_id": rail, "at": [D / 2.0, 0, H / 2.0]},
+    ],
+    "joints": [
+        # foot: full pin on a rough floor -- carries both the normal force and
+        # the friction force we are solving for.
+        {"id": "foot", "type": "spherical", "between": ["ladder", "ground"],
+         "at": [0, 0, 0], "axis": [0, 0, 1]},
+        # wall: SMOOTH vertical surface. point_plane, not spherical -- a wall
+        # pushes along its normal and cannot grip or carry vertical friction.
+        {"id": "wall", "type": "point_plane", "between": ["ladder", "ground"],
+         "at": [D, 0, H], "axis": [1, 0, 0]},
     ],
     "chains": [{"name": "placeholder", "requirement_mm": {"min": 0.0},
                 "terms": [{"desc": "d", "nominal": 1.0, "tol_plus": 0.1,
                            "tol_minus": 0.1, "sense": 1}]}],
-    "joints": [
-        {"id": "foot", "type": "spherical", "between": ["ladder", "ground"],
-         "at": [0, 0, 0], "axis": [0, 0, 1]},
-        {"id": "top", "type": "spherical", "between": ["ladder", "ground"],
-         "at": [D, 0, H], "axis": [0, 0, 1]},
-    ],
 }, reason=(
-    f"ladder leaning at the OSHA 4:1 angle ({math.degrees(theta_from_vertical):.2f} "
-    f"deg from vertical), foot and top-support idealised as force-only "
-    f"(spherical) point constraints -- mirrors the verified door-on-2-hinges "
-    f"pattern exactly. Ladder body approximated by a single rail's mass "
-    f"(representative, not the full section's -- stated simplification)"))["assembly_id"]
+    f"base-slip check at the OSHA 4:1 leaning angle "
+    f"({math.degrees(theta_from_vertical):.2f} deg from vertical). Wall "
+    f"modelled as point_plane (pushes only); foot as a spherical pin on a "
+    f"rough floor. Ladder body approximated by one rail's mass -- stated "
+    f"simplification"))["assembly_id"]
 
 kin = eng.run_kinematics(kin_asm, {
     "gravity_mm_s2": [0, 0, -9810],
     "analysis": "static",
     "fixed": ["ground"],
+    "external_forces": [{"body": "ladder", "at_mm": [D, 0, H],
+                         "force_N": [0, 0, -climber_N]}],
     "limit_state": {
         "name": "joint_reaction_force",
         "allowable": 5000.0,
-        "source": "provisional screening allowable; this run computes the "
-                  "base-slip friction requirement, it is not itself a "
-                  "pass/fail structural gate",
+        "source": "screening allowable well above the expected reaction; this "
+                  "run COMPUTES the friction demand rather than gating on it",
     },
 }, reason=(
-    f"base-slip check: climber ({climber_N:.0f} N, full duty rating) "
-    f"idealised at the top support point (worst case per the closed-form "
-    f"moment balance). Predicted N_wall=F_floor=0.25*P="
-    f"{0.25*climber_N:.1f} N, N_floor=P={climber_N:.1f} N, "
-    f"mu_required=0.25"))
+    f"climber at full duty rating ({climber_N:.0f} N) at the top of the "
+    f"ladder (worst case for slip). Predicted (climber alone) N_floor="
+    f"{climber_N:.1f} N, F_floor=N_wall={0.25*climber_N:.1f} N, "
+    f"mu_required=0.25; the ladder's own weight adds vertical load at the "
+    f"foot and lowers mu slightly"))
 
 by_id = {r["joint_id"]: r for r in kin["reactions"]}
-N_floor_z = by_id["foot"]["force_N"][2]
-F_floor_x = by_id["foot"]["force_N"][0]
-N_wall_x = by_id["top"]["force_N"][0]
-mu_req = abs(F_floor_x) / abs(N_floor_z) if N_floor_z else float("inf")
-print(f"  foot reaction: F=({by_id['foot']['force_N'][0]:.1f}, "
-      f"{by_id['foot']['force_N'][1]:.1f}, {by_id['foot']['force_N'][2]:.1f}) N")
-print(f"  top reaction:  F=({by_id['top']['force_N'][0]:.1f}, "
-      f"{by_id['top']['force_N'][1]:.1f}, {by_id['top']['force_N'][2]:.1f}) N")
-print(f"  N_floor(z)={N_floor_z:.1f} N  (closed form {climber_N:.1f} N)")
-print(f"  F_floor(x)={F_floor_x:.1f} N  N_wall(x)={N_wall_x:.1f} N  "
-      f"(closed form both {0.25*climber_N:.1f} N)")
-print(f"  mu_required = {mu_req:.4f}  (closed form 0.2500)")
-print(f"  -> a rubber ladder foot (typical dry mu ~0.5-0.8 on most surfaces) "
-      f"has margin against slip at this angle and load; wet/oily/icy "
-      f"surfaces are a real, separate hazard this check does not clear.")
+foot, wall = by_id["foot"], by_id["wall"]
+N_floor = abs(foot["force_N"][2])
+F_floor = abs(foot["force_N"][0])
+N_wall = abs(wall["force_N"][0])
+mu_req = F_floor / N_floor
+print(f"  foot: F=({foot['force_N'][0]:9.2f}, {foot['force_N'][1]:7.2f}, "
+      f"{foot['force_N'][2]:9.2f}) N  [{foot['frame']}]")
+print(f"  wall: F=({wall['force_N'][0]:9.2f}, {wall['force_N'][1]:7.2f}, "
+      f"{wall['force_N'][2]:9.2f}) N  [{wall['frame']}]")
+print(f"  N_floor={N_floor:.2f} N  F_floor={F_floor:.2f} N "
+      f"(= N_wall {N_wall:.2f} N)  mu_required={mu_req:.4f}")
+print(f"  hand-check: (P*D + W_ladder*D/2)/H should equal N_wall")
+print(f"  -> mu_required {mu_req:.3f} is BELOW the 0.42 wet threshold ANSI "
+      f"A326.3 sets for level walkway surfaces. That is an INDICATIVE "
+      f"comparison only: A326.3 is a flooring standard, not the "
+      f"ladder-shoe requirement in ANSI A14.2 (paywalled, not accessed). "
+      f"Wet/oily/icy surfaces remain a real hazard this does not clear.")
 
 # ---------------------------------------------------------------------------
 report = eng.generate_report()
