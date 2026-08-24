@@ -201,10 +201,14 @@ def generate_report(log: ActionLog, out_path: str | Path,
             if r["action"] not in ("create_part", "edit_part") or r["result"] != "pass":
                 continue
             det = _details(r)
+            diff_html = _fmt_diff(det.get("diff", []))
+            if det.get("addresses_failure_id") is not None:
+                diff_html += (f'<br><span class="mono">addresses failure '
+                              f'#{_esc(det["addresses_failure_id"])}</span>')
             change_rows.append([
                 _esc(r["id"]), _esc(r["timestamp"]), _esc(r["action"]),
                 f'<span class="mono">{_esc(r["geometry_version"])}</span>',
-                _fmt_diff(det.get("diff", [])), _esc(r["reason"] or "—")])
+                diff_html, _esc(r["reason"] or "—")])
 
         pending = [r for r in log.pending_actions() if r["id"] != action_id]
         pending_note = "" if not pending else (

@@ -109,7 +109,11 @@ class PartStore:
         return {"geometry_id": gid, "step_file_path": str(step_path),
                 "properties": props}
 
-    def edit_part(self, geometry_id: str, changes: dict, reason: str) -> dict:
+    def edit_part(self, geometry_id: str, changes: dict, reason: str,
+                  addresses_failure_id: int | None = None) -> dict:
+        """addresses_failure_id: id of the fail row this edit responds to —
+        the non-linear revert contract (never retry blind after a Validation
+        failure; reference the failure record instead)."""
         parent_row = self.log.latest_pass_for(str(geometry_id))
         action_id = self.log.open_action(
             "design", "edit_part", geometry_version=str(geometry_id),
@@ -119,6 +123,13 @@ class PartStore:
             reason = _check_reason(reason)
             if not isinstance(changes, dict) or not changes:
                 raise ValueError("'changes' must be a non-empty dict of path -> value")
+            if addresses_failure_id is not None:
+                ref = [r for r in self.log.rows(result="fail")
+                       if r["id"] == addresses_failure_id]
+                if not ref:
+                    raise ValueError(
+                        f"addresses_failure_id={addresses_failure_id} does not "
+                        f"reference an existing fail row in the log")
             parent = self.get_part(geometry_id)
             new_spec, diff = geometry.apply_changes(parent["spec"], changes)
             if new_spec == parent["spec"]:
@@ -134,8 +145,11 @@ class PartStore:
         prop_delta = {
             "volume_mm3": [parent["properties"]["volume_mm3"], props["volume_mm3"]],
         }
+        details = {"diff": diff, "property_delta": prop_delta,
+                   "parent": geometry_id, "properties": props}
+        if addresses_failure_id is not None:
+            details["addresses_failure_id"] = addresses_failure_id
         self.log.close_action(action_id, "pass", geometry_version=gid,
-                              details={"diff": diff, "property_delta": prop_delta,
-                                       "parent": geometry_id, "properties": props})
+                              details=details)
         return {"new_geometry_id": gid, "step_file_path": str(step_path),
                 "properties": props, "diff": diff}
