@@ -44,7 +44,7 @@ class DesignEngine:
         self.sourcing = SourcingTools(
             self.root, self.log, self.parts, self.production)
         self.viewer = ViewerTools(
-            self.root, self.log, self.parts, self.production)
+            self.root, self.log, self.parts, self.production, self.assemblies)
 
     # Phase 1 contracts
     def create_part(self, spec: dict, reason: str) -> dict:
@@ -72,6 +72,10 @@ class DesignEngine:
     def generate_viewer(self, geometry_id: str, reason: str,
                         out_path: str | Path | None = None) -> dict:
         return self.viewer.generate_viewer(geometry_id, reason, out_path)
+
+    def generate_assembly_viewer(self, assembly_id: str, reason: str,
+                                 out_path: str | Path | None = None) -> dict:
+        return self.viewer.generate_assembly_viewer(assembly_id, reason, out_path)
 
     def get_part(self, geometry_id: str) -> dict:
         return self.parts.get_part(geometry_id)

@@ -100,7 +100,7 @@ def test_stock_selection_picks_cheapest_usable_length(book):
     assert sel["total_usd"] == pytest.approx(8.19)
     assert sel["utilisation_pct"] == pytest.approx(82.02, abs=0.01)
     # a part thicker than the bar cannot be sourced from it
-    with pytest.raises(SourcingError, match="smaller than the required"):
+    with pytest.raises(SourcingError, match="cannot yield this part"):
         select_stock(bar, 25.0, 100.0, 1, 3.0)
     # nothing stocked is long enough for a 7 m blank
     with pytest.raises(SourcingError, match="no stocked length fits"):
@@ -214,3 +214,54 @@ def test_bom_spec_validation(eng, signed_gid):
     for spec, msg in bad_specs:
         with pytest.raises(SourcingError, match=msg):
             eng.generate_bom(signed_gid, spec, reason="must be rejected")
+
+
+# ---------- shape-aware stock fit, process lines (gaps found by the hinge test) ----------
+
+def test_stock_fit_depends_on_bar_shape(book):
+    """A single 'cross_section_mm' cannot express a flat or round bar."""
+    from design_engine.sourcing import cross_section_fits
+
+    flat = book["_by_sku"]["onlinemetals-10001"]      # 3.175 x 38.1 mm
+    ok, why = cross_section_fits(flat, 2.5, 32.0)     # hinge-leaf-shaped blank
+    assert ok and "flat bar" in why                   # wide part, thin bar: fits
+    assert not cross_section_fits(flat, 2.5, 45.0)[0]  # wider than the bar
+    assert not cross_section_fits(flat, 6.0, 20.0)[0]  # thicker than the bar
+
+    rnd = book["_by_sku"]["onlinemetals-4790"]        # 4.7625 mm dia
+    # a rectangular blank must fit the bar's DIAGONAL, not its side
+    assert not cross_section_fits(rnd, 3.5, 3.5)[0]   # diagonal 4.95 > 4.7625
+    assert cross_section_fits(rnd, 3.0, 3.0)[0]       # diagonal 4.24 < 4.7625
+    # a part that is itself round only needs the diameter covered
+    ok, why = cross_section_fits(rnd, 3.5, 3.5, blank_section="round")
+    assert ok and "round blank" in why
+
+
+def test_process_line_requires_a_cited_rate(eng, signed_gid):
+    """Machining cost is caller-supplied and must be cited, like material data."""
+    base = {"ref": "mill", "kind": "process", "per_assembly": 1,
+            "rate_usd_per_hr": 75.0, "minutes_each": 6.0,
+            "setup_minutes": 30.0,
+            "source": "local shop quote 2026-08-24, 3-axis mill, $75/hr"}
+
+    bom = eng.generate_bom(signed_gid, {"quantity": 10, "lines": [dict(base)]},
+                           reason="machining cost with a cited rate")
+    line = bom["lines"][0]
+    # 10 x 6 min run + 30 min setup = 90 min at $75/hr = $112.50
+    assert line["total_minutes"] == pytest.approx(90.0)
+    assert line["total_usd"] == pytest.approx(112.50)
+    assert bom["as_specified_total_usd"] == pytest.approx(112.50)
+
+    uncited = {k: v for k, v in base.items() if k != "source"}
+    with pytest.raises(SourcingError, match="does not invent manufacturing costs"):
+        eng.generate_bom(signed_gid, {"quantity": 1, "lines": [uncited]},
+                         reason="uncited rate must be refused")
+
+
+def test_unknown_line_keys_are_refused(eng, signed_gid):
+    """A typo'd key must not silently do nothing."""
+    with pytest.raises(SourcingError, match="unexpected keys"):
+        eng.generate_bom(signed_gid, {"quantity": 1, "lines": [
+            {"ref": "screws", "kind": "catalog", "sku": "boltdepot-23106",
+             "per_assembly": 1, "quantitiy": 5}]},   # typo
+            reason="typo'd key must be caught")

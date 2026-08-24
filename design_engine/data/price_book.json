@@ -1,0 +1,775 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-08-23",
+  "capture_method": "manual browser capture of public catalog pages (no supplier API; McMaster-Carr API deliberately not used per Gideon 2026-08-23)",
+  "currency": "USD",
+  "staleness_warn_days": 90,
+  "provenance_note": "Every price below was read off the supplier's public catalog page on the capture date and is quoted excluding tax and shipping. Prices are NOT live. Re-capture before committing to a purchase.",
+  "suppliers": {
+    "bolt_depot": {
+      "name": "Bolt Depot, Inc.",
+      "site": "https://boltdepot.com",
+      "note": "Published each/bag/bulk price breaks. Part numbers are Bolt Depot product numbers."
+    },
+    "online_metals": {
+      "name": "OnlineMetals.com",
+      "site": "https://www.onlinemetals.com",
+      "note": "Published cut-length pricing. Part numbers are OnlineMetals part IDs."
+    }
+  },
+  "items": [
+    {
+      "sku": "boltdepot-23106",
+      "supplier": "bolt_depot",
+      "part_number": "23106",
+      "description": "Metric socket cap screw, M6x1.0 x 20mm, class 12.9 alloy steel, zinc plated",
+      "kind": "catalog",
+      "function_class": "m6x20_capscrew_cl12.9",
+      "spec": {
+        "thread": "M6x1.0",
+        "length_mm": 20,
+        "grade": "class 12.9",
+        "finish": "zinc plated",
+        "head": "socket cap",
+        "standard": "ISO 4762 / DIN 912 pattern"
+      },
+      "price_breaks": [
+        {
+          "pack_qty": 1,
+          "pack_usd": 0.21
+        },
+        {
+          "pack_qty": 100,
+          "pack_usd": 17.48
+        },
+        {
+          "pack_qty": 1000,
+          "pack_usd": 157.0
+        }
+      ],
+      "source_url": "https://boltdepot.com/Metric_socket_cap_Zinc_plated_class_12.9_alloy_steel_6mm_x_1.0mm",
+      "captured_at": "2026-08-23"
+    },
+    {
+      "sku": "boltdepot-6540",
+      "supplier": "bolt_depot",
+      "part_number": "6540",
+      "description": "Metric socket cap screw, M6x1.0 x 20mm, class 12.9 alloy steel, black oxide finish",
+      "kind": "catalog",
+      "function_class": "m6x20_capscrew_cl12.9",
+      "spec": {
+        "thread": "M6x1.0",
+        "length_mm": 20,
+        "grade": "class 12.9",
+        "finish": "black oxide",
+        "head": "socket cap",
+        "standard": "ISO 4762 / DIN 912 pattern"
+      },
+      "substitution_caveat": "Black oxide is a conversion coating with essentially no sacrificial corrosion protection; zinc plating is sacrificial. Do not substitute for zinc in damp, outdoor, or washdown service without an added oil/wax coating.",
+      "price_breaks": [
+        {
+          "pack_qty": 1,
+          "pack_usd": 0.17
+        },
+        {
+          "pack_qty": 100,
+          "pack_usd": 11.2
+        },
+        {
+          "pack_qty": 1000,
+          "pack_usd": 98.6
+        }
+      ],
+      "source_url": "https://boltdepot.com/Metric_socket_cap_Class_12.9_alloy_steel_black_oxide_finish_6mm_x_1.0mm",
+      "captured_at": "2026-08-23"
+    },
+    {
+      "sku": "boltdepot-23108",
+      "supplier": "bolt_depot",
+      "part_number": "23108",
+      "description": "Metric socket cap screw, M6x1.0 x 25mm, class 12.9 alloy steel, zinc plated",
+      "kind": "catalog",
+      "function_class": "m6x25_capscrew_cl12.9",
+      "spec": {
+        "thread": "M6x1.0",
+        "length_mm": 25,
+        "grade": "class 12.9",
+        "finish": "zinc plated",
+        "head": "socket cap"
+      },
+      "price_breaks": [
+        {
+          "pack_qty": 1,
+          "pack_usd": 0.24
+        },
+        {
+          "pack_qty": 100,
+          "pack_usd": 20.06
+        },
+        {
+          "pack_qty": 1000,
+          "pack_usd": 181.0
+        }
+      ],
+      "source_url": "https://boltdepot.com/Metric_socket_cap_Zinc_plated_class_12.9_alloy_steel_6mm_x_1.0mm",
+      "captured_at": "2026-08-23"
+    },
+    {
+      "sku": "boltdepot-6541",
+      "supplier": "bolt_depot",
+      "part_number": "6541",
+      "description": "Metric socket cap screw, M6x1.0 x 25mm, class 12.9 alloy steel, black oxide finish",
+      "kind": "catalog",
+      "function_class": "m6x25_capscrew_cl12.9",
+      "spec": {
+        "thread": "M6x1.0",
+        "length_mm": 25,
+        "grade": "class 12.9",
+        "finish": "black oxide",
+        "head": "socket cap"
+      },
+      "substitution_caveat": "Black oxide offers essentially no sacrificial corrosion protection; see boltdepot-6540 note.",
+      "price_breaks": [
+        {
+          "pack_qty": 1,
+          "pack_usd": 0.18
+        },
+        {
+          "pack_qty": 100,
+          "pack_usd": 11.73
+        },
+        {
+          "pack_qty": 1000,
+          "pack_usd": 103.0
+        }
+      ],
+      "source_url": "https://boltdepot.com/Metric_socket_cap_Class_12.9_alloy_steel_black_oxide_finish_6mm_x_1.0mm",
+      "captured_at": "2026-08-23"
+    },
+    {
+      "sku": "boltdepot-6883",
+      "supplier": "bolt_depot",
+      "part_number": "6883",
+      "description": "Metric hex nut, M6x1.0, class 10.9 steel, zinc plated",
+      "kind": "catalog",
+      "function_class": "m6_hexnut",
+      "spec": {
+        "thread": "M6x1.0",
+        "grade": "class 10.9",
+        "finish": "zinc plated"
+      },
+      "price_breaks": [
+        {
+          "pack_qty": 1,
+          "pack_usd": 0.06
+        },
+        {
+          "pack_qty": 100,
+          "pack_usd": 4.2
+        },
+        {
+          "pack_qty": 1000,
+          "pack_usd": 37.0
+        }
+      ],
+      "source_url": "https://boltdepot.com/Metric_hex_nuts_Zinc_plated_class_10.9_steel",
+      "captured_at": "2026-08-23"
+    },
+    {
+      "sku": "boltdepot-27842",
+      "supplier": "bolt_depot",
+      "part_number": "27842",
+      "description": "Metric high collar lock washer, 6mm, zinc plated alloy steel",
+      "kind": "catalog",
+      "function_class": "m6_lockwasher",
+      "spec": {
+        "size": "6mm",
+        "type": "high collar split lock",
+        "finish": "zinc plated"
+      },
+      "price_breaks": [
+        {
+          "pack_qty": 1,
+          "pack_usd": 0.08
+        },
+        {
+          "pack_qty": 100,
+          "pack_usd": 5.33
+        },
+        {
+          "pack_qty": 1000,
+          "pack_usd": 49.0
+        }
+      ],
+      "source_url": "https://boltdepot.com/Metric_socket_cap_Zinc_plated_class_12.9_alloy_steel_6mm_x_1.0mm",
+      "captured_at": "2026-08-23"
+    },
+    {
+      "sku": "boltdepot-14827",
+      "supplier": "bolt_depot",
+      "part_number": "14827",
+      "description": "Metric high collar lock washer, 6mm, alloy steel black oxide finish",
+      "kind": "catalog",
+      "function_class": "m6_lockwasher",
+      "spec": {
+        "size": "6mm",
+        "type": "high collar split lock",
+        "finish": "black oxide"
+      },
+      "substitution_caveat": "Black oxide: no sacrificial corrosion protection; see boltdepot-6540 note.",
+      "price_breaks": [
+        {
+          "pack_qty": 1,
+          "pack_usd": 0.07
+        },
+        {
+          "pack_qty": 100,
+          "pack_usd": 3.27
+        },
+        {
+          "pack_qty": 1000,
+          "pack_usd": 27.7
+        }
+      ],
+      "source_url": "https://boltdepot.com/Metric_socket_cap_Class_12.9_alloy_steel_black_oxide_finish_6mm_x_1.0mm",
+      "captured_at": "2026-08-23"
+    },
+    {
+      "sku": "onlinemetals-10277",
+      "supplier": "online_metals",
+      "part_number": "10277",
+      "description": "1/2 in. carbon steel square bar, A36, hot rolled",
+      "kind": "stock",
+      "function_class": "square_bar_steel_a36",
+      "stock_form": "square_bar",
+      "spec": {
+        "cross_section_mm": 12.7,
+        "cross_section_in": 0.5,
+        "alloy": "A36",
+        "production": "hot rolled",
+        "yield_ksi": 48,
+        "yield_MPa_nominal": 331,
+        "ultimate_ksi": 58,
+        "ultimate_MPa_nominal": 400,
+        "weight_lb_per_ft": 0.86,
+        "material_source": "OnlineMetals product page mechanical properties for A36; the page also lists 'Density 8 g/cm^3', which is a rounded catalog value - its own 0.86 lb/ft for a 0.5 in square bar implies ~7.9 g/cm^3, and standard mild steel is 7.85 g/cm^3. Use 7.85 for mass and treat the catalog density as rounded."
+      },
+      "length_breaks": [
+        {
+          "length_in": 12,
+          "length_mm": 304.8,
+          "usd": 4.5,
+          "weight_lb": 0.86
+        },
+        {
+          "length_in": 24,
+          "length_mm": 609.6,
+          "usd": 4.8,
+          "weight_lb": 1.72
+        },
+        {
+          "length_in": 36,
+          "length_mm": 914.4,
+          "usd": 6.56,
+          "weight_lb": 2.58
+        },
+        {
+          "length_in": 48,
+          "length_mm": 1219.2,
+          "usd": 8.19,
+          "weight_lb": 3.44
+        },
+        {
+          "length_in": 72,
+          "length_mm": 1828.8,
+          "usd": 8.96,
+          "weight_lb": 5.16
+        },
+        {
+          "length_in": 96,
+          "length_mm": 2438.4,
+          "usd": 14.39,
+          "weight_lb": 6.88
+        },
+        {
+          "length_in": 120,
+          "length_mm": 3048.0,
+          "usd": 17.98,
+          "weight_lb": 8.6
+        },
+        {
+          "length_in": 240,
+          "length_mm": 6096.0,
+          "usd": 35.98,
+          "weight_lb": 17.2
+        }
+      ],
+      "source_url": "https://www.onlinemetals.com/en/buy/carbon-steel/0-5-carbon-steel-square-bar-a36-hot-rolled/pid/10277",
+      "captured_at": "2026-08-23"
+    },
+    {
+      "sku": "onlinemetals-10280",
+      "supplier": "online_metals",
+      "part_number": "10280",
+      "description": "3/4 in. carbon steel square bar, A36, hot rolled",
+      "kind": "stock",
+      "function_class": "square_bar_steel_a36",
+      "stock_form": "square_bar",
+      "spec": {
+        "cross_section_mm": 19.05,
+        "cross_section_in": 0.75,
+        "alloy": "A36",
+        "production": "hot rolled",
+        "yield_ksi": 48,
+        "yield_MPa_nominal": 331,
+        "ultimate_ksi": 58,
+        "ultimate_MPa_nominal": 400,
+        "weight_lb_per_ft": 1.92,
+        "material_source": "OnlineMetals product page mechanical properties for A36; see the density note on onlinemetals-10277."
+      },
+      "length_breaks": [
+        {
+          "length_in": 12,
+          "length_mm": 304.8,
+          "usd": 5.63,
+          "weight_lb": 1.92
+        },
+        {
+          "length_in": 24,
+          "length_mm": 609.6,
+          "usd": 10.95,
+          "weight_lb": 3.84
+        },
+        {
+          "length_in": 36,
+          "length_mm": 914.4,
+          "usd": 14.94,
+          "weight_lb": 5.76
+        },
+        {
+          "length_in": 48,
+          "length_mm": 1219.2,
+          "usd": 18.63,
+          "weight_lb": 7.68
+        },
+        {
+          "length_in": 72,
+          "length_mm": 1828.8,
+          "usd": 20.4,
+          "weight_lb": 11.52
+        },
+        {
+          "length_in": 96,
+          "length_mm": 2438.4,
+          "usd": 32.75,
+          "weight_lb": 15.36
+        },
+        {
+          "length_in": 120,
+          "length_mm": 3048.0,
+          "usd": 40.95,
+          "weight_lb": 19.2
+        },
+        {
+          "length_in": 240,
+          "length_mm": 6096.0,
+          "usd": 81.92,
+          "weight_lb": 38.4
+        }
+      ],
+      "source_url": "https://www.onlinemetals.com/en/buy/carbon-steel/0-75-carbon-steel-square-bar-a36-hot-rolled/pid/10280",
+      "captured_at": "2026-08-23"
+    },
+    {
+      "sku": "boltdepot-23075",
+      "supplier": "bolt_depot",
+      "part_number": "23075",
+      "description": "Metric socket cap screw, M4x0.7 x 8mm, class 12.9 alloy steel, zinc plated",
+      "kind": "catalog",
+      "function_class": "m4x8_capscrew_cl12.9",
+      "spec": {
+        "thread": "M4x0.7",
+        "length_mm": 8,
+        "grade": "class 12.9",
+        "finish": "zinc plated",
+        "head": "socket cap",
+        "standard": "ISO 4762 / DIN 912 pattern"
+      },
+      "price_breaks": [
+        {
+          "pack_qty": 1,
+          "pack_usd": 0.13
+        },
+        {
+          "pack_qty": 100,
+          "pack_usd": 10.76
+        },
+        {
+          "pack_qty": 1000,
+          "pack_usd": 99.0
+        }
+      ],
+      "source_url": "https://boltdepot.com/Metric_socket_cap_Zinc_plated_class_12.9_alloy_steel_4mm_x_0.7mm",
+      "captured_at": "2026-08-24"
+    },
+    {
+      "sku": "boltdepot-23077",
+      "supplier": "bolt_depot",
+      "part_number": "23077",
+      "description": "Metric socket cap screw, M4x0.7 x 10mm, class 12.9 alloy steel, zinc plated",
+      "kind": "catalog",
+      "function_class": "m4x10_capscrew_cl12.9",
+      "spec": {
+        "thread": "M4x0.7",
+        "length_mm": 10,
+        "grade": "class 12.9",
+        "finish": "zinc plated",
+        "head": "socket cap",
+        "standard": "ISO 4762 / DIN 912 pattern"
+      },
+      "price_breaks": [
+        {
+          "pack_qty": 1,
+          "pack_usd": 0.15
+        },
+        {
+          "pack_qty": 100,
+          "pack_usd": 10.89
+        },
+        {
+          "pack_qty": 1000,
+          "pack_usd": 100.0
+        }
+      ],
+      "source_url": "https://boltdepot.com/Metric_socket_cap_Zinc_plated_class_12.9_alloy_steel_4mm_x_0.7mm",
+      "captured_at": "2026-08-24"
+    },
+    {
+      "sku": "boltdepot-23079",
+      "supplier": "bolt_depot",
+      "part_number": "23079",
+      "description": "Metric socket cap screw, M4x0.7 x 12mm, class 12.9 alloy steel, zinc plated",
+      "kind": "catalog",
+      "function_class": "m4x12_capscrew_cl12.9",
+      "spec": {
+        "thread": "M4x0.7",
+        "length_mm": 12,
+        "grade": "class 12.9",
+        "finish": "zinc plated",
+        "head": "socket cap",
+        "standard": "ISO 4762 / DIN 912 pattern"
+      },
+      "price_breaks": [
+        {
+          "pack_qty": 1,
+          "pack_usd": 0.16
+        },
+        {
+          "pack_qty": 100,
+          "pack_usd": 11.06
+        },
+        {
+          "pack_qty": 1000,
+          "pack_usd": 102.0
+        }
+      ],
+      "source_url": "https://boltdepot.com/Metric_socket_cap_Zinc_plated_class_12.9_alloy_steel_4mm_x_0.7mm",
+      "captured_at": "2026-08-24"
+    },
+    {
+      "sku": "boltdepot-23082",
+      "supplier": "bolt_depot",
+      "part_number": "23082",
+      "description": "Metric socket cap screw, M4x0.7 x 16mm, class 12.9 alloy steel, zinc plated",
+      "kind": "catalog",
+      "function_class": "m4x16_capscrew_cl12.9",
+      "spec": {
+        "thread": "M4x0.7",
+        "length_mm": 16,
+        "grade": "class 12.9",
+        "finish": "zinc plated",
+        "head": "socket cap",
+        "standard": "ISO 4762 / DIN 912 pattern"
+      },
+      "price_breaks": [
+        {
+          "pack_qty": 1,
+          "pack_usd": 0.19
+        },
+        {
+          "pack_qty": 100,
+          "pack_usd": 11.74
+        },
+        {
+          "pack_qty": 1000,
+          "pack_usd": 108.0
+        }
+      ],
+      "source_url": "https://boltdepot.com/Metric_socket_cap_Zinc_plated_class_12.9_alloy_steel_4mm_x_0.7mm",
+      "captured_at": "2026-08-24"
+    },
+    {
+      "sku": "boltdepot-23080",
+      "supplier": "bolt_depot",
+      "part_number": "23080",
+      "description": "Metric socket cap screw, M4x0.7 x 20mm, class 12.9 alloy steel, zinc plated",
+      "kind": "catalog",
+      "function_class": "m4x20_capscrew_cl12.9",
+      "spec": {
+        "thread": "M4x0.7",
+        "length_mm": 20,
+        "grade": "class 12.9",
+        "finish": "zinc plated",
+        "head": "socket cap",
+        "standard": "ISO 4762 / DIN 912 pattern"
+      },
+      "price_breaks": [
+        {
+          "pack_qty": 1,
+          "pack_usd": 0.2
+        },
+        {
+          "pack_qty": 100,
+          "pack_usd": 13.24
+        },
+        {
+          "pack_qty": 1000,
+          "pack_usd": 122.0
+        }
+      ],
+      "source_url": "https://boltdepot.com/Metric_socket_cap_Zinc_plated_class_12.9_alloy_steel_4mm_x_0.7mm",
+      "captured_at": "2026-08-24"
+    },
+    {
+      "sku": "boltdepot-23078",
+      "supplier": "bolt_depot",
+      "part_number": "23078",
+      "description": "Metric socket cap screw, M4x0.7 x 25mm, class 12.9 alloy steel, zinc plated",
+      "kind": "catalog",
+      "function_class": "m4x25_capscrew_cl12.9",
+      "spec": {
+        "thread": "M4x0.7",
+        "length_mm": 25,
+        "grade": "class 12.9",
+        "finish": "zinc plated",
+        "head": "socket cap",
+        "standard": "ISO 4762 / DIN 912 pattern"
+      },
+      "price_breaks": [
+        {
+          "pack_qty": 1,
+          "pack_usd": 0.21
+        },
+        {
+          "pack_qty": 100,
+          "pack_usd": 14.5
+        },
+        {
+          "pack_qty": 1000,
+          "pack_usd": 133.0
+        }
+      ],
+      "source_url": "https://boltdepot.com/Metric_socket_cap_Zinc_plated_class_12.9_alloy_steel_4mm_x_0.7mm",
+      "captured_at": "2026-08-24"
+    },
+    {
+      "sku": "boltdepot-21705",
+      "supplier": "bolt_depot",
+      "part_number": "21705",
+      "description": "Metric hex nut, M4x0.7, class 10.9 steel, zinc plated",
+      "kind": "catalog",
+      "function_class": "m4_hexnut",
+      "spec": {
+        "thread": "M4x0.7",
+        "grade": "class 10.9",
+        "finish": "zinc plated"
+      },
+      "price_breaks": [
+        {
+          "pack_qty": 1,
+          "pack_usd": 0.05
+        },
+        {
+          "pack_qty": 100,
+          "pack_usd": 3.34
+        },
+        {
+          "pack_qty": 1000,
+          "pack_usd": 29.4
+        }
+      ],
+      "source_url": "https://boltdepot.com/Metric_hex_nuts_Zinc_plated_class_10.9_steel",
+      "captured_at": "2026-08-23"
+    },
+    {
+      "sku": "boltdepot-27840",
+      "supplier": "bolt_depot",
+      "part_number": "27840",
+      "description": "Metric high collar lock washer, 4mm, zinc plated alloy steel",
+      "kind": "catalog",
+      "function_class": "m4_lockwasher",
+      "spec": {
+        "size": "4mm",
+        "type": "high collar split lock",
+        "finish": "zinc plated"
+      },
+      "price_breaks": [
+        {
+          "pack_qty": 1,
+          "pack_usd": 0.06
+        },
+        {
+          "pack_qty": 100,
+          "pack_usd": 3.89
+        },
+        {
+          "pack_qty": 1000,
+          "pack_usd": 35.8
+        }
+      ],
+      "source_url": "https://boltdepot.com/Metric_socket_cap_Zinc_plated_class_12.9_alloy_steel_4mm_x_0.7mm",
+      "captured_at": "2026-08-24"
+    },
+    {
+      "sku": "onlinemetals-4790",
+      "supplier": "online_metals",
+      "part_number": "4790",
+      "description": "3/16 in. carbon steel round bar, 1018, cold finish",
+      "kind": "stock",
+      "function_class": "round_bar_steel_1018",
+      "stock_form": "round_bar",
+      "spec": {
+        "cross_section_mm": 4.7625,
+        "diameter_in": 0.1875,
+        "alloy": "1018",
+        "production": "cold finish",
+        "standard": "ASTM-A108",
+        "yield_ksi": 54,
+        "yield_MPa_nominal": 372,
+        "ultimate_ksi": 64,
+        "ultimate_MPa_nominal": 441,
+        "weight_lb_per_ft": 0.1,
+        "material_source": "OnlineMetals product page mechanical properties for 1018 cold finish (ASTM-A108). Catalog lists 'Density 8 g/cm^3', a rounded value; use 7.85 for mass.",
+        "price_note": "Page also showed a promotional 48in price of $3.29 on 2026-08-24; the regular $4.70 ladder is recorded here deliberately - a sale price is not a stable basis for costing."
+      },
+      "length_breaks": [
+        {
+          "length_in": 12,
+          "length_mm": 304.8,
+          "usd": 4.5,
+          "weight_lb": 0.1
+        },
+        {
+          "length_in": 24,
+          "length_mm": 609.6,
+          "usd": 4.55,
+          "weight_lb": 0.2
+        },
+        {
+          "length_in": 36,
+          "length_mm": 914.4,
+          "usd": 4.6,
+          "weight_lb": 0.3
+        },
+        {
+          "length_in": 48,
+          "length_mm": 1219.2,
+          "usd": 4.7,
+          "weight_lb": 0.4
+        },
+        {
+          "length_in": 72,
+          "length_mm": 1828.8,
+          "usd": 4.75,
+          "weight_lb": 0.6
+        },
+        {
+          "length_in": 96,
+          "length_mm": 2438.4,
+          "usd": 4.8,
+          "weight_lb": 0.8
+        },
+        {
+          "length_in": 144,
+          "length_mm": 3657.6,
+          "usd": 4.9,
+          "weight_lb": 1.2
+        }
+      ],
+      "source_url": "https://www.onlinemetals.com/en/buy/carbon-steel/0-1875-carbon-steel-round-bar-1018-cold-finish/pid/4790",
+      "captured_at": "2026-08-24"
+    },
+    {
+      "sku": "onlinemetals-10001",
+      "supplier": "online_metals",
+      "part_number": "10001",
+      "description": "1/8 in. x 1-1/2 in. carbon steel rectangle bar, A36 commercial quality, hot rolled",
+      "kind": "stock",
+      "function_class": "flat_bar_steel_a36",
+      "stock_form": "flat_bar",
+      "spec": {
+        "thickness_mm": 3.175,
+        "width_mm": 38.1,
+        "cross_section_mm": 3.175,
+        "thickness_in": 0.125,
+        "width_in": 1.5,
+        "alloy": "A36 (commercial quality hot rolled)",
+        "production": "hot rolled",
+        "weight_lb_per_ft": 0.64,
+        "material_source": "OnlineMetals product page; listed Type A36, commercial quality hot rolled."
+      },
+      "length_breaks": [
+        {
+          "length_in": 12,
+          "length_mm": 304.8,
+          "usd": 4.5,
+          "weight_lb": 0.64
+        },
+        {
+          "length_in": 24,
+          "length_mm": 609.6,
+          "usd": 4.96,
+          "weight_lb": 1.28
+        },
+        {
+          "length_in": 36,
+          "length_mm": 914.4,
+          "usd": 6.77,
+          "weight_lb": 1.92
+        },
+        {
+          "length_in": 48,
+          "length_mm": 1219.2,
+          "usd": 8.44,
+          "weight_lb": 2.56
+        },
+        {
+          "length_in": 72,
+          "length_mm": 1828.8,
+          "usd": 9.22,
+          "weight_lb": 3.84
+        },
+        {
+          "length_in": 96,
+          "length_mm": 2438.4,
+          "usd": 14.82,
+          "weight_lb": 5.12
+        },
+        {
+          "length_in": 120,
+          "length_mm": 3048.0,
+          "usd": 18.53,
+          "weight_lb": 6.4
+        },
+        {
+          "length_in": 240,
+          "length_mm": 6096.0,
+          "usd": 37.07,
+          "weight_lb": 12.8
+        }
+      ],
+      "source_url": "https://www.onlinemetals.com/en/buy/carbon-steel/0-125-x-1-5-carbon-steel-rectangle-bar-commercial-quality-hot-rolled/pid/10001",
+      "captured_at": "2026-08-24"
+    }
+  ]
+}

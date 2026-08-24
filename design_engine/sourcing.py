@@ -109,18 +109,57 @@ def cost_for_qty(item: dict, qty: int) -> dict:
     }
 
 
+def cross_section_fits(item: dict, a_mm: float, b_mm: float,
+                       blank_section: str = "rect") -> tuple[bool, str]:
+    """Can the part's two smaller dimensions be cut from this bar's section?
+
+    Depends on the stock's shape, so a single 'cross_section_mm' number is not
+    enough — a 38 mm wide flat bar can yield a 32 mm wide part despite being
+    3.2 mm thick, and a round bar must swallow the blank's DIAGONAL, not its
+    side. Returns (fits, explanation).
+    """
+    spec = item["spec"]
+    form = item.get("stock_form", "square_bar")
+    lo, hi = min(a_mm, b_mm), max(a_mm, b_mm)
+    if form == "flat_bar":
+        th, w = spec["thickness_mm"], spec["width_mm"]
+        ok = lo <= th + 1e-9 and hi <= w + 1e-9
+        return ok, (f"flat bar {th} x {w} mm vs blank {lo:.3f} x {hi:.3f} mm "
+                    f"(thickness must cover {lo:.3f}, width must cover {hi:.3f})")
+    if form == "round_bar":
+        d = spec["cross_section_mm"]
+        if blank_section == "round":
+            # part is itself round and coaxial with the bar: only the
+            # diameter must be covered, not the bounding-box diagonal
+            ok = hi <= d + 1e-9
+            return ok, (f"round bar dia {d} mm vs round blank dia {hi:.3f} mm "
+                        f"(declared blank_section='round')")
+        diag = math.hypot(lo, hi)
+        ok = diag <= d + 1e-9
+        return ok, (f"round bar dia {d} mm vs blank diagonal {diag:.3f} mm "
+                    f"(a rectangular blank needs the diagonal; if the part is "
+                    f"itself round, declare blank_section='round' on the line)")
+    cross = spec["cross_section_mm"]
+    ok = hi <= cross + 1e-9
+    return ok, f"square bar {cross} mm vs blank {lo:.3f} x {hi:.3f} mm"
+
+
 def select_stock(item: dict, required_cross_mm: float, required_length_mm: float,
-                 pieces: int, cut_allowance_mm: float) -> dict:
+                 pieces: int, cut_allowance_mm: float,
+                 blank_a_mm: float | None = None,
+                 blank_b_mm: float | None = None,
+                 blank_section: str = "rect") -> dict:
     """Cheapest purchasable stock length that yields `pieces` blanks.
 
     Nesting is 1-D: each blank consumes required_length + cut allowance, and
     only whole blanks are counted per bar (remainder is scrap).
     """
-    cross = item["spec"]["cross_section_mm"]
-    if cross < required_cross_mm - 1e-9:
+    a = blank_a_mm if blank_a_mm is not None else required_cross_mm
+    b = blank_b_mm if blank_b_mm is not None else required_cross_mm
+    fits, why = cross_section_fits(item, a, b, blank_section)
+    if not fits:
         raise SourcingError(
-            f"{item['sku']}: stock cross-section {cross} mm is smaller than the "
-            f"required {required_cross_mm} mm — cannot source this part from it")
+            f"{item['sku']}: stock section cannot yield this part - {why}")
     per_blank = required_length_mm + cut_allowance_mm
     options = []
     for br in item["length_breaks"]:
@@ -144,6 +183,54 @@ def select_stock(item: dict, required_cross_mm: float, required_length_mm: float
         100.0 * pieces * required_length_mm
         / (best["bars"] * best["length_mm"]), 2)
     return best
+
+
+def process_cost(line: dict, qty: int, ctx: str) -> dict:
+    """Cost of a manufacturing operation (machining, welding, finishing).
+
+    The engine has no shop-rate database and will not invent one: the caller
+    supplies the rate and the time, and MUST cite where they came from
+    (a quote, a shop's published rate, a measured cycle time). This mirrors
+    the rule that material properties must carry a `source` - an uncited
+    number that looks like a cost is exactly the sort of thing that ends up
+    in a decision unchallenged.
+
+    Setup is charged once for the batch; run time is charged per piece.
+    """
+    for key in ("rate_usd_per_hr", "minutes_each"):
+        v = line.get(key)
+        if not isinstance(v, (int, float)) or isinstance(v, bool) or v < 0:
+            raise SourcingError(f"{ctx}.{key}: non-negative number required, got {v!r}")
+    setup = line.get("setup_minutes", 0.0)
+    if not isinstance(setup, (int, float)) or isinstance(setup, bool) or setup < 0:
+        raise SourcingError(f"{ctx}.setup_minutes: non-negative number required")
+    src = line.get("source")
+    if not isinstance(src, str) or not src.strip():
+        raise SourcingError(
+            f"{ctx}.source: required - cite where the rate and cycle time come "
+            f"from (quote, published shop rate, measured time). This engine "
+            f"does not invent manufacturing costs.")
+    rate = float(line["rate_usd_per_hr"])
+    run_min = float(line["minutes_each"]) * qty
+    total_min = run_min + float(setup)
+    return {
+        "rate_usd_per_hr": rate,
+        "minutes_each": float(line["minutes_each"]),
+        "setup_minutes": float(setup),
+        "total_minutes": round(total_min, 4),
+        "qty_required": qty, "qty_purchased": qty, "overbuy": 0,
+        "total_usd": round(rate * total_min / 60.0, 4),
+        "source": src.strip(),
+    }
+
+
+_LINE_KEYS = {
+    "catalog": {"ref", "kind", "sku", "per_assembly"},
+    "stock": {"ref", "kind", "function_class", "per_assembly", "blank_section"},
+    "process": {"ref", "kind", "per_assembly", "rate_usd_per_hr",
+                "minutes_each", "setup_minutes", "source", "description",
+                "supplier", "function_class"},
+}
 
 
 class SourcingTools:
@@ -177,6 +264,11 @@ class SourcingTools:
 
     def _resolve_stock(self, book: dict, line: dict, pieces: int,
                        bbox_size: list, cut_allowance_mm: float) -> dict:
+        blank_section = line.get("blank_section", "rect")
+        if blank_section not in ("rect", "round"):
+            raise SourcingError(
+                f"line {line.get('ref')!r}: blank_section must be "
+                f"'rect' or 'round', got {blank_section!r}")
         candidates = [i for i in book["items"]
                       if i["kind"] == "stock"
                       and i["function_class"] == line.get("function_class")]
@@ -191,7 +283,9 @@ class SourcingTools:
         for item in candidates:
             try:
                 sel = select_stock(item, required_cross, required_length,
-                                   pieces, cut_allowance_mm)
+                                   pieces, cut_allowance_mm,
+                                   blank_a_mm=dims[0], blank_b_mm=dims[1],
+                                   blank_section=blank_section)
             except SourcingError:
                 continue
             priced.append((item, sel))
@@ -199,8 +293,7 @@ class SourcingTools:
             raise SourcingError(
                 f"line {line.get('ref')!r}: no stocked size in "
                 f"{[c['sku'] for c in candidates]} can yield a "
-                f"{required_cross:.2f} x {required_cross:.2f} x "
-                f"{required_length:.2f} mm blank")
+                f"{dims[0]:.2f} x {dims[1]:.2f} x {required_length:.2f} mm blank")
         item, sel = min(priced, key=lambda p: p[1]["total_usd"])
         return {
             "ref": line["ref"], "kind": "stock", "sku": item["sku"],
@@ -286,11 +379,31 @@ class SourcingTools:
                     raise SourcingError(
                         f"line {ref!r}: per_assembly must be a positive integer")
                 qty = per * assemblies
-                if line.get("kind") == "catalog":
+                kind = line.get("kind")
+                if kind in _LINE_KEYS:
+                    unknown = set(line) - _LINE_KEYS[kind]
+                    if unknown:
+                        raise SourcingError(
+                            f"line {ref!r} ({kind}): unexpected keys "
+                            f"{sorted(unknown)} - allowed: "
+                            f"{sorted(_LINE_KEYS[kind])}")
+                if kind == "catalog":
                     r = self._resolve_catalog(book, line, qty)
                     resolved.append(r)
                     min_cost_lines.append(self._min_cost_line(book, r, qty))
-                elif line.get("kind") == "stock":
+                elif kind == "process":
+                    r = {"ref": ref, "kind": "process",
+                         "sku": None, "supplier": line.get("supplier", "in-house"),
+                         "part_number": "-",
+                         "description": line.get("description", "process operation"),
+                         "function_class": line.get("function_class", "process"),
+                         "source_url": "", "captured_at": "-",
+                         **process_cost(line, qty, f"line {ref!r}")}
+                    resolved.append(r)
+                    min_cost_lines.append(
+                        {"ref": ref, "sku": None, "total_usd": r["total_usd"],
+                         "saving_usd": 0.0, "substituted": False})
+                elif kind == "stock":
                     r = self._resolve_stock(book, line, qty, bbox_size, cut_allowance)
                     resolved.append(r)
                     min_cost_lines.append(
@@ -298,8 +411,8 @@ class SourcingTools:
                          "saving_usd": 0.0, "substituted": False})
                 else:
                     raise SourcingError(
-                        f"line {ref!r}: kind must be 'catalog' or 'stock', "
-                        f"got {line.get('kind')!r}")
+                        f"line {ref!r}: kind must be 'catalog', 'stock' or "
+                        f"'process', got {line.get('kind')!r}")
 
             as_specified = round(sum(r["total_usd"] for r in resolved), 4)
             min_cost = round(sum(m["total_usd"] for m in min_cost_lines), 4)

@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design Engine - Signed-off Assembly Viewer</title>
+<style>
+  :root {
+    --bg: #06090f; --panel: rgba(10,18,28,0.88); --line: #1d3a52;
+    --accent: #35e0d0; --text: #d8e6f0; --muted: #7d93a6;
+    --warn: #e0b040; --ok: #46c46e; --bad: #e05a6a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden;
+               background: var(--bg); color: var(--text);
+               font-family: 'Segoe UI', system-ui, sans-serif; }
+  #stage { position: fixed; inset: 0; }
+  .panel { position: fixed; background: var(--panel);
+           border: 1px solid var(--line); border-radius: 6px;
+           backdrop-filter: blur(6px); font-size: 12px; }
+  #info { top: 16px; left: 16px; width: 350px; max-height: calc(100% - 32px);
+          overflow-y: auto; padding: 14px 16px; }
+  #info h1 { font-size: 15px; margin: 0 0 2px; color: var(--accent);
+             letter-spacing: 0.4px; }
+  #info h2 { font-size: 10px; margin: 16px 0 6px; color: var(--muted);
+             text-transform: uppercase; letter-spacing: 1.2px;
+             border-bottom: 1px solid var(--line); padding-bottom: 4px; }
+  .gid { font-family: Consolas, monospace; color: var(--muted);
+         font-size: 11px; margin-bottom: 10px; }
+  dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; }
+  dt { color: var(--muted); }
+  dd { margin: 0; text-align: right; font-family: Consolas, monospace; }
+  .comp { border-left: 3px solid var(--line); padding: 6px 0 6px 9px;
+          margin-bottom: 8px; cursor: pointer; }
+  .comp:hover { background: rgba(53,224,208,0.06); }
+  .comp.off { opacity: 0.4; }
+  .comp b { font-size: 12px; }
+  .comp .meta { color: var(--muted); font-family: Consolas, monospace;
+                font-size: 11px; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 10px;
+          font-size: 10px; font-weight: 700; letter-spacing: 0.5px; }
+  .pill.ok { background: rgba(70,196,110,0.16); color: var(--ok);
+             border: 1px solid var(--ok); }
+  .pill.bad { background: rgba(224,90,106,0.16); color: var(--bad);
+              border: 1px solid var(--bad); }
+  #hud { bottom: 16px; left: 16px; padding: 9px 14px; color: var(--muted); }
+  #hud b { color: var(--text); font-weight: 600; }
+  #readout { bottom: 16px; right: 16px; padding: 9px 14px;
+             font-family: Consolas, monospace; color: var(--accent); }
+  .note { color: var(--muted); font-size: 11px; line-height: 1.45;
+          margin-top: 6px; }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<div id="info" class="panel">
+  <h1 id="asmName">-</h1>
+  <div class="gid" id="asmId">-</div>
+  <div id="componentBlock"></div>
+  <div id="stackBlock"></div>
+  <h2>Provenance</h2>
+  <div class="note">
+    Every component shown is <b>signed off</b>; the render refuses entirely if
+    any one of them is unsigned or was edited after signing. All values come
+    from the FRACAS log. Parts are drawn at their declared assembly
+    translations - the v0 assembly schema carries no rotation, so this shows
+    placement, not a posed mechanism.
+  </div>
+</div>
+<div id="hud" class="panel">
+  <b>drag</b> orbit &nbsp; <b>shift+drag</b> pan &nbsp; <b>wheel</b> zoom
+  &nbsp;&nbsp; <b>R</b> reset &nbsp; <b>W</b> wireframe &nbsp;
+  <b>E</b> edges &nbsp; <b>G</b> grid &nbsp; <b>click a part</b> to isolate
+</div>
+<div id="readout" class="panel">-</div>
+
+<script>%%THREE_JS%%</script>
+<script>
+(function () {
+  "use strict";
+  var raw = atob("%%PAYLOAD%%");
+  var bytes = new Uint8Array(raw.length);
+  for (var i = 0; i < raw.length; i++) { bytes[i] = raw.charCodeAt(i); }
+  var D = JSON.parse(new TextDecoder("utf-8").decode(bytes));
+
+  var esc = function (s) {
+    return String(s).replace(/[&<>"]/g, function (c) {
+      return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c];
+    });
+  };
+
+  document.getElementById("asmName").textContent = D.assembly_name;
+  document.getElementById("asmId").textContent =
+    D.assembly_id + "  ·  " + D.components.length + " component(s)";
+
+  var PALETTE = [0x2f6f8f, 0x8f6f2f, 0x5f8f4f, 0x8f4f6f, 0x6f5f8f, 0x8f8f4f];
+
+  var scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x06090f);
+
+  var stage = document.getElementById("stage");
+  var renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  stage.appendChild(renderer.domElement);
+
+  var camera = new THREE.PerspectiveCamera(
+    45, window.innerWidth / window.innerHeight, 0.1, 50000);
+  camera.up.set(0, 0, 1);                 // CAD Z-up
+
+  var group = new THREE.Group();
+  scene.add(group);
+  var parts = [];
+  var bounds = new THREE.Box3();
+
+  D.components.forEach(function (c, i) {
+    var g = new THREE.BufferGeometry();
+    g.setAttribute("position",
+      new THREE.Float32BufferAttribute(c.mesh.positions, 3));
+    g.setIndex(c.mesh.indices);
+    g.computeVertexNormals();
+    var colour = PALETTE[i % PALETTE.length];
+    var mat = new THREE.MeshStandardMaterial({
+      color: colour, metalness: 0.45, roughness: 0.38,
+      flatShading: true, transparent: true, opacity: 0.95
+    });
+    var mesh = new THREE.Mesh(g, mat);
+    mesh.position.set(c.at[0], c.at[1], c.at[2]);
+    var edges = new THREE.LineSegments(
+      new THREE.EdgesGeometry(g, 20),
+      new THREE.LineBasicMaterial({ color: 0x35e0d0 }));
+    edges.position.copy(mesh.position);
+    group.add(mesh); group.add(edges);
+    parts.push({ mesh: mesh, edges: edges, mat: mat, data: c,
+                 colour: colour, visible: true });
+    g.computeBoundingBox();
+    var bb = g.boundingBox.clone();
+    bb.translate(mesh.position);
+    bounds.union(bb);
+  });
+
+  var centre = new THREE.Vector3();
+  bounds.getCenter(centre);
+  var radius = Math.max(bounds.getSize(new THREE.Vector3()).length() / 2, 1);
+
+  var grid = new THREE.GridHelper(radius * 8, 32, 0x1d7f78, 0x11202c);
+  grid.rotation.x = Math.PI / 2;
+  grid.position.z = bounds.min.z;
+  scene.add(grid);
+  var axes = new THREE.AxesHelper(radius * 0.8);
+  axes.position.copy(bounds.min);
+  scene.add(axes);
+
+  scene.add(new THREE.AmbientLight(0x4a6a80, 0.8));
+  var key = new THREE.DirectionalLight(0xbfe9ff, 1.1);
+  key.position.set(1, 0.6, 1.4).multiplyScalar(radius * 4);
+  scene.add(key);
+  var rim = new THREE.DirectionalLight(0x35e0d0, 0.5);
+  rim.position.set(-1.2, -0.9, 0.5).multiplyScalar(radius * 4);
+  scene.add(rim);
+
+  // ---- component roster (click to isolate) ----
+  var block = document.getElementById("componentBlock");
+  var html = "<h2>Components - all signed off</h2>";
+  D.components.forEach(function (c, i) {
+    var col = "#" + PALETTE[i % PALETTE.length].toString(16).padStart(6, "0");
+    html += '<div class="comp" data-i="' + i + '" style="border-left-color:' +
+      col + '"><b>' + esc(c.name) + '</b> ' +
+      '<span class="pill ok">SIGNED</span><br>' +
+      '<span class="meta">' + esc(c.geometry_id) + " · digest " +
+      esc(c.sign_off.spec_digest) + "<br>at [" + c.at.join(", ") + "] mm · " +
+      Number(c.properties.volume_mm3).toFixed(1) + " mm³ · " +
+      c.mesh.triangles + " tris<br>by " + esc(c.sign_off.signed_off_by) +
+      " · log #" + c.sign_off.log_id + "</span></div>";
+  });
+  block.innerHTML = html;
+  block.querySelectorAll(".comp").forEach(function (el) {
+    el.addEventListener("click", function () {
+      var i = parseInt(el.dataset.i, 10);
+      var p = parts[i];
+      p.visible = !p.visible;
+      p.mesh.visible = p.visible; p.edges.visible = p.visible;
+      el.classList.toggle("off", !p.visible);
+    });
+  });
+
+  // ---- tolerance stackup, straight from the log ----
+  var S = D.stackup || {};
+  if (S.chains && S.chains.length) {
+    var sh = "<h2>Tolerance stackup (worst-case gate)</h2>";
+    S.chains.forEach(function (ch) {
+      var ok = ch.result === "pass";
+      sh += "<div style='margin-bottom:8px'><b>" + esc(ch.name) + "</b> " +
+        '<span class="pill ' + (ok ? "ok" : "bad") + '">' +
+        esc(ch.result.toUpperCase()) + "</span>" +
+        "<dl><dt>Nominal</dt><dd>" + ch.nominal_mm + " mm</dd>" +
+        "<dt>Worst case</dt><dd>[" + ch.worst_case_mm.min + ", " +
+        ch.worst_case_mm.max + "]</dd>" +
+        "<dt>Requirement</dt><dd>" + esc(JSON.stringify(ch.requirement_mm)) +
+        "</dd><dt>Worst margin</dt><dd>" + ch.worst_margin_mm +
+        " mm</dd></dl></div>";
+    });
+    document.getElementById("stackBlock").innerHTML = sh;
+  }
+
+  // ---- hand-written Z-up orbit controls ----
+  var target = centre.clone();
+  var sph = { r: radius * 3.0, theta: Math.PI * 0.28, phi: Math.PI * 0.36 };
+  var home = { t: target.clone(), r: sph.r, th: sph.theta, ph: sph.phi };
+  var drag = null;
+
+  function applyCamera() {
+    sph.phi = Math.max(0.02, Math.min(Math.PI - 0.02, sph.phi));
+    sph.r = Math.max(radius * 0.2, Math.min(radius * 40, sph.r));
+    camera.position.set(
+      target.x + sph.r * Math.sin(sph.phi) * Math.cos(sph.theta),
+      target.y + sph.r * Math.sin(sph.phi) * Math.sin(sph.theta),
+      target.z + sph.r * Math.cos(sph.phi));
+    camera.lookAt(target);
+    document.getElementById("readout").textContent =
+      "dist " + sph.r.toFixed(1) + " mm   az " +
+      (sph.theta * 180 / Math.PI).toFixed(0) + "°   el " +
+      (90 - sph.phi * 180 / Math.PI).toFixed(0) + "°";
+  }
+
+  renderer.domElement.addEventListener("pointerdown", function (e) {
+    drag = { x: e.clientX, y: e.clientY, pan: e.shiftKey || e.button === 1 };
+    renderer.domElement.setPointerCapture(e.pointerId);
+  });
+  renderer.domElement.addEventListener("pointerup", function (e) {
+    drag = null;
+    try { renderer.domElement.releasePointerCapture(e.pointerId); } catch (x) {}
+  });
+  renderer.domElement.addEventListener("pointermove", function (e) {
+    if (!drag) { return; }
+    var dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    drag.x = e.clientX; drag.y = e.clientY;
+    if (drag.pan) {
+      var right = new THREE.Vector3().subVectors(camera.position, target)
+        .cross(camera.up).normalize();
+      var up = new THREE.Vector3().crossVectors(
+        right, new THREE.Vector3().subVectors(camera.position, target)).normalize();
+      var k = sph.r * 0.0016;
+      target.addScaledVector(right, -dx * k).addScaledVector(up, -dy * k);
+    } else {
+      sph.theta -= dx * 0.007; sph.phi -= dy * 0.007;
+    }
+    applyCamera();
+  });
+  renderer.domElement.addEventListener("wheel", function (e) {
+    e.preventDefault();
+    sph.r *= (e.deltaY > 0 ? 1.11 : 0.9);
+    applyCamera();
+  }, { passive: false });
+
+  window.addEventListener("keydown", function (e) {
+    var k = e.key.toLowerCase();
+    if (k === "r") {
+      target.copy(home.t); sph.r = home.r; sph.theta = home.th; sph.phi = home.ph;
+      parts.forEach(function (p) {
+        p.visible = true; p.mesh.visible = true; p.edges.visible = true;
+      });
+      block.querySelectorAll(".comp").forEach(function (el) {
+        el.classList.remove("off");
+      });
+      applyCamera();
+    } else if (k === "w") {
+      parts.forEach(function (p) { p.mat.wireframe = !p.mat.wireframe; });
+    } else if (k === "e") {
+      parts.forEach(function (p) {
+        p.edges.visible = p.visible && !p.edges.visible;
+      });
+    } else if (k === "g") {
+      grid.visible = !grid.visible; axes.visible = grid.visible;
+    }
+  });
+
+  window.addEventListener("resize", function () {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  window.__designEngineViewer = {
+    payload: D, scene: scene, camera: camera, renderer: renderer,
+    parts: parts, frames: 0
+  };
+
+  applyCamera();
+  (function loop() {
+    requestAnimationFrame(loop);
+    renderer.render(scene, camera);
+    window.__designEngineViewer.frames++;
+  })();
+})();
+</script>
+</body>
+</html>

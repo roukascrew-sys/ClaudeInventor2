@@ -4,8 +4,11 @@ tools/
 __pycache__/
 *.pyc
 # Runtime state — the log DB and generated geometry live here, reproducible
-# from specs; back up data/ separately, don't version it
-data/
+# from specs; back up /data/ separately, don't version it.
+# Leading slash matters: an unanchored "data/" also swallowed
+# design_engine/data/, silently keeping the price book, three.js and the
+# viewer templates out of the repo (a fresh clone could not run Phase 6).
+/data/
 # CalculiX run droppings (results that matter get copied into the log by tooling)
 phase0_smoke/*.frd
 phase0_smoke/*.dat

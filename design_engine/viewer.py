@@ -32,6 +32,8 @@ from .production import ProductionTools
 
 THREE_JS_PATH = Path(__file__).parent / "data" / "three.min.js"
 TEMPLATE_PATH = Path(__file__).parent / "data" / "viewer_template.html"
+ASSEMBLY_TEMPLATE_PATH = (Path(__file__).parent / "data"
+                          / "assembly_viewer_template.html")
 
 # Display tessellation only — never used for analysis. The solver meshes
 # independently in fea.py; this is a picture, the numbers are the claim.
@@ -55,11 +57,12 @@ def tessellate(spec: dict, linear_tol_mm: float = DEFAULT_LINEAR_TOL_MM,
 
 class ViewerTools:
     def __init__(self, root: str | Path, log: ActionLog, parts: PartStore,
-                 production: ProductionTools):
+                 production: ProductionTools, assemblies=None):
         self.root = Path(root)
         self.log = log
         self.parts = parts
         self.production = production
+        self.assemblies = assemblies
 
     def _validation_summary(self, geometry_id: str, sign_row) -> dict:
         vid = json.loads(sign_row["details_json"])["validation_action_id"]
@@ -90,6 +93,83 @@ class ViewerTools:
             "price_as_of": (det.get("pricing") or {}).get("price_as_of"),
             "budget_label": (det.get("budget") or {}).get("label"),
         }
+
+    def generate_assembly_viewer(self, assembly_id: str, reason: str,
+                                 out_path: str | Path | None = None,
+                                 linear_tol_mm: float = DEFAULT_LINEAR_TOL_MM
+                                 ) -> dict:
+        """Render a whole assembly - every component must be signed off.
+
+        This does not weaken the production gate, it applies it N times: a
+        single unsigned or tampered component refuses the whole render, so an
+        assembly view can never show a mix of released and draft geometry.
+
+        Components are placed by their assembly 'at' translation. The v0
+        assembly schema carries translation only, so a mechanism cannot be
+        posed at an angle here; parts are shown in their declared positions.
+        """
+        action_id = self.log.open_action(
+            "production", "generate_assembly_viewer",
+            geometry_version=str(assembly_id), reason=str(reason))
+        try:
+            _check_reason(reason)
+            spec = self.assemblies.get_assembly(assembly_id)
+            components = []
+            for i, comp in enumerate(spec["components"]):
+                gid = comp["geometry_id"]
+                sign_row = self.production.verify_sign_off(gid)   # THE LOCK, per part
+                part = self.parts.get_part(gid)
+                sdet = json.loads(sign_row["details_json"])
+                components.append({
+                    "index": i,
+                    "geometry_id": gid,
+                    "name": part["spec"]["name"],
+                    "at": comp.get("at", [0, 0, 0]),
+                    "properties": part["properties"],
+                    "mesh": tessellate(part["spec"], linear_tol_mm),
+                    "sign_off": {
+                        "signed_off_by": sign_row["signed_off_by"],
+                        "statement": sdet["statement"],
+                        "token": sdet["token"],
+                        "spec_digest": sdet["spec_digest"],
+                        "signed_at": sign_row["timestamp"],
+                        "log_id": sign_row["id"],
+                    },
+                })
+
+            stack_rows = [r for r in self.log.rows(
+                action="check_tolerance_stackup",
+                geometry_version=str(assembly_id)) if r["result"] != "pending"]
+            stackup = (json.loads(stack_rows[-1]["details_json"])
+                       if stack_rows else {})
+
+            payload = {
+                "kind": "assembly",
+                "assembly_id": assembly_id,
+                "assembly_name": spec["name"],
+                "components": components,
+                "stackup": stackup,
+            }
+            three_js = THREE_JS_PATH.read_text(encoding="utf-8")
+            html = (ASSEMBLY_TEMPLATE_PATH.read_text(encoding="utf-8")
+                    .replace("%%THREE_JS%%", three_js)
+                    .replace("%%PAYLOAD%%", base64.b64encode(
+                        json.dumps(payload).encode()).decode()))
+            out = Path(out_path) if out_path else (
+                self.root / "production" / assembly_id / "assembly_viewer.html")
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(html, encoding="utf-8")
+            size_kb = round(out.stat().st_size / 1024, 1)
+        except Exception as exc:
+            self.log.close_action(
+                action_id, "fail", failure_mode=f"{type(exc).__name__}: {exc}")
+            raise
+        details = {"viewer_path": str(out), "size_kb": size_kb,
+                   "components": [c["geometry_id"] for c in components],
+                   "triangles": sum(c["mesh"]["triangles"] for c in components),
+                   "artifacts": []}
+        self.log.close_action(action_id, "pass", details=details)
+        return {**details, "action_id": action_id}
 
     def generate_viewer(self, geometry_id: str, reason: str,
                         out_path: str | Path | None = None,

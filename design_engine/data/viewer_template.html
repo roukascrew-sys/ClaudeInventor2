@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design Engine - Signed-off Geometry Viewer</title>
+<style>
+  :root {
+    --bg: #06090f; --panel: rgba(10,18,28,0.88); --line: #1d3a52;
+    --accent: #35e0d0; --accent-dim: #1d7f78; --text: #d8e6f0;
+    --muted: #7d93a6; --warn: #e0b040; --ok: #46c46e;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden;
+               background: var(--bg); color: var(--text);
+               font-family: 'Segoe UI', system-ui, sans-serif; }
+  #stage { position: fixed; inset: 0; }
+  .panel {
+    position: fixed; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 6px; backdrop-filter: blur(6px); font-size: 12px;
+  }
+  #info { top: 16px; left: 16px; width: 330px; max-height: calc(100% - 32px);
+          overflow-y: auto; padding: 14px 16px; }
+  #info h1 { font-size: 15px; margin: 0 0 2px; color: var(--accent);
+             letter-spacing: 0.4px; }
+  #info h2 { font-size: 10px; margin: 16px 0 6px; color: var(--muted);
+             text-transform: uppercase; letter-spacing: 1.2px;
+             border-bottom: 1px solid var(--line); padding-bottom: 4px; }
+  .gid { font-family: Consolas, monospace; color: var(--muted);
+         font-size: 11px; margin-bottom: 10px; }
+  dl { margin: 0; display: grid; grid-template-columns: auto 1fr;
+       gap: 3px 10px; }
+  dt { color: var(--muted); }
+  dd { margin: 0; text-align: right; font-family: Consolas, monospace; }
+  .stmt { color: var(--text); font-style: italic; margin: 6px 0 0;
+          line-height: 1.45; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 10px;
+          font-size: 10px; font-weight: 700; letter-spacing: 0.5px; }
+  .pill.ok { background: rgba(70,196,110,0.16); color: var(--ok);
+             border: 1px solid var(--ok); }
+  .pill.warn { background: rgba(224,176,64,0.14); color: var(--warn);
+               border: 1px solid var(--warn); }
+  #hud { bottom: 16px; left: 16px; padding: 9px 14px; color: var(--muted); }
+  #hud b { color: var(--text); font-weight: 600; }
+  #readout { bottom: 16px; right: 16px; padding: 9px 14px;
+             font-family: Consolas, monospace; color: var(--accent); }
+  .note { color: var(--muted); font-size: 11px; line-height: 1.45;
+          margin-top: 6px; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+
+<div id="info" class="panel">
+  <h1 id="partName">-</h1>
+  <div class="gid" id="gidLine">-</div>
+  <div id="signBlock"></div>
+  <div id="validationBlock"></div>
+  <div id="geometryBlock"></div>
+  <div id="sourcingBlock"></div>
+  <h2>Provenance</h2>
+  <div class="note">
+    Every value on this panel is read from the FRACAS log. The mesh is a
+    display tessellation of the signed spec and is <b>not</b> the solver mesh -
+    the numbers are the claim, this is a picture of them.
+  </div>
+</div>
+
+<div id="hud" class="panel">
+  <b>drag</b> orbit &nbsp; <b>shift+drag</b> pan &nbsp; <b>wheel</b> zoom
+  &nbsp;&nbsp; <b>R</b> reset &nbsp; <b>W</b> wireframe &nbsp;
+  <b>E</b> edges &nbsp; <b>G</b> grid &nbsp; <b>S</b> stress marker
+</div>
+<div id="readout" class="panel">-</div>
+
+<script>%%THREE_JS%%</script>
+<script>
+(function () {
+  "use strict";
+  var raw = atob("%%PAYLOAD%%");
+  var bytes = new Uint8Array(raw.length);
+  for (var i = 0; i < raw.length; i++) { bytes[i] = raw.charCodeAt(i); }
+  var D = JSON.parse(new TextDecoder("utf-8").decode(bytes));
+
+  // ---------- info panel (all values from the log payload) ----------
+  var esc = function (s) {
+    return String(s).replace(/[&<>"]/g, function (c) {
+      return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c];
+    });
+  };
+  var dl = function (pairs) {
+    return "<dl>" + pairs.map(function (p) {
+      return "<dt>" + esc(p[0]) + "</dt><dd>" + p[1] + "</dd>";
+    }).join("") + "</dl>";
+  };
+
+  document.getElementById("partName").textContent = D.spec.name;
+  document.getElementById("gidLine").textContent =
+    D.geometry_id + "  ·  digest " + D.sign_off.spec_digest;
+
+  document.getElementById("signBlock").innerHTML =
+    '<h2>Sign-off <span class="pill ok">RELEASED</span></h2>' +
+    dl([["Signed by", esc(D.sign_off.signed_off_by)],
+        ["Signed at", esc(D.sign_off.signed_at)],
+        ["Token", esc(D.sign_off.token)],
+        ["Log row", "#" + D.sign_off.log_id]]) +
+    '<p class="stmt">"' + esc(D.sign_off.statement) + '"</p>';
+
+  var V = D.validation || {};
+  if (V.limit_state) {
+    var sfOk = V.safety_factor >= V.required_SF;
+    document.getElementById("validationBlock").innerHTML =
+      "<h2>Validation</h2>" +
+      dl([["Limit state", esc(V.limit_state)],
+          ["Safety factor",
+           '<span class="pill ' + (sfOk ? "ok" : "warn") + '">' +
+           Number(V.safety_factor).toFixed(2) + "</span>"],
+          ["Required SF", Number(V.required_SF).toFixed(2)],
+          ["Max von Mises", Number(V.max_von_mises_MPa).toFixed(1) + " MPa"],
+          ["Material", esc(V.material.name)],
+          ["Yield", V.material.yield_MPa + " MPa"],
+          ["Log row", "#" + V.validation_action_id]]) +
+      '<div class="note">Material source: ' + esc(V.material.source) + "</div>";
+  }
+
+  var P = D.properties, bb = P.bbox_mm.size;
+  var geomPairs = [
+    ["Bounding box", bb[0] + " × " + bb[1] + " × " + bb[2] + " mm"],
+    ["Volume", Number(P.volume_mm3).toFixed(1) + " mm³"],
+    ["Surface area", Number(P.area_mm2).toFixed(1) + " mm²"]];
+  if (P.mass_kg_estimate !== undefined) {
+    geomPairs.push(["Mass (est.)", Number(P.mass_kg_estimate).toFixed(4) + " kg"]);
+  }
+  geomPairs.push(["Display mesh", D.mesh.triangles.toLocaleString() + " tris"]);
+  document.getElementById("geometryBlock").innerHTML =
+    "<h2>Geometry</h2>" + dl(geomPairs);
+
+  var S = D.sourcing || {};
+  if (S.as_specified_total_usd !== undefined) {
+    document.getElementById("sourcingBlock").innerHTML =
+      "<h2>Sourcing</h2>" +
+      dl([["Assemblies", S.assemblies],
+          ["As specified", "$" + Number(S.as_specified_total_usd).toFixed(2)],
+          ["Min-cost baseline", "$" + Number(S.min_cost_total_usd).toFixed(2)],
+          ["Budget", '<span class="pill ' +
+           (S.budget_label === "within-budget" ? "ok" : "warn") + '">' +
+           esc(S.budget_label || "n/a") + "</span>"]]) +
+      '<div class="note">Cached public pricing as of ' +
+      esc(S.price_as_of) + " - not live supplier data.</div>";
+  }
+
+  // ---------- scene ----------
+  var stage = document.getElementById("stage");
+  var renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  stage.appendChild(renderer.domElement);
+
+  var scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x06090f);
+  scene.fog = new THREE.Fog(0x06090f, 400, 1600);
+
+  var camera = new THREE.PerspectiveCamera(
+    45, window.innerWidth / window.innerHeight, 0.1, 20000);
+  camera.up.set(0, 0, 1);           // CAD convention: Z is up, not Y
+
+  var geom = new THREE.BufferGeometry();
+  geom.setAttribute("position",
+    new THREE.Float32BufferAttribute(D.mesh.positions, 3));
+  geom.setIndex(D.mesh.indices);
+  geom.computeVertexNormals();
+  geom.computeBoundingBox();
+  geom.computeBoundingSphere();
+
+  var centre = new THREE.Vector3();
+  geom.boundingBox.getCenter(centre);
+  var radius = geom.boundingSphere.radius;
+
+  var solidMat = new THREE.MeshStandardMaterial({
+    color: 0x2f6f8f, metalness: 0.45, roughness: 0.35,
+    emissive: 0x0a2430, flatShading: true,
+    transparent: true, opacity: 0.93
+  });
+  var mesh = new THREE.Mesh(geom, solidMat);
+  scene.add(mesh);
+
+  var edges = new THREE.LineSegments(
+    new THREE.EdgesGeometry(geom, 20),
+    new THREE.LineBasicMaterial({ color: 0x35e0d0 }));
+  scene.add(edges);
+
+  // ground grid on the z = 0 plane (three's GridHelper is XZ; rotate to XY)
+  var grid = new THREE.GridHelper(radius * 8, 32, 0x1d7f78, 0x11202c);
+  grid.rotation.x = Math.PI / 2;
+  grid.position.z = geom.boundingBox.min.z;
+  scene.add(grid);
+
+  var axes = new THREE.AxesHelper(radius * 0.9);
+  axes.position.copy(geom.boundingBox.min);
+  scene.add(axes);
+
+  // peak-stress marker, positioned from the validation log row
+  var marker = null;
+  if (D.validation && D.validation.max_von_mises_at_mm) {
+    var at = D.validation.max_von_mises_at_mm;
+    marker = new THREE.Mesh(
+      new THREE.SphereGeometry(Math.max(radius * 0.035, 0.4), 20, 14),
+      new THREE.MeshBasicMaterial({ color: 0xff4d5a }));
+    marker.position.set(at[0], at[1], at[2]);
+    scene.add(marker);
+  }
+
+  scene.add(new THREE.AmbientLight(0x4a6a80, 0.75));
+  var key = new THREE.DirectionalLight(0xbfe9ff, 1.15);
+  key.position.set(1, 0.6, 1.4).multiplyScalar(radius * 4);
+  scene.add(key);
+  var rim = new THREE.DirectionalLight(0x35e0d0, 0.55);
+  rim.position.set(-1.2, -0.9, 0.5).multiplyScalar(radius * 4);
+  scene.add(rim);
+
+  // ---------- hand-written orbit controls (Z-up spherical) ----------
+  var target = centre.clone();
+  var sph = { r: radius * 3.2, theta: Math.PI * 0.28, phi: Math.PI * 0.36 };
+  var home = { target: target.clone(), r: sph.r,
+               theta: sph.theta, phi: sph.phi };
+  var drag = null;
+
+  function applyCamera() {
+    sph.phi = Math.max(0.02, Math.min(Math.PI - 0.02, sph.phi));
+    sph.r = Math.max(radius * 0.25, Math.min(radius * 40, sph.r));
+    camera.position.set(
+      target.x + sph.r * Math.sin(sph.phi) * Math.cos(sph.theta),
+      target.y + sph.r * Math.sin(sph.phi) * Math.sin(sph.theta),
+      target.z + sph.r * Math.cos(sph.phi));
+    camera.lookAt(target);
+    document.getElementById("readout").textContent =
+      "dist " + sph.r.toFixed(1) + " mm   az " +
+      (sph.theta * 180 / Math.PI).toFixed(0) + "°   el " +
+      (90 - sph.phi * 180 / Math.PI).toFixed(0) + "°";
+  }
+
+  renderer.domElement.addEventListener("pointerdown", function (e) {
+    drag = { x: e.clientX, y: e.clientY, pan: e.shiftKey || e.button === 1 };
+    renderer.domElement.setPointerCapture(e.pointerId);
+  });
+  renderer.domElement.addEventListener("pointerup", function (e) {
+    drag = null;
+    try { renderer.domElement.releasePointerCapture(e.pointerId); } catch (x) {}
+  });
+  renderer.domElement.addEventListener("pointermove", function (e) {
+    if (!drag) { return; }
+    var dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    drag.x = e.clientX; drag.y = e.clientY;
+    if (drag.pan) {
+      var right = new THREE.Vector3().subVectors(camera.position, target)
+        .cross(camera.up).normalize();
+      var up = new THREE.Vector3().crossVectors(
+        right, new THREE.Vector3().subVectors(camera.position, target)
+      ).normalize();
+      var k = sph.r * 0.0016;
+      target.addScaledVector(right, -dx * k).addScaledVector(up, -dy * k);
+    } else {
+      sph.theta -= dx * 0.007;
+      sph.phi -= dy * 0.007;
+    }
+    applyCamera();
+  });
+  renderer.domElement.addEventListener("wheel", function (e) {
+    e.preventDefault();
+    sph.r *= (e.deltaY > 0 ? 1.11 : 0.9);
+    applyCamera();
+  }, { passive: false });
+
+  window.addEventListener("keydown", function (e) {
+    var k = e.key.toLowerCase();
+    if (k === "r") {
+      target.copy(home.target); sph.r = home.r;
+      sph.theta = home.theta; sph.phi = home.phi; applyCamera();
+    } else if (k === "w") {
+      solidMat.wireframe = !solidMat.wireframe;
+    } else if (k === "e") {
+      edges.visible = !edges.visible;
+    } else if (k === "g") {
+      grid.visible = !grid.visible; axes.visible = grid.visible;
+    } else if (k === "s" && marker) {
+      marker.visible = !marker.visible;
+    }
+  });
+
+  window.addEventListener("resize", function () {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  // Exposed for inspection and automated verification (e.g. confirming the
+  // renderer actually drew the expected triangle count). Read-only in intent;
+  // nothing in the viewer depends on it.
+  window.__designEngineViewer = {
+    payload: D, scene: scene, camera: camera, renderer: renderer,
+    mesh: mesh, frames: 0
+  };
+
+  applyCamera();
+  (function loop() {
+    requestAnimationFrame(loop);
+    if (marker) {
+      var t = performance.now() * 0.003;
+      marker.scale.setScalar(1 + 0.16 * Math.sin(t));
+    }
+    renderer.render(scene, camera);
+    window.__designEngineViewer.frames++;
+  })();
+})();
+</script>
+</body>
+</html>
