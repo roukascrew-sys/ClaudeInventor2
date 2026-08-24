@@ -77,6 +77,7 @@ class ActionLog:
         failure_mode: str | None = None,
         geometry_version: str | None = None,
         details: dict | None = None,
+        signed_off_by: str | None = None,
     ) -> None:
         """Finalize a pending row to pass/fail."""
         if result not in ("pass", "fail"):
@@ -84,13 +85,15 @@ class ActionLog:
         self._conn.execute(
             "UPDATE actions SET result = ?, failure_mode = ?,"
             " geometry_version = COALESCE(?, geometry_version),"
-            " details_json = COALESCE(?, details_json)"
+            " details_json = COALESCE(?, details_json),"
+            " signed_off_by = COALESCE(?, signed_off_by)"
             " WHERE id = ?",
             (
                 result,
                 failure_mode,
                 geometry_version,
                 json.dumps(details, sort_keys=True) if details is not None else None,
+                signed_off_by,
                 action_id,
             ),
         )
