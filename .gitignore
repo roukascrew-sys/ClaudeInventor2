@@ -1,0 +1,11 @@
+.venv/
+# Binary payloads stay out of git; SETUP.md records exact versions + source URLs
+tools/
+__pycache__/
+*.pyc
+# CalculiX run droppings (results that matter get copied into the log by tooling)
+phase0_smoke/*.frd
+phase0_smoke/*.dat
+phase0_smoke/*.sta
+phase0_smoke/*.cvg
+phase0_smoke/spooles.out

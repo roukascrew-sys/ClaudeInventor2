@@ -1,0 +1,38 @@
+*HEADING
+Phase 0 smoke test: single C3D8 unit cube, steel, uniaxial tension
+** Units: mm / N / MPa. E=210000 MPa, nu=0.3
+** 4 x 25 N on top face (1 mm^2) = 100 MPa nominal -> u_z = sigma*L/E = 4.7619e-4 mm
+*NODE, NSET=NALL
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0., 0., 1.
+6, 1., 0., 1.
+7, 1., 1., 1.
+8, 0., 1., 1.
+*ELEMENT, TYPE=C3D8, ELSET=EALL
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*NSET, NSET=FIX
+1, 2, 3, 4
+*NSET, NSET=TOP
+5, 6, 7, 8
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000., 0.3
+*SOLID SECTION, ELSET=EALL, MATERIAL=STEEL
+*STEP
+*STATIC
+*BOUNDARY
+FIX, 3, 3, 0.
+1, 1, 2, 0.
+2, 2, 2, 0.
+*CLOAD
+TOP, 3, 25.
+*NODE PRINT, NSET=TOP
+U
+*NODE FILE
+U
+*EL FILE
+S
+*END STEP
