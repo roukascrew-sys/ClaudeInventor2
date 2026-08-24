@@ -3,9 +3,14 @@
 tools/
 __pycache__/
 *.pyc
+# Runtime state — the log DB and generated geometry live here, reproducible
+# from specs; back up data/ separately, don't version it
+data/
 # CalculiX run droppings (results that matter get copied into the log by tooling)
 phase0_smoke/*.frd
 phase0_smoke/*.dat
 phase0_smoke/*.sta
 phase0_smoke/*.cvg
+phase0_smoke/*.12d
 phase0_smoke/spooles.out
+.pytest_cache/
