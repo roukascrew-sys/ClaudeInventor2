@@ -47,3 +47,8 @@ class DesignEngine:
 
     def check_tolerance_stackup(self, assembly_id: str) -> dict:
         return self.assemblies.check_tolerance_stackup(assembly_id)
+
+    def generate_report(self, out_path: str | Path | None = None) -> Path:
+        from .report import generate_report
+        return generate_report(
+            self.log, out_path or self.root / "report.html", data_root=self.root)
