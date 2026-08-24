@@ -27,13 +27,16 @@ from __future__ import annotations
 import json
 import math
 import re
+import os
 import subprocess
+import time
 from pathlib import Path
 
 import numpy as np
 
 from .log import ActionLog
-from .mesh import MeshError, mesh_step, select_nodes
+from .mesh import (MeshError, describe_axis_options, mesh_step,
+                   select_nodes)
 from .parts import PartStore, _check_reason
 
 
@@ -119,8 +122,75 @@ def validate_case(case: dict) -> None:
     _num(ls, "required_SF", "case.limit_state", lo=0)
 
 
+def check_rigid_body_modes(mesh: dict, constraint_sets: list,
+                          constraints: list) -> dict:
+    """Refuse a model that can move without straining.
+
+    A static analysis needs every rigid-body mode removed, or the stiffness
+    matrix is singular. CalculiX may still return numbers: the STRAINS (and so
+    the stresses and the safety factor) come out right, but the DISPLACEMENTS
+    carry an arbitrary rigid-body component that changes with solver, ordering
+    or thread count. A displacement reported from such a model is not a
+    physical prediction, and silently comparing it to a hand calculation is
+    exactly the kind of false agreement this engine exists to prevent.
+
+    Rigid-body motion of a point p is u(p) = t + omega x p, six parameters.
+    Each constrained (node, dof) contributes one linear equation u(p)_dof = 0.
+    Stacking them gives A (n x 6); the model is fully restrained iff
+    rank(A) == 6. Coordinates are centred and scaled first so the rotation
+    columns are numerically comparable to the translation ones.
+    """
+    coords = {int(tag): c for tag, c in zip(mesh["node_tags"], mesh["coords"])}
+    pts = []
+    for tags, spec in zip(constraint_sets, constraints):
+        for tag in tags:
+            for dof in spec["dof"]:
+                pts.append((coords[int(tag)], int(dof)))
+    if not pts:
+        raise FeaError("case.constraints: no nodes constrained")
+
+    origin = np.mean([p for p, _ in pts], axis=0)
+    scale = max(float(np.max(np.abs([p - origin for p, _ in pts]))), 1e-9)
+    rows = []
+    for p, dof in pts:
+        q = (np.asarray(p) - origin) / scale
+        row = np.zeros(6)
+        row[dof - 1] = 1.0
+        # d(omega x q)/d(omega) for this dof component
+        if dof == 1:
+            row[3:] = [0.0, q[2], -q[1]]
+        elif dof == 2:
+            row[3:] = [-q[2], 0.0, q[0]]
+        else:
+            row[3:] = [q[1], -q[0], 0.0]
+        rows.append(row)
+    A = np.asarray(rows)
+    rank = int(np.linalg.matrix_rank(A, tol=1e-8))
+    if rank < 6:
+        names = ["translation x", "translation y", "translation z",
+                 "rotation x", "rotation y", "rotation z"]
+        # null space of A = the rigid-body motions still available
+        _, s, vh = np.linalg.svd(A)
+        s_full = np.zeros(6)
+        s_full[:len(s)] = s
+        free = [names[i] for i in range(6)
+                if abs(vh[i] @ vh[i]) > 0 and s_full[i] <= 1e-8]
+        dofs_used = sorted({d for _, d in pts})
+        raise FeaError(
+            f"underconstrained_model: the constraints leave {6 - rank} "
+            f"rigid-body mode(s) free (constraint rank {rank}/6; dofs "
+            f"constrained anywhere: {dofs_used}). The stiffness matrix is "
+            f"singular, so reported DISPLACEMENTS carry an arbitrary "
+            f"rigid-body component and vary with solver/thread count "
+            f"(stresses are still valid). Likely free: "
+            f"{', '.join(free) if free else 'see constraint rank'}. Fix by "
+            f"fully restraining one location (e.g. a pin at one support with "
+            f"dof [1,2,3] and a roller at the other with dof [1,2]).")
+    return {"constraint_rank": rank, "constrained_node_dofs": len(pts)}
+
+
 def _consistent_face_loads(mesh: dict, selected_tags, force_total_N: list,
-                           ctx: str) -> dict[int, np.ndarray]:
+                           ctx: str, where: dict | None = None) -> dict[int, np.ndarray]:
     """Nodal forces for uniform traction on the selected planar face.
 
     Per straight-sided T6 triangle of area a carrying force F*(a/A): corners
@@ -131,9 +201,17 @@ def _consistent_face_loads(mesh: dict, selected_tags, force_total_N: list,
     tris = [row for row in mesh["tri6"]
             if all(int(n) in selected for n in row)]
     if not tris:
+        hint = ""
+        axes = [w.get("axis") for w in (where.get("all", [where]) if where else [])
+                if isinstance(w, dict) and w.get("axis")]
+        for ax in dict.fromkeys(axes):
+            hint += "; " + describe_axis_options(mesh, ax)
         raise FeaError(
-            f"{ctx}: no boundary triangles lie fully inside the selection — "
-            f"the load selector must cover one planar boundary face")
+            f"{ctx}: no boundary triangles lie fully inside the selection - a "
+            f"load must cover a real boundary face, and 'at': 'min'/'max' is a "
+            f"coordinate extremum, not a face (a protruding round feature makes "
+            f"the extremum a curved tangent that carries no complete "
+            f"triangle){hint}")
     force_total = np.asarray(force_total_N, dtype=float)
     areas = []
     for row in tris:
@@ -252,13 +330,39 @@ def _diagnostic_png(out_path: Path, mesh: dict, vm: dict[int, float],
 
 class ValidationTools:
     def __init__(self, root: str | Path, log: ActionLog, parts: PartStore,
-                 ccx_path: str | Path):
+                 ccx_path: str | Path, threads: int | None = None,
+                 solve_timeout_s: int = 600):
+        """threads: CPUs for the solver. None (default) = use every core.
+
+        CalculiX ships a multithreaded binary (ccx_MT.exe) alongside the
+        single-threaded one; only the latter was ever invoked before, so a
+        fine mesh on a thin part could take minutes on one core while the rest
+        of the machine idled. When ccx_MT is present and more than one thread
+        is requested it is used instead, with OMP_NUM_THREADS set.
+
+        This changes only HOW the same linear system is solved, not the system
+        itself; tests assert the two binaries agree on the same job.
+        """
         self.root = Path(root)
         self.run_root = self.root / "validation"
         self.run_root.mkdir(parents=True, exist_ok=True)
         self.log = log
         self.parts = parts
         self.ccx_path = Path(ccx_path)
+        self.threads = threads if threads is not None else (os.cpu_count() or 1)
+        self.solve_timeout_s = solve_timeout_s
+        mt = self.ccx_path.with_name(
+            self.ccx_path.stem + "_MT" + self.ccx_path.suffix)
+        self.ccx_mt_path = mt if mt.is_file() else None
+
+    def _solver_command(self) -> tuple[Path, dict, int]:
+        """(binary, env, threads_used) — MT binary when available and useful."""
+        env = dict(os.environ)
+        if self.ccx_mt_path is not None and self.threads > 1:
+            env["OMP_NUM_THREADS"] = str(self.threads)
+            return self.ccx_mt_path, env, self.threads
+        env["OMP_NUM_THREADS"] = "1"
+        return self.ccx_path, env, 1
 
     def _next_run_dir(self) -> Path:
         nums = [int(p.name[1:]) for p in self.run_root.glob("R[0-9]*") if p.is_dir()]
@@ -281,20 +385,33 @@ class ValidationTools:
             m = mesh_step(part["step_file_path"], case["mesh"]["max_size_mm"],
                           case["mesh"].get("min_size_mm"))
             constraint_sets = [select_nodes(m, c["where"]) for c in case["constraints"]]
+            rbm = check_rigid_body_modes(m, constraint_sets, case["constraints"])
             load_sets = [
                 _consistent_face_loads(
                     m, select_nodes(m, ld["where"]), ld["force_total_N"],
-                    f"case.loads[{i}]")
+                    f"case.loads[{i}]", ld["where"])
                 for i, ld in enumerate(case["loads"])]
             _write_inp(run_dir / "job.inp", m, case, constraint_sets, load_sets)
 
-            proc = subprocess.run(
-                [str(self.ccx_path), "-i", "job"], cwd=run_dir,
-                capture_output=True, text=True, timeout=600)
+            binary, env, threads_used = self._solver_command()
+            solve_t0 = time.time()
+            try:
+                proc = subprocess.run(
+                    [str(binary), "-i", "job"], cwd=run_dir, env=env,
+                    capture_output=True, text=True, timeout=self.solve_timeout_s)
+            except subprocess.TimeoutExpired:
+                raise FeaError(
+                    f"solver_timeout: {binary.name} exceeded "
+                    f"{self.solve_timeout_s}s on {len(m['node_tags'])} nodes "
+                    f"using {threads_used} thread(s). Direct-solve cost grows "
+                    f"steeply with node count - coarsen case.mesh.max_size_mm "
+                    f"(subject to the Jacobian gate on the thinnest feature), "
+                    f"or raise ValidationTools(solve_timeout_s=...).")
+            solve_s = time.time() - solve_t0
             if proc.returncode != 0 or "Job finished" not in proc.stdout:
                 (run_dir / "ccx_stdout.txt").write_text(proc.stdout, encoding="utf-8")
                 raise FeaError(
-                    f"solver_error: ccx exit {proc.returncode}; "
+                    f"solver_error: {binary.name} exit {proc.returncode}; "
                     f"tail: {proc.stdout[-400:]!r}")
 
             blocks = _parse_frd(run_dir / "job.frd")
@@ -307,7 +424,28 @@ class ValidationTools:
             coords = {int(t): c for t, c in zip(m["node_tags"], m["coords"])}
             max_node = max(vm, key=vm.get)
             max_vm = vm[max_node]
-            median_vm = float(np.median(list(vm.values())))
+            vm_vals = np.array(list(vm.values()))
+            median_vm = float(np.median(vm_vals))
+            # Outlier guard: the gate divides yield by max nodal stress, so a
+            # single bad node sets the safety factor. Comparing the max with
+            # the 99.9th percentile separates a physical peak from a numerical
+            # one. Calibrated on 24 real runs: physically sound models sat at
+            # 1.00-1.20, models with an artificial constraint singularity at
+            # 1.95-2.12, and one non-reproducible garbage result at 5.47.
+            # Advisory, not a refusal: a spurious HIGH stress lowers SF, so it
+            # can only cause a false FAIL, never an unsafe pass.
+            p999 = float(np.percentile(vm_vals, 99.9))
+            outlier_ratio = (max_vm / p999) if p999 > 0 else float("inf")
+            outlier_warning = None
+            if outlier_ratio > 2.0:
+                outlier_warning = (
+                    f"stress_outlier: peak {max_vm:.1f} MPa is "
+                    f"{outlier_ratio:.1f}x the 99.9th percentile "
+                    f"({p999:.1f} MPa). Likely a numerical artifact or an "
+                    f"unconverged singularity (sharp re-entrant corner, "
+                    f"point-like restraint) rather than a physical peak. The "
+                    f"safety factor derived from it is pessimistic, not "
+                    f"unsafe - but do not treat it as a converged stress.")
             max_disp = max(math.sqrt(sum(v ** 2 for v in u[:3]))
                            for u in disp.values())
 
@@ -330,12 +468,19 @@ class ValidationTools:
                 "safety_factor": round(sf, 6) if sf != math.inf else "inf",
                 "max_von_mises_MPa": round(max_vm, 6),
                 "median_von_mises_MPa": round(median_vm, 6),
+                "p99_9_von_mises_MPa": round(p999, 6),
+                "stress_outlier_ratio": round(outlier_ratio, 4),
+                "stress_outlier_warning": outlier_warning,
                 "max_von_mises_node": int(max_node),
                 "max_von_mises_at_mm": [round(v, 3) for v in coords[int(max_node)]],
                 "max_displacement_mm": round(max_disp, 9),
                 "nodes": int(len(m["node_tags"])),
                 "elements": int(len(m["connectivity"])),
                 "run_dir": str(run_dir),
+                "constraint_rank": rbm["constraint_rank"],
+                "solver_binary": binary.name,
+                "solver_threads": threads_used,
+                "solve_seconds": round(solve_s, 2),
                 "artifacts": [png_rel],
             }
             passed = sf >= required

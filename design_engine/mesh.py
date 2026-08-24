@@ -162,18 +162,137 @@ def _axis_mask(mesh: dict, where: dict) -> np.ndarray:
     return np.abs(col - target) <= tol
 
 
+def planar_face_candidates(mesh: dict, axis: str,
+                           min_tris: int = 4) -> list[dict]:
+    """Coordinate values along `axis` that carry a real planar boundary face.
+
+    Exists because 'at': 'max' is a *coordinate extremum*, not a face: on a
+    part whose extremum is a curved tangent (e.g. a hinge knuckle barrel
+    protruding past its flat leaf), 'max' selects a tangent sliver carrying no
+    complete boundary triangle, while the flat face the user meant sits at a
+    smaller coordinate. Used to turn that into an actionable error instead of
+    a bare 'matched 0 nodes' / 'no boundary triangles'.
+
+    Returns [{'at', 'nodes', 'triangles'}] sorted by triangle count, richest
+    first — a face carrying many complete triangles is a real planar face.
+    """
+    idx = {"x": 0, "y": 1, "z": 2}.get(axis)
+    if idx is None:
+        raise MeshError(f"axis must be x|y|z, got {axis!r}")
+    coords = {int(t): c for t, c in zip(mesh["node_tags"], mesh["coords"])}
+    buckets: dict[float, dict] = {}
+    for row in mesh["tri6"]:
+        vals = [coords[int(n)][idx] for n in row]
+        lo, hi = min(vals), max(vals)
+        if hi - lo > 1e-6:          # triangle is not flat in this axis
+            continue
+        key = round((lo + hi) / 2.0, 4)
+        b = buckets.setdefault(key, {"at": key, "nodes": set(), "triangles": 0})
+        b["triangles"] += 1
+        b["nodes"].update(int(n) for n in row)
+    out = [{"at": b["at"], "nodes": len(b["nodes"]), "triangles": b["triangles"]}
+           for b in buckets.values() if b["triangles"] >= min_tris]
+    return sorted(out, key=lambda d: -d["triangles"])
+
+
+def describe_axis_options(mesh: dict, axis: str, limit: int = 4) -> str:
+    """Human-readable planar-face suggestions for an axis, for error messages."""
+    cands = planar_face_candidates(mesh, axis)
+    if not cands:
+        return f"no flat boundary face found along {axis}"
+    bits = [f"{axis}={c['at']:g} ({c['triangles']} tris)" for c in cands[:limit]]
+    return "flat faces along %s: %s" % (axis, ", ".join(bits))
+
+
+def _cylinder_mask(mesh: dict, spec: dict) -> np.ndarray:
+    """Mask for nodes on a cylindrical surface (e.g. a bore wall).
+
+    {'axis': 'x|y|z', 'center': [a, b], 'r': mm, 'tol': mm (default 0.05),
+     'half': [da, db] optional}
+
+    'center' is in the plane perpendicular to 'axis', in that plane's two
+    remaining coordinates in x,y,z order (axis 'z' -> center is [x, y]).
+    'half' keeps only the nodes whose outward radial direction has a positive
+    dot product with the given in-plane vector — the loaded half of a bore,
+    which is closer to how a pin actually bears than wrapping the full circle.
+
+    IMPORTANT (documented, not silently assumed): selecting a bore surface
+    lets you APPLY A LOAD to it, but the load applied is still a uniform
+    traction over the selected patch. Real pin bearing is a contact problem
+    with a roughly cosine pressure distribution and a contact patch that
+    depends on clearance and load. This is a modelling simplification, not
+    contact mechanics; treat resulting local bore stresses as indicative.
+    """
+    allowed = {"axis", "center", "r", "tol", "half"}
+    extra = set(spec) - allowed
+    if extra:
+        raise MeshError(
+            f"cylinder selector has unexpected keys {sorted(extra)} — "
+            f"allowed: {sorted(allowed)}")
+    idx = {"x": 0, "y": 1, "z": 2}.get(spec.get("axis"))
+    if idx is None:
+        raise MeshError(
+            f"cylinder selector axis must be x|y|z, got {spec.get('axis')!r}")
+    center = spec.get("center")
+    if not (isinstance(center, list) and len(center) == 2
+            and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                    for v in center)):
+        raise MeshError("cylinder selector 'center' must be [a, b] numbers")
+    r = spec.get("r")
+    if not isinstance(r, (int, float)) or isinstance(r, bool) or r <= 0:
+        raise MeshError(f"cylinder selector 'r' must be > 0, got {r!r}")
+    tol = spec.get("tol", 0.05)
+    perp = [i for i in (0, 1, 2) if i != idx]
+    da = mesh["coords"][:, perp[0]] - float(center[0])
+    db = mesh["coords"][:, perp[1]] - float(center[1])
+    radius = np.sqrt(da ** 2 + db ** 2)
+    mask = np.abs(radius - float(r)) <= tol
+    half = spec.get("half")
+    if half is not None:
+        if not (isinstance(half, list) and len(half) == 2):
+            raise MeshError("cylinder selector 'half' must be [da, db]")
+        hn = np.hypot(float(half[0]), float(half[1]))
+        if hn == 0:
+            raise MeshError("cylinder selector 'half' must be a nonzero vector")
+        with np.errstate(invalid="ignore", divide="ignore"):
+            dot = (da * float(half[0]) + db * float(half[1])) / (radius * hn)
+        mask &= np.nan_to_num(dot, nan=-1.0) > 0.0
+    return mask
+
+
+def _sub_mask(mesh: dict, where: dict) -> np.ndarray:
+    """One selector term: a planar axis window or a cylindrical surface."""
+    if "cylinder" in where:
+        extra = set(where) - {"cylinder"}
+        if extra:
+            raise MeshError(
+                f"cylinder selector takes no sibling keys, got {sorted(extra)}")
+        return _cylinder_mask(mesh, where["cylinder"])
+    return _axis_mask(mesh, where)
+
+
 def select_nodes(mesh: dict, where: dict) -> np.ndarray:
     """Node tags matching a selector.
 
     Single-axis window: {'axis': 'x|y|z', 'at': 'min'|'max'|float,
     'tol': mm (default 0.01)}.
 
-    Compound (AND) window: {'all': [selector, selector, ...]} — each inner
-    selector uses the same axis/at/tol keys. Needed for a load or constraint
-    that lives on an interior strip of a face rather than the whole face,
-    e.g. a mid-span loading patch on a beam's top face: the top face alone
-    (y='max') is one plane: the load patch is that plane intersected with a
-    narrow z-window around the load point.
+    Cylindrical surface: {'cylinder': {'axis', 'center', 'r', 'tol', 'half'}}
+    — for bore walls and other round surfaces that no axis window can reach.
+    See _cylinder_mask for the important modelling caveat about bearing loads.
+
+    Compound (AND) window: {'all': [selector, selector, ...]} — inner selectors
+    may be either axis windows or cylinder selectors, and are intersected.
+    Needed for a load or constraint on an interior strip of a face rather than
+    a whole face, e.g. a mid-span loading patch on a beam's top face: the top
+    face alone (y='max') is one plane; the load patch is that plane
+    intersected with a narrow z-window around the load point.
+
+    NOTE on 'at': 'min'/'max': these are coordinate extrema, NOT faces. If the
+    part's extremum along that axis is a curved tangent (a protruding round
+    boss or barrel), 'max' selects a sliver there rather than the flat face you
+    probably meant. planar_face_candidates() lists the real flat faces along an
+    axis, and load assembly reports them when a selection carries no face.
 
     Raises MeshError if the selection (or, for 'all', the intersection) is
     empty — an empty selection is always a spec error, never a silent no-op.
@@ -187,9 +306,9 @@ def select_nodes(mesh: dict, where: dict) -> np.ndarray:
         if not isinstance(subs, list) or len(subs) < 2:
             raise MeshError(
                 "selector 'all' must be a list of 2 or more axis selectors")
-        mask = np.logical_and.reduce([_axis_mask(mesh, w) for w in subs])
+        mask = np.logical_and.reduce([_sub_mask(mesh, w) for w in subs])
     else:
-        mask = _axis_mask(mesh, where)
+        mask = _sub_mask(mesh, where)
     tags = mesh["node_tags"][mask]
     if len(tags) == 0:
         raise MeshError(f"selector {where} matched 0 nodes")
