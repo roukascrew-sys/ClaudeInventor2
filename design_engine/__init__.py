@@ -61,6 +61,10 @@ class DesignEngine:
     def run_fea_static(self, geometry_id: str, case: dict, reason: str) -> dict:
         return self.validation.fea_static(geometry_id, case, reason)
 
+    def run_fea_buckling(self, geometry_id: str, case: dict, reason: str,
+                         n_modes: int = 3) -> dict:
+        return self.validation.fea_buckling(geometry_id, case, reason, n_modes)
+
     def run_kinematics(self, assembly_id: str, motion_case: dict,
                        reason: str) -> dict:
         return self.kinematics.run_kinematics(assembly_id, motion_case, reason)

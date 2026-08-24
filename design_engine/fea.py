@@ -115,10 +115,11 @@ def validate_case(case: dict) -> None:
 
     ls = case["limit_state"]
     _reject_extra(ls, _LIMIT_KEYS, "case.limit_state")
-    if ls.get("name") != "yield_von_mises":
+    allowed_states = ("yield_von_mises", "elastic_buckling")
+    if ls.get("name") not in allowed_states:
         raise FeaError(
-            f"case.limit_state.name: only 'yield_von_mises' is implemented in v0, "
-            f"got {ls.get('name')!r} — the gate must name its limit state")
+            f"case.limit_state.name: must be one of {allowed_states}, got "
+            f"{ls.get('name')!r} — the gate must name its limit state")
     _num(ls, "required_SF", "case.limit_state", lo=0)
 
 
@@ -233,7 +234,8 @@ def _consistent_face_loads(mesh: dict, selected_tags, force_total_N: list,
 
 
 def _write_inp(path: Path, mesh: dict, case: dict,
-               constraint_sets: list, load_sets: list) -> None:
+               constraint_sets: list, load_sets: list,
+               analysis: str = "static", n_modes: int = 4) -> None:
     mat = case["material"]
     lines = ["*HEADING", f"design-engine fea_static, material {mat['name']}",
              "*NODE, NSET=NALL"]
@@ -250,7 +252,14 @@ def _write_inp(path: Path, mesh: dict, case: dict,
               "*ELASTIC",
               f"{mat['E_MPa']:.9g}, {mat['nu']:.9g}",
               "*SOLID SECTION, ELSET=EALL, MATERIAL=MAT",
-              "*STEP", "*STATIC"]
+              "*STEP"]
+    if analysis == "buckle":
+        # Linear (eigenvalue) buckling. CalculiX returns load MULTIPLIERS on
+        # the applied reference load, so the lowest positive factor IS the
+        # safety factor against elastic instability for that load pattern.
+        lines += ["*BUCKLE", str(int(n_modes))]
+    else:
+        lines.append("*STATIC")
     lines.append("*BOUNDARY")
     for i, c in enumerate(case["constraints"]):
         for dof in c["dof"]:
@@ -261,7 +270,11 @@ def _write_inp(path: Path, mesh: dict, case: dict,
             for dof, val in enumerate(nodal[tag], start=1):
                 if val != 0:
                     lines.append(f"{tag}, {dof}, {val:.9g}")
-    lines += ["*NODE FILE", "U, RF", "*EL FILE", "S", "*END STEP", ""]
+    if analysis == "buckle":
+        # no RF/stress for an eigenvalue step: mode shapes only
+        lines += ["*NODE FILE", "U", "*END STEP", ""]
+    else:
+        lines += ["*NODE FILE", "U, RF", "*EL FILE", "S", "*END STEP", ""]
     path.write_text("\n".join(lines), encoding="ascii")
 
 
@@ -414,20 +427,46 @@ def _diagnostic_png(out_path: Path, mesh: dict, vm: dict[int, float],
     plt.close(fig)
 
 
+def parse_buckling_factors(dat_path: Path) -> list[float]:
+    """Buckling factors (load multipliers) from a CalculiX .dat file.
+
+    Each factor is the number the applied reference load must be multiplied
+    by to reach elastic instability, so the lowest positive factor IS the
+    safety factor against buckling for that load pattern.
+    """
+    if not dat_path.is_file():
+        raise FeaError(
+            f"solver produced no .dat file at {dat_path}; buckling factors "
+            f"unavailable and no safety factor is derived")
+    text = dat_path.read_text(encoding="ascii", errors="replace")
+    if "BUCKLING" not in text.upper():
+        raise FeaError(
+            f"no buckling factor output in {dat_path} - the eigenvalue step "
+            f"did not produce results")
+    return [float(x) for x in
+            re.findall(r"^\s+\d+\s+(-?[\d.]+E[+-]\d+)", text, re.M)]
+
+
 class ValidationTools:
     def __init__(self, root: str | Path, log: ActionLog, parts: PartStore,
-                 ccx_path: str | Path, threads: int | None = None,
-                 solve_timeout_s: int = 600):
-        """threads: CPUs for the solver. None (default) = use every core.
+                 ccx_path: str | Path, threads: int | None = 1,
+                 solve_timeout_s: int = 600,
+                 buckle_max_attempts: int = 6):
+        """threads: CPUs for the solver. Default 1 (single-threaded).
 
-        CalculiX ships a multithreaded binary (ccx_MT.exe) alongside the
-        single-threaded one; only the latter was ever invoked before, so a
-        fine mesh on a thin part could take minutes on one core while the rest
-        of the machine idled. When ccx_MT is present and more than one thread
-        is requested it is used instead, with OMP_NUM_THREADS set.
+        ccx_MT.exe IS NOT TRUSTED BY DEFAULT. Measured 2026-08-24 on an
+        identical buckling job, same mesh, same deck: single-threaded gave the
+        correct answer 5/5 times, bit-identical (factor 3.5282 vs Euler
+        3.5338); ccx_MT gave a WRONG answer 4/5 times (2.86, 2.06, 0.98, 2.08
+        where 3.53 is correct), silently and with no error. That is a
+        threading race producing wrong numbers, not a performance trade-off,
+        and it is the most likely cause of this project's long-running
+        intermittent corruption (byte-identical .inp -> different results).
 
-        This changes only HOW the same linear system is solved, not the system
-        itself; tests assert the two binaries agree on the same job.
+        MT remains available via threads>1 for exploratory work where a
+        re-checked answer is acceptable, but it must never be the default for
+        a safety gate. Buckling always forces single-threaded regardless of
+        this setting, because that is where MT was proven broken.
         """
         self.root = Path(root)
         self.run_root = self.root / "validation"
@@ -435,16 +474,18 @@ class ValidationTools:
         self.log = log
         self.parts = parts
         self.ccx_path = Path(ccx_path)
-        self.threads = threads if threads is not None else (os.cpu_count() or 1)
+        self.threads = threads if threads is not None else 1
         self.solve_timeout_s = solve_timeout_s
+        self.buckle_max_attempts = buckle_max_attempts
         mt = self.ccx_path.with_name(
             self.ccx_path.stem + "_MT" + self.ccx_path.suffix)
         self.ccx_mt_path = mt if mt.is_file() else None
 
-    def _solver_command(self) -> tuple[Path, dict, int]:
-        """(binary, env, threads_used) — MT binary when available and useful."""
+    def _solver_command(self, force_single: bool = False
+                        ) -> tuple[Path, dict, int]:
+        """(binary, env, threads_used). See __init__ on why MT is opt-in."""
         env = dict(os.environ)
-        if self.ccx_mt_path is not None and self.threads > 1:
+        if not force_single and self.ccx_mt_path is not None and self.threads > 1:
             env["OMP_NUM_THREADS"] = str(self.threads)
             return self.ccx_mt_path, env, self.threads
         env["OMP_NUM_THREADS"] = "1"
@@ -455,6 +496,173 @@ class ValidationTools:
         run = self.run_root / f"R{(max(nums) + 1 if nums else 1):04d}"
         run.mkdir()
         return run
+
+    def _run_buckle(self, m, case, constraint_sets, load_sets, run_dir,
+                    n_modes: int):
+        """One *BUCKLE solve; returns (factors, threads, binary_name)."""
+        _write_inp(run_dir / "job.inp", m, case, constraint_sets, load_sets,
+                   analysis="buckle", n_modes=n_modes)
+        # force_single: ccx_MT returns wrong eigenvalues ~4 times in 5 on an
+        # identical job (measured). Never multithread a buckling solve.
+        binary, env, threads = self._solver_command(force_single=True)
+        try:
+            proc = subprocess.run(
+                [str(binary), "-i", "job"], cwd=run_dir, env=env,
+                capture_output=True, text=True, timeout=self.solve_timeout_s)
+        except subprocess.TimeoutExpired:
+            raise FeaError(
+                f"solver_timeout: {binary.name} exceeded {self.solve_timeout_s}s "
+                f"on a buckling solve of {len(m['node_tags'])} nodes")
+        if proc.returncode != 0:
+            (run_dir / "ccx_stdout.txt").write_text(proc.stdout, encoding="utf-8")
+            raise FeaError(f"solver_error: {binary.name} exit {proc.returncode}; "
+                           f"tail: {proc.stdout[-400:]!r}")
+        return parse_buckling_factors(run_dir / "job.dat"), threads, binary.name
+
+    def fea_buckling(self, geometry_id: str, case: dict, reason: str,
+                     n_modes: int = 3) -> dict:
+        """Linear (eigenvalue) buckling against the elastic_buckling limit state.
+
+        Verified against the Euler closed form for a fixed-pinned prismatic
+        column to 0.16% (tests/test_buckling.py).
+
+        SELF-CHECK, and the reason this runs the solve TWICE: a buckling
+        factor is a load multiplier, so halving the reference load must
+        double every factor. When this project's intermittent CalculiX corruption
+        hits the pre-buckling static solve, the geometric stiffness is lost
+        and every factor collapses toward 1.0 - a plausible-looking number
+        that does NOT scale. The scaling check catches exactly that, and
+        because it tests the SOLUTION rather than the input it catches other
+        corruption modes too.
+        """
+        action_id = self.log.open_action(
+            "validation", "fea_buckling", geometry_version=str(geometry_id),
+            reason=str(reason))
+        try:
+            _check_reason(reason)
+            validate_case(case)
+            if case["limit_state"]["name"] != "elastic_buckling":
+                raise FeaError(
+                    f"fea_buckling requires limit_state 'elastic_buckling', got "
+                    f"{case['limit_state']['name']!r}")
+            if not self.ccx_path.is_file():
+                raise FeaError(f"ccx solver not found at {self.ccx_path}")
+            part = self.parts.get_part(geometry_id)
+            run_dir = self._next_run_dir()
+
+            m = mesh_step(part["step_file_path"], case["mesh"]["max_size_mm"],
+                          case["mesh"].get("min_size_mm"))
+            constraint_sets = [select_nodes(m, c["where"])
+                               for c in case["constraints"]]
+            rbm = check_rigid_body_modes(m, constraint_sets, case["constraints"])
+
+            def loads_scaled(k):
+                return [_consistent_face_loads(
+                            m, select_nodes(m, ld["where"]),
+                            [v * k for v in ld["force_total_N"]],
+                            f"case.loads[{i}]", ld["where"])
+                        for i, ld in enumerate(case["loads"])]
+
+            # BOUNDED RETRY against a known upstream defect, not a fix for it.
+            # This project has an unresolved intermittent CalculiX corruption
+            # (proved solver-side: byte-identical .inp -> different results).
+            # It hits buckling solves relatively often and has a distinctive
+            # signature - the geometric stiffness is lost and every factor
+            # collapses toward 1.0, which does NOT scale with the reference
+            # load. The scaling check below is the acceptance criterion; a
+            # rejected attempt is retried because the corruption is transient.
+            # If every attempt is rejected the run REFUSES rather than
+            # reporting a number, so a corrupted result can never reach a gate.
+            t0 = time.time()
+            attempts = []
+            lowest = lowest_2x = ratio = None
+            factors = []
+            for attempt in range(1, self.buckle_max_attempts + 1):
+                base_dir = run_dir / f"ref{attempt}"
+                base_dir.mkdir()
+                f1, threads, binary = self._run_buckle(
+                    m, case, constraint_sets, loads_scaled(1.0), base_dir,
+                    n_modes)
+                check_dir = run_dir / f"scaled{attempt}"
+                check_dir.mkdir()
+                # scale DOWN, not up: halving keeps the check load further
+                # BELOW the critical load. Doubling can push an already-near
+                # -critical reference load deep into the supercritical range
+                # where the linearised eigenvalue solve degrades - measured
+                # directly (a case whose 1x factor was correct at 0.6656 gave
+                # a meaningless 0.983 at 2x, every attempt).
+                f2, _, _ = self._run_buckle(
+                    m, case, constraint_sets, loads_scaled(0.5), check_dir,
+                    n_modes)
+
+                pos1 = [f for f in f1 if f > 0]
+                pos2 = [f for f in f2 if f > 0]
+                if not pos1 or not pos2:
+                    attempts.append({"attempt": attempt, "rejected":
+                                     "no positive factor"})
+                    continue
+                lo1, lo2 = min(pos1), min(pos2)
+                r = lo2 / lo1
+                attempts.append({"attempt": attempt,
+                                 "factor_at_1x": round(lo1, 6),
+                                 "factor_at_half": round(lo2, 6),
+                                 "ratio": round(r, 6),
+                                 "accepted": abs(r - 2.0) <= 0.04})
+                if abs(r - 2.0) <= 0.04:
+                    factors, lowest, lowest_2x, ratio = f1, lo1, lo2, r
+                    break
+            solve_s = time.time() - t0
+
+            if lowest is None:
+                raise FeaError(
+                    f"buckling_scaling_violation: no attempt in "
+                    f"{self.buckle_max_attempts} produced a load-multiplier "
+                    f"that scales correctly (halving the reference load must "
+                    f"double every factor, ratio 2.0). Attempts: {attempts}. "
+                    f"This is the signature of the project's intermittent "
+                    f"CalculiX corruption losing the geometric stiffness, "
+                    f"which collapses every factor toward 1.0. No safety "
+                    f"factor is derived from this run.")
+
+            required = case["limit_state"]["required_SF"]
+            details = {
+                "limit_state": "elastic_buckling",
+                "required_SF": required,
+                "safety_factor": round(lowest, 6),
+                "buckling_factors": [round(f, 6) for f in factors],
+                "scaling_check": {"factor_at_1x": round(lowest, 6),
+                                  "factor_at_half_load": round(lowest_2x, 6),
+                                  "ratio": round(ratio, 6),
+                                  "required_ratio": 2.0,
+                                  "attempts": attempts},
+                "constraint_rank": rbm["constraint_rank"],
+                "nodes": int(len(m["node_tags"])),
+                "elements": int(len(m["connectivity"])),
+                "solver_binary": binary, "solver_threads": threads,
+                "solve_seconds": round(solve_s, 2),
+                "run_dir": str(run_dir),
+                "artifacts": [],
+            }
+            passed = lowest >= required
+        except Exception as exc:
+            self.log.close_action(
+                action_id, "fail", failure_mode=f"{type(exc).__name__}: {exc}")
+            raise
+
+        if passed:
+            self.log.close_action(action_id, "pass", details=details)
+        else:
+            self.log.close_action(
+                action_id, "fail", details=details,
+                failure_mode=(
+                    f"elastic_buckling: factor {lowest:.4f} < required "
+                    f"{required} (the applied load reaches "
+                    f"{100.0 / lowest:.1f}% of the elastic critical load)"))
+        return {"result": "pass" if passed else "fail",
+                "action_id": action_id,
+                "failure_id": None if passed else action_id,
+                "safety_factor": lowest, "buckling_factors": factors,
+                "scaling_ratio": ratio}
 
     def fea_static(self, geometry_id: str, case: dict, reason: str) -> dict:
         action_id = self.log.open_action(
