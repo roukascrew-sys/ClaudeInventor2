@@ -185,8 +185,33 @@ def mass_properties(spec: dict, solid: cq.Workplane) -> dict[str, Any]:
     density = spec.get("density_kg_m3")
     if density is not None:
         # estimate: derived purely from the user-supplied density, not measured
-        props["mass_kg_estimate"] = round(shape.Volume() * 1e-9 * density, 9)
+        mass_kg = shape.Volume() * 1e-9 * density
+        props["mass_kg_estimate"] = round(mass_kg, 9)
+        props["inertia_kg_m2_about_com"] = inertia_about_com(shape, density)
     return props
+
+
+def inertia_about_com(shape, density_kg_m3: float) -> list[list[float]]:
+    """Exact inertia tensor about the centre of mass, in kg*m^2.
+
+    Computed from the real solid via OpenCascade's volume properties (verified
+    against the analytic box result m(b^2+c^2)/12), not approximated from the
+    bounding box - a bounding-box inertia would silently mis-state the
+    rotational dynamics of anything that is not a solid cuboid.
+
+    OCC returns volume moments in mm^5 for unit density; multiplying by
+    density (kg/m^3) and 1e-15 converts mm^5 -> m^5 * (kg/m^3) = kg*m^2.
+    """
+    from OCP.BRepGProp import BRepGProp
+    from OCP.GProp import GProp_GProps
+    from OCP.gp import gp_Pnt
+
+    com = shape.Center()
+    props = GProp_GProps(gp_Pnt(com.x, com.y, com.z))
+    BRepGProp.VolumeProperties_s(shape.wrapped, props)
+    m = props.MatrixOfInertia()
+    k = density_kg_m3 * 1e-15
+    return [[round(m.Value(i, j) * k, 12) for j in (1, 2, 3)] for i in (1, 2, 3)]
 
 
 def apply_changes(spec: dict, changes: dict[str, Any]) -> tuple[dict, list[dict]]:

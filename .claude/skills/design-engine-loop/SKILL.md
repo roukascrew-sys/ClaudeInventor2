@@ -18,9 +18,12 @@ ever claimed that the log cannot back.
   experiments go to a scratch root, never the real `data\`.
 - API surface (all on `DesignEngine(root)`): `create_part`, `edit_part`,
   `get_part`, `create_assembly`, `check_tolerance_stackup`, `run_fea_static`,
-  `sign_off`, `generate_bom`, `export_production_package`, `generate_viewer`,
-  `generate_report`, plus `eng.log` queries (`failures`, `failure_mode_counts`,
-  `version_history`, `lineage`, `pending_actions`).
+  `run_kinematics`, `sign_off`, `generate_bom`, `export_production_package`,
+  `generate_viewer`, `generate_assembly_viewer`, `generate_report`, plus
+  `eng.log` queries (`failures`, `failure_mode_counts`, `version_history`,
+  `lineage`, `pending_actions`).
+- Kinematics runs in a SEPARATE conda env (`chrono`), bridged by subprocess.
+  Never add pychrono to the pip venv. `chrono_available()` reports status.
 
 ## Hard rules (some enforced in code, all enforced in process)
 
@@ -98,6 +101,18 @@ size chosen in Step 3. Then check the solver against Step 2:
 - max stress location — is the peak where the mechanics says it belongs?
 If the SF lands within ~20% of `required_SF`, refine the mesh once and re-run:
 a gate decision on an unconverged number is not a decision.
+
+### Step 5b — If the part is in a mechanism, compute the load rather than assume it
+An assembly with `joints` can be solved by `run_kinematics`, and its peak joint
+reaction is returned in newtons — directly usable as a `force_total_N` for
+`run_fea_static`. Prefer that over an assumed load, and say in the FEA
+`reason` which kinematics log row the number came from.
+
+Joint type is a mechanical decision, never a default: `revolute` carries
+bending moment (the force couple between joints vanishes), `spherical` is
+force-only (the couple appears). For sizing a part that a joint pulls on,
+`spherical` is usually the honest choice — `revolute` hides that pull as an
+internal moment. Both are verified against closed form.
 
 ### Step 6 — Gate outcome
 - **Pass:** regenerate the report; present SF, margins, and any residual

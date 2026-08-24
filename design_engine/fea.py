@@ -261,7 +261,7 @@ def _write_inp(path: Path, mesh: dict, case: dict,
             for dof, val in enumerate(nodal[tag], start=1):
                 if val != 0:
                     lines.append(f"{tag}, {dof}, {val:.9g}")
-    lines += ["*NODE FILE", "U", "*EL FILE", "S", "*END STEP", ""]
+    lines += ["*NODE FILE", "U, RF", "*EL FILE", "S", "*END STEP", ""]
     path.write_text("\n".join(lines), encoding="ascii")
 
 
@@ -293,6 +293,92 @@ def _parse_frd(frd_path: Path) -> dict[str, dict[int, list[float]]]:
             node = int(line[3:13])
             current[node] = [float(v) for v in _FRD_FLOAT.findall(line[13:])]
     return blocks
+
+
+def check_equilibrium(mesh: dict, forc: dict, constraint_sets: list,
+                      load_sets: list, ctx: str, rel_tol: float = 1e-4) -> dict:
+    """Verify the solution satisfies global force equilibrium.
+
+    CalculiX's RF output gives the TOTAL nodal force at each node - applied
+    load plus constraint reaction. For a converged static solution those must
+    cancel over the whole model: sum over ALL nodes = 0.
+
+    Summing over the constrained nodes only would be wrong: a node can be both
+    loaded and constrained (the beam's midspan axial restraint shares nodes
+    with the load patch), and its FORC already contains the applied term, so
+    that sum double-counts. The global sum has no such overlap.
+
+    This is a physics-level check on the SOLUTION, not on the input deck, so
+    it catches a corrupted or partially-read result whatever the cause - which
+    matters because three intermittent, non-reproducible bad results were seen
+    in development (one turning a passing gate into a failing one) and neither
+    the mesh nor the solver could be shown non-deterministic in isolation. A
+    solve that does not balance is not a solve, and no safety factor is
+    derived from it.
+    """
+    applied = np.zeros(3)
+    for nodal in load_sets:
+        for vec in nodal.values():
+            applied += np.asarray(vec, dtype=float)
+
+    net = np.zeros(3)
+    for vals in forc.values():
+        net += np.asarray(vals[:3], dtype=float)
+
+    scale = max(float(np.linalg.norm(applied)), 1e-9)
+    rel = float(np.linalg.norm(net)) / scale
+    stats = {"applied_N": [round(v, 6) for v in applied.tolist()],
+             "net_nodal_force_N": [round(v, 9) for v in net.tolist()],
+             "residual_rel": round(rel, 12),
+             "records": len(forc)}
+    if not forc:
+        raise FeaError(
+            f"{ctx}: no reaction-force (RF) output in job.frd - equilibrium "
+            f"could not be verified, so the result is not trusted.")
+    if rel > rel_tol:
+        raise FeaError(
+            f"{ctx}: equilibrium_violation: nodal forces do not sum to zero. "
+            f"applied={applied.tolist()} N, net={net.tolist()} N, relative "
+            f"residual {rel:.3e} exceeds {rel_tol:.0e}. The solution is not "
+            f"trustworthy and no safety factor is derived from it.")
+    return stats
+
+
+def _check_results_complete(mesh: dict, disp: dict, stress: dict,
+                            run_dir: Path) -> None:
+    """Refuse a result set that is not a complete, finite solution.
+
+    The gate is computed from these numbers, so a partial or mis-parsed .frd
+    must fail loudly rather than yield a plausible-looking safety factor. A
+    correct run has exactly one entry per mesh node with 3 displacement and 6
+    stress components, all finite; anything else means the file was truncated,
+    the solver stopped early, or the fixed-format parse drifted.
+
+    This guard exists because three intermittent, non-reproducible bad results
+    were observed during development (a 5618 MPa peak, a displacement 2.5% off
+    with the mesh unchanged, and a peak in the wrong location). The mesh and
+    the solver were each proved deterministic in isolation, so the fault was
+    never pinned down - this converts that failure mode from silent to loud.
+    """
+    n = len(mesh["node_tags"])
+    if len(disp) != n or len(stress) != n:
+        raise FeaError(
+            f"incomplete_results: solver returned {len(disp)} displacement and "
+            f"{len(stress)} stress records for a {n}-node mesh (expected {n} "
+            f"of each). The .frd in {run_dir} is truncated or was read before "
+            f"it was complete; the run is not trustworthy and no safety factor "
+            f"is derived from it.")
+    for name, table, width in (("DISP", disp, 3), ("STRESS", stress, 6)):
+        for node, vals in table.items():
+            if len(vals) < width:
+                raise FeaError(
+                    f"malformed_results: {name} record for node {node} has "
+                    f"{len(vals)} components, expected {width} (parse drift in "
+                    f"{run_dir}/job.frd)")
+            if any(not math.isfinite(v) for v in vals[:width]):
+                raise FeaError(
+                    f"nonfinite_results: {name} record for node {node} contains "
+                    f"NaN or Inf - the solve diverged ({run_dir}/job.frd)")
 
 
 def von_mises(s: list[float]) -> float:
@@ -419,6 +505,10 @@ class ValidationTools:
             disp = blocks.get("DISP")
             if not stress or not disp:
                 raise FeaError("solver produced no STRESS/DISP results in job.frd")
+            _check_results_complete(m, disp, stress, run_dir)
+            equilibrium = check_equilibrium(
+                m, blocks.get("FORC", {}), constraint_sets, load_sets,
+                f"run {run_dir.name}")
 
             vm = {n: von_mises(s) for n, s in stress.items()}
             coords = {int(t): c for t, c in zip(m["node_tags"], m["coords"])}
@@ -475,6 +565,8 @@ class ValidationTools:
                 "max_von_mises_at_mm": [round(v, 3) for v in coords[int(max_node)]],
                 "max_displacement_mm": round(max_disp, 9),
                 "nodes": int(len(m["node_tags"])),
+                "result_records": {"disp": len(disp), "stress": len(stress)},
+                "equilibrium": equilibrium,
                 "elements": int(len(m["connectivity"])),
                 "run_dir": str(run_dir),
                 "constraint_rank": rbm["constraint_rank"],

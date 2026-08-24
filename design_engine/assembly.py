@@ -51,6 +51,11 @@ from .parts import PartStore, _check_reason
 
 _AID_RE = re.compile(r"^A\d{4}$")
 
+# Joint types the kinematics layer understands. Mechanically distinct:
+# revolute carries bending moment; spherical is force-only. Both are verified
+# against closed-form door-reaction results in tests/test_kinematics.py.
+JOINT_TYPES = ("revolute", "spherical")
+
 
 class AssemblyNotFound(KeyError):
     pass
@@ -73,16 +78,77 @@ def validate_assembly_spec(spec: dict, parts: PartStore) -> None:
         raise SpecError("assembly spec must be a dict")
     if spec.get("units") != "mm":
         raise SpecError(f"assembly units must be 'mm', got {spec.get('units')!r}")
+    extra_top = set(spec) - {"name", "units", "components", "chains", "joints"}
+    if extra_top:
+        raise SpecError(f"assembly has unexpected keys: {sorted(extra_top)}")
     if not isinstance(spec.get("name"), str) or not spec["name"]:
         raise SpecError("assembly needs a non-empty 'name'")
     comps = spec.get("components")
     if not isinstance(comps, list) or not comps:
         raise SpecError("assembly needs a non-empty 'components' list")
+    refs = []
     for i, comp in enumerate(comps):
         gid = comp.get("geometry_id") if isinstance(comp, dict) else None
         if not gid:
             raise SpecError(f"components[{i}]: 'geometry_id' required")
+        extra = set(comp) - {"geometry_id", "at", "ref"}
+        if extra:
+            raise SpecError(f"components[{i}]: unexpected keys {sorted(extra)}")
         parts.get_part(gid)  # raises PartNotFound if the version doesn't exist
+        ref = comp.get("ref", f"c{i}")
+        if not isinstance(ref, str) or not ref:
+            raise SpecError(f"components[{i}].ref must be a non-empty string")
+        if ref in refs:
+            raise SpecError(f"components[{i}]: duplicate ref {ref!r} - refs "
+                            f"name instances, so the same part used twice "
+                            f"needs two distinct refs")
+        refs.append(ref)
+
+    # 'joints' is optional: without it an assembly is a parts list (placement
+    # + tolerance chains). With it, it is a mechanism the kinematics layer can
+    # solve. Validated here so a malformed joint is caught at creation.
+    joints = spec.get("joints")
+    if joints is not None:
+        if not isinstance(joints, list) or not joints:
+            raise SpecError("assembly 'joints', if present, must be non-empty")
+        jids = []
+        for i, j in enumerate(joints):
+            if not isinstance(j, dict):
+                raise SpecError(f"joints[{i}] must be a dict")
+            extra = set(j) - {"id", "type", "between", "at", "axis"}
+            if extra:
+                raise SpecError(f"joints[{i}]: unexpected keys {sorted(extra)}")
+            if j.get("type") not in JOINT_TYPES:
+                raise SpecError(
+                    f"joints[{i}].type must be one of {sorted(JOINT_TYPES)}, "
+                    f"got {j.get('type')!r}. The choice is mechanical, not "
+                    f"cosmetic: 'revolute' carries bending moment, "
+                    f"'spherical' is force-only and produces the force couple "
+                    f"a real hinge leaf sees.")
+            between = j.get("between")
+            if not (isinstance(between, list) and len(between) == 2):
+                raise SpecError(f"joints[{i}].between: [refA, refB] required")
+            missing = [b for b in between if b not in refs]
+            if missing:
+                raise SpecError(
+                    f"joints[{i}].between references unknown component ref(s) "
+                    f"{missing}; assembly refs are {refs}")
+            if between[0] == between[1]:
+                raise SpecError(f"joints[{i}]: cannot join a component to itself")
+            at = j.get("at")
+            if not (isinstance(at, list) and len(at) == 3
+                    and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                            for v in at)):
+                raise SpecError(f"joints[{i}].at: [x, y, z] in mm required")
+            axis = j.get("axis", [0, 0, 1])
+            if not (isinstance(axis, list) and len(axis) == 3):
+                raise SpecError(f"joints[{i}].axis: [ax, ay, az] required")
+            if all(v == 0 for v in axis):
+                raise SpecError(f"joints[{i}].axis: must be a non-zero vector")
+            jid = j.get("id", f"j{i}")
+            if jid in jids:
+                raise SpecError(f"joints[{i}]: duplicate joint id {jid!r}")
+            jids.append(jid)
     chains = spec.get("chains")
     if not isinstance(chains, list) or not chains:
         raise SpecError("assembly needs a non-empty 'chains' list")

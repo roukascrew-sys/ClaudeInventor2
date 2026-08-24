@@ -49,7 +49,33 @@ self-contained and reproducible offline:
 `gmsh` (pip) provides STEP → tetrahedral meshing for the solver and is pinned
 in `requirements.txt`.
 
-## 4. Orchestration skill
+## 4. Kinematics environment (Project Chrono) — separate by necessity
+
+PyChrono is distributed **conda-only** and pins dependencies that conflict with
+this pip venv, so it must NOT be installed alongside CadQuery. It lives in its
+own Miniforge environment and is driven over a subprocess/JSON boundary
+(`design_engine/chrono_worker.py`), which is the only supported arrangement.
+
+```
+winget install --id CondaForge.Miniforge3 -e
+%USERPROFILE%\miniforge3\Scripts\conda.exe create -n chrono python=3.12 -y
+%USERPROFILE%\miniforge3\Scripts\conda.exe install -n chrono projectchrono::pychrono -c conda-forge -y
+```
+
+Verified working 2026-08-24 with PyChrono on Python 3.12.14 and numpy 2.5.2 —
+the old-numpy pin that originally motivated deferring Chrono no longer applies
+to this build.
+
+Note: run it through `conda run -n chrono`, not by calling the env's
+`python.exe` directly. A direct call leaves `Libraryin` off PATH and the
+PyChrono DLL load hangs rather than erroring. `kinematics.py` already does
+this correctly.
+
+If the env is absent, `run_kinematics` refuses with setup instructions — it
+never silently falls back to an approximation. `design_engine.kinematics.
+chrono_available()` reports status, and the kinematics tests skip cleanly.
+
+## 5. Orchestration skill
 
 The `design-engine-loop` skill (Phase 7) packages the operating process for
 Claude Code. Canonical copy: `.claude/skills/design-engine-loop/SKILL.md` in
@@ -62,7 +88,7 @@ copy .claude\skills\design-engine-loop\SKILL.md ^
 
 Keep the two copies identical (the skill's own editing notes say the same).
 
-## 5. Verify
+## 6. Verify
 
 ```
 .venv\Scripts\python.exe smoke_test.py

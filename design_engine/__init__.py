@@ -37,6 +37,7 @@ class DesignEngine:
         from .fea import ValidationTools
         from .production import ProductionTools
         from .sourcing import SourcingTools
+        from .kinematics import KinematicsTools
         from .viewer import ViewerTools
         self.validation = ValidationTools(
             self.root, self.log, self.parts, ccx_path or _DEFAULT_CCX)
@@ -45,6 +46,8 @@ class DesignEngine:
             self.root, self.log, self.parts, self.production)
         self.viewer = ViewerTools(
             self.root, self.log, self.parts, self.production, self.assemblies)
+        self.kinematics = KinematicsTools(
+            self.root, self.log, self.parts, self.assemblies)
 
     # Phase 1 contracts
     def create_part(self, spec: dict, reason: str) -> dict:
@@ -57,6 +60,10 @@ class DesignEngine:
 
     def run_fea_static(self, geometry_id: str, case: dict, reason: str) -> dict:
         return self.validation.fea_static(geometry_id, case, reason)
+
+    def run_kinematics(self, assembly_id: str, motion_case: dict,
+                       reason: str) -> dict:
+        return self.kinematics.run_kinematics(assembly_id, motion_case, reason)
 
     def sign_off(self, geometry_id: str, signed_off_by: str, statement: str) -> dict:
         return self.production.sign_off(geometry_id, signed_off_by, statement)
