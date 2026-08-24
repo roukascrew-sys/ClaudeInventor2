@@ -104,6 +104,30 @@ def test_gate_fail_writes_failure_record_then_edit_references_it(eng, bar_gid):
                       addresses_failure_id=999999)
 
 
+def test_degenerate_mesh_is_named_not_dumped_on_the_solver(eng):
+    """A mesh too coarse for the feature must fail with an actionable reason.
+
+    10x10 bar with a 6.6 mm axial bore leaves 1.7 mm walls; at 4 mm elements
+    the midside nodes projected onto the bore invert elements. CalculiX aborts
+    with a bare 'nonpositive jacobian determinant in element N'. The engine
+    must catch this first and say what to change.
+    """
+    gid = eng.create_part(
+        {"name": "thin-wall-tube", "units": "mm",
+         "features": [{"op": "box", "x": 10, "y": 10, "z": 100},
+                      {"op": "hole", "d": 6.6, "at": [0, 0]}]},
+        reason="deliberately thin-walled bore")["geometry_id"]
+    case = _case(1000, 2.0)
+    case["mesh"]["max_size_mm"] = 4.0
+    with pytest.raises(MeshError, match="degenerate_mesh") as exc:
+        eng.run_fea_static(gid, case, reason="coarse mesh on a thin wall")
+    assert "max_size_mm" in str(exc.value)      # names the knob to turn
+    row = eng.log.rows(action="fea_static", result="fail")[-1]
+    assert "degenerate_mesh" in row["failure_mode"]
+    # and it never reached the solver
+    assert "nonpositive jacobian" not in (row["failure_mode"] or "")
+
+
 def test_case_validation_rejects_garbage(eng, bar_gid):
     good = _case(1000, 2.0)
     bad_extra = _case(1000, 2.0); bad_extra["turbo"] = True

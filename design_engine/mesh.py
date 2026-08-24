@@ -70,8 +70,72 @@ def mesh_step(step_path: str | Path, max_size_mm: float,
     finally:
         gmsh.finalize()
 
-    return {"node_tags": node_tags, "coords": coords, "connectivity": conn,
+    mesh = {"node_tags": node_tags, "coords": coords, "connectivity": conn,
             "tri6": tri6}
+    mesh["quality"] = check_element_quality(mesh, max_size_mm)
+    return mesh
+
+
+# 4-point Gauss rule for tetrahedra, plus the 4 corners. Checking only corner
+# volumes is not enough for C3D10: on curved faces the midside nodes are
+# projected onto the surface, which can invert an element whose corners are
+# still fine — exactly the case a coarse mesh on a thin bore wall produces.
+_A, _B = 0.5854101966249685, 0.1381966011250105
+_CHECK_POINTS = np.array([
+    (0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0),
+    (_A, _B, _B), (_B, _A, _B), (_B, _B, _A), (_B, _B, _B),
+])
+
+
+def _c3d10_shape_derivatives(g: float, h: float, r: float) -> np.ndarray:
+    """d(N_i)/d(g,h,r) for the 10-node tet in Abaqus/CalculiX node order.
+
+    Returns a (3, 10) array. L1..L4 are the barycentric coordinates.
+    """
+    L1, L2, L3, L4 = 1.0 - g - h - r, g, h, r
+    d = np.zeros((3, 10))
+    # d/dg
+    d[0] = [-(4 * L1 - 1), 4 * L2 - 1, 0.0, 0.0,
+            4 * (L1 - L2), 4 * L3, -4 * L3, -4 * L4, 4 * L4, 0.0]
+    # d/dh
+    d[1] = [-(4 * L1 - 1), 0.0, 4 * L3 - 1, 0.0,
+            -4 * L2, 4 * L2, 4 * (L1 - L3), -4 * L4, 0.0, 4 * L4]
+    # d/dr
+    d[2] = [-(4 * L1 - 1), 0.0, 0.0, 4 * L4 - 1,
+            -4 * L2, 0.0, -4 * L3, 4 * (L1 - L4), 4 * L2, 4 * L3]
+    return d
+
+
+def check_element_quality(mesh: dict, max_size_mm: float) -> dict:
+    """Reject meshes CalculiX would reject, with an actionable message.
+
+    Evaluates the isoparametric Jacobian determinant of every C3D10 element at
+    its corners and Gauss points. A non-positive determinant means the element
+    is inverted or degenerate; ccx aborts on these with a bare
+    'nonpositive jacobian determinant in element N', which says nothing about
+    what to change. Raises MeshError naming the count and the likely cause.
+    """
+    coords = {int(t): c for t, c in zip(mesh["node_tags"], mesh["coords"])}
+    conn = mesh["connectivity"]
+    xyz = np.stack([np.array([coords[int(t)] for t in row]) for row in conn])
+    dets = np.empty((len(conn), len(_CHECK_POINTS)))
+    for k, (g, h, r) in enumerate(_CHECK_POINTS):
+        dN = _c3d10_shape_derivatives(g, h, r)      # (3, 10)
+        J = np.einsum("in,enj->eij", dN, xyz)       # (elements, 3, 3)
+        dets[:, k] = np.linalg.det(J)
+    min_per_elem = dets.min(axis=1)
+    bad = np.flatnonzero(min_per_elem <= 0.0)
+    stats = {"elements": int(len(conn)),
+             "min_jacobian": float(min_per_elem.min()),
+             "degenerate_elements": int(len(bad))}
+    if len(bad):
+        raise MeshError(
+            f"degenerate_mesh: {len(bad)} of {len(conn)} elements have a "
+            f"non-positive Jacobian (worst {min_per_elem.min():.4g}); CalculiX "
+            f"would abort on these. The mesh size ({max_size_mm} mm) is too "
+            f"coarse for the smallest feature — reduce case.mesh.max_size_mm "
+            f"below the thinnest wall/radius, or thicken that feature.")
+    return stats
 
 
 def select_nodes(mesh: dict, where: dict) -> np.ndarray:

@@ -31,7 +31,25 @@ in-repo, not GitHub Releases):
 `tools/` is gitignored (25 MB of binaries); this file is the record of exactly
 what goes there.
 
-## 3. Verify
+## 3. Vendored assets (in-repo, no download step)
+
+Committed under `design_engine/data/` because the outputs must be
+self-contained and reproducible offline:
+
+- `three.min.js` — three.js **r147** UMD build, MIT licence, 594 KB, from
+  `https://unpkg.com/three@0.147.0/build/three.min.js`. Inlined into every
+  generated viewer. r147 is used deliberately: it is the last line with a UMD
+  build, so the viewer needs no import map or module loader and works from a
+  plain `file://` open.
+- `viewer_template.html` — the viewer shell; `%%THREE_JS%%` and `%%PAYLOAD%%`
+  are substituted at generation time.
+- `price_book.json` — cached public supplier pricing (see Phase 6 notes in the
+  build plan). Prices are **not live**; re-capture before purchasing.
+
+`gmsh` (pip) provides STEP → tetrahedral meshing for the solver and is pinned
+in `requirements.txt`.
+
+## 4. Verify
 
 ```
 .venv\Scripts\python.exe smoke_test.py

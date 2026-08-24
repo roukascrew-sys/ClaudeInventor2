@@ -37,10 +37,13 @@ class DesignEngine:
         from .fea import ValidationTools
         from .production import ProductionTools
         from .sourcing import SourcingTools
+        from .viewer import ViewerTools
         self.validation = ValidationTools(
             self.root, self.log, self.parts, ccx_path or _DEFAULT_CCX)
         self.production = ProductionTools(self.root, self.log, self.parts)
         self.sourcing = SourcingTools(
+            self.root, self.log, self.parts, self.production)
+        self.viewer = ViewerTools(
             self.root, self.log, self.parts, self.production)
 
     # Phase 1 contracts
@@ -65,6 +68,10 @@ class DesignEngine:
                      budget_usd: float | None = None) -> dict:
         return self.sourcing.generate_bom(geometry_id, bom_spec, reason,
                                           budget_usd=budget_usd)
+
+    def generate_viewer(self, geometry_id: str, reason: str,
+                        out_path: str | Path | None = None) -> dict:
+        return self.viewer.generate_viewer(geometry_id, reason, out_path)
 
     def get_part(self, geometry_id: str) -> dict:
         return self.parts.get_part(geometry_id)
