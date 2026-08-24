@@ -30,6 +30,7 @@ import pychrono as chrono
 JOINT_TYPES = {
     "revolute": chrono.ChLinkLockRevolute,
     "spherical": chrono.ChLinkLockSpherical,
+    "point_plane": chrono.ChLinkLockPointPlane,
 }
 
 
@@ -60,6 +61,22 @@ def _axis_quaternion(axis):
     q = chrono.ChQuaterniond(1 + dot, cross.x, cross.y, cross.z)
     q.Normalize()
     return q
+
+
+def apply_external_forces(job, bodies):
+    """Point loads at a body-local offset from its COM, world-frame force.
+
+    Uses the modern ChLoadBodyForce/ChLoadContainer mechanism, not the
+    legacy ChForce/body.AddForce() API -- that one segfaults in this Chrono
+    build (verified directly: a minimal repro crashes the process).
+    """
+    container = chrono.ChLoadContainer()
+    for f in job.get("external_forces", []):
+        body = bodies[f["body"]]
+        load = chrono.ChLoadBodyForce(
+            body, _v(f["force_N"]), False, _v(f["at_m"]), False)
+        container.Add(load)
+    return container
 
 
 def build_system(job):
@@ -117,6 +134,8 @@ def reactions(links):
 
 def run(job):
     sys_, bodies, links = build_system(job)
+    loads = apply_external_forces(job, bodies)
+    sys_.Add(loads)
     analysis = job.get("analysis", "static")
 
     if analysis == "static":

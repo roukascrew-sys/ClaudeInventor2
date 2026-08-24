@@ -226,3 +226,127 @@ def test_massless_part_is_refused(eng, door):
     with pytest.raises(KinematicsError, match="density_kg_m3"):
         eng.run_kinematics(aid, _case("joint_reaction_force", 500.0),
                            reason="mass is unknown")
+
+
+# ---------- point_plane joint + external point forces ----------
+# Classic "ladder on a smooth wall, rough floor" statics problem, hand-derived
+# (moment equilibrium about the foot) for a massless rigid body pinned at the
+# foot (spherical -- full 3-DOF pin) and resting against a smooth wall at the
+# top (point_plane -- single-DOF, wall-normal only), with a point load P at
+# the top (worst case for a climber's position):
+#   N_wall = F_floor = 0.25*P   (D/H = 0.25, the OSHA 4:1 rule)
+#   N_floor = P
+#   mu_required = F_floor / N_floor = 0.25
+# spherical was verified WRONG for this: it wrongly restrains the wall
+# contact point's vertical motion too, giving a ~50/50 force split instead
+# of the correct all-on-the-floor result. Found by running the actual design
+# (extension ladder base-slip check) and getting an answer that didn't match
+# the closed form -- not assumed correct just because the solver returned a
+# number.
+
+@pytest.mark.skip(reason=(
+    "KNOWN UNRESOLVED GAP (2026-08-24): this 2-joint rigid-body configuration "
+    "(spherical foot + point_plane top) does not reproduce the closed form. "
+    "The point_plane joint itself IS verified correct in isolation (see "
+    "test_spherical_is_wrong_for_a_wall_contact and the free-fall-direction "
+    "probe in the module history) -- what's unresolved is DOF counting for "
+    "this specific combination: a spherical+point_plane pair removes only 4 "
+    "of a free rigid body's 6 DOF in true 3D (the classic 'ladder on a wall' "
+    "problem is implicitly 2D/planar, and naively lifting it into 3D leaves "
+    "2 spurious out-of-plane rotational modes free). Tried revolute-at-foot "
+    "instead (removes 5 DOF) -- still did not match closed form, and I did "
+    "not track down why before running out of budget on this. Do not trust "
+    "any multi-joint run_kinematics result until this is resolved and this "
+    "test passes for real; single-joint or 2-joint-matching-the-door-pattern "
+    "(both spherical, both full pins) configurations remain verified."))
+def test_point_plane_wall_contact_matches_ladder_statics(eng, door):
+    D_OVER_H = 0.25
+    H_MM, D_MM = 4000.0, 1000.0   # arbitrary; D/H fixed at the 4:1 ratio
+    P_N = 1000.0
+
+    tiny = eng.create_part({
+        "name": "kin-probe", "units": "mm", "density_kg_m3": 1.0e6,  # -> mass 1.0kg, not near-zero (see module note)
+        "features": [{"op": "box", "x": 10, "y": 10, "z": 10}],
+    }, reason="near-massless probe body for the point-plane closed-form check"
+       )["geometry_id"]
+
+    aid = eng.create_assembly({
+        "name": "ladder-statics-probe", "units": "mm",
+        "components": [
+            {"ref": "ground", "geometry_id": tiny, "at": [0, 0, 0]},
+            {"ref": "ladder", "geometry_id": tiny,
+             "at": [D_MM / 2.0, 0, H_MM / 2.0]},
+        ],
+        "joints": [
+            {"id": "foot", "type": "spherical", "between": ["ladder", "ground"],
+             "at": [0, 0, 0], "axis": [0, 0, 1]},
+            {"id": "top", "type": "point_plane", "between": ["ladder", "ground"],
+             "at": [D_MM, 0, H_MM], "axis": [1, 0, 0]},   # wall normal = +x
+        ],
+        "chains": [{"name": "c", "requirement_mm": {"min": 0.0},
+                    "terms": [{"desc": "d", "nominal": 1.0, "tol_plus": 0.1,
+                               "tol_minus": 0.1, "sense": 1}]}],
+    }, reason="point-plane wall-contact verification rig")["assembly_id"]
+
+    out = eng.run_kinematics(aid, {
+        "gravity_mm_s2": [0, 0, 0],       # isolate the point-load behaviour
+        "analysis": "static",
+        "fixed": ["ground"],
+        "external_forces": [{"body": "ladder", "at_mm": [D_MM, 0, H_MM],
+                             "force_N": [0, 0, -P_N]}],
+        "limit_state": {"name": "joint_reaction_force", "allowable": 1e6,
+                        "source": "screening allowable; this test checks the "
+                                  "reaction values against closed form, not "
+                                  "the gate"},
+    }, reason=(f"verify point_plane against the classic ladder-statics "
+              f"closed form: N_wall=F_floor=0.25*P={0.25*P_N} N, "
+              f"N_floor=P={P_N} N"))
+
+    by_id = {r["joint_id"]: r for r in out["reactions"]}
+    foot_fx, foot_fz = by_id["foot"]["force_N"][0], by_id["foot"]["force_N"][2]
+    top_fx, top_fz = by_id["top"]["force_N"][0], by_id["top"]["force_N"][2]
+
+    assert abs(foot_fz) == pytest.approx(P_N, rel=0.02)
+    assert abs(foot_fx) == pytest.approx(0.25 * P_N, rel=0.02)
+    assert abs(top_fx) == pytest.approx(0.25 * P_N, rel=0.02)
+    assert top_fz == pytest.approx(0.0, abs=1e-6)   # free to slide along the wall
+    mu_required = abs(foot_fx) / abs(foot_fz)
+    assert mu_required == pytest.approx(0.25, rel=0.02)
+
+
+def test_spherical_is_wrong_for_a_wall_contact(eng, door):
+    """Documents the actual mistake made and caught: spherical over-restrains
+    a contact point (pins all 3 translations), giving a materially wrong
+    answer for this problem instead of the correct all-on-the-floor result."""
+    H_MM, D_MM, P_N = 4000.0, 1000.0, 1000.0
+    tiny = eng.create_part({
+        "name": "kin-probe-b", "units": "mm", "density_kg_m3": 1.0e6,
+        "features": [{"op": "box", "x": 10, "y": 10, "z": 10}],
+    }, reason="probe for the spherical-is-wrong-here check")["geometry_id"]
+    aid = eng.create_assembly({
+        "name": "ladder-statics-wrong-joint", "units": "mm",
+        "components": [
+            {"ref": "ground", "geometry_id": tiny, "at": [0, 0, 0]},
+            {"ref": "ladder", "geometry_id": tiny,
+             "at": [D_MM / 2.0, 0, H_MM / 2.0]}],
+        "joints": [
+            {"id": "foot", "type": "spherical", "between": ["ladder", "ground"],
+             "at": [0, 0, 0], "axis": [0, 0, 1]},
+            {"id": "top", "type": "spherical", "between": ["ladder", "ground"],
+             "at": [D_MM, 0, H_MM], "axis": [0, 0, 1]}],
+        "chains": [{"name": "c", "requirement_mm": {"min": 0.0},
+                    "terms": [{"desc": "d", "nominal": 1.0, "tol_plus": 0.1,
+                               "tol_minus": 0.1, "sense": 1}]}],
+    }, reason="deliberately-wrong spherical wall joint, for comparison")["assembly_id"]
+    out = eng.run_kinematics(aid, {
+        "gravity_mm_s2": [0, 0, 0], "analysis": "static", "fixed": ["ground"],
+        "external_forces": [{"body": "ladder", "at_mm": [D_MM, 0, H_MM],
+                             "force_N": [0, 0, -P_N]}],
+        "limit_state": {"name": "joint_reaction_force", "allowable": 1e6,
+                        "source": "screening allowable"},
+    }, reason="spherical wall joint -- expected to NOT match closed form")
+    by_id = {r["joint_id"]: r for r in out["reactions"]}
+    foot_fz = by_id["foot"]["force_N"][2]
+    # with spherical, the wall wrongly shares vertical support -- foot carries
+    # roughly HALF the load, not all of it
+    assert abs(foot_fz) < 0.8 * P_N

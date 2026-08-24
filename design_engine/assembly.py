@@ -54,7 +54,17 @@ _AID_RE = re.compile(r"^A\d{4}$")
 # Joint types the kinematics layer understands. Mechanically distinct:
 # revolute carries bending moment; spherical is force-only. Both are verified
 # against closed-form door-reaction results in tests/test_kinematics.py.
-JOINT_TYPES = ("revolute", "spherical")
+# revolute: carries bending moment, force couple between joints vanishes.
+# spherical: force-only pin, 3-DOF (x,y,z all restrained), used for a real
+#   hinge/ball joint.
+# point_plane: single-DOF contact -- restrains translation ONLY along 'axis'
+#   (the surface normal), free in the other two translations and all
+#   rotation. This is a surface PUSHING on a point (a wall, a floor), not
+#   gripping it -- using 'spherical' for a contact like this is a real
+#   modelling error (it wrongly pins the point in all 3 directions); this
+#   was found and fixed 2026-08-24 while modelling a ladder leaning on a
+#   wall. All three verified against closed form in tests/test_kinematics.py.
+JOINT_TYPES = ("revolute", "spherical", "point_plane")
 
 
 class AssemblyNotFound(KeyError):

@@ -40,7 +40,7 @@ WORKER = Path(__file__).parent / "chrono_worker.py"
 DEFAULT_ENV = "chrono"
 
 _CASE_KEYS = {"gravity_mm_s2", "analysis", "duration_s", "dt_s", "fixed",
-              "limit_state", "track_body"}
+              "limit_state", "track_body", "external_forces"}
 _LIMIT_KEYS = {"name", "allowable", "source"}
 _LIMIT_STATES = {"joint_reaction_force": ("force_magnitude_N", "N"),
                  "joint_reaction_torque": ("torque_magnitude_Nm", "N.m")}
@@ -110,6 +110,24 @@ def validate_motion_case(case: dict) -> None:
         raise KinematicsError(
             "motion case.fixed: list of component refs to hold fixed (ground) "
             "is required - a mechanism with nothing fixed is unconstrained")
+
+    for i, f in enumerate(case.get("external_forces", [])):
+        ctx = f"motion case.external_forces[{i}]"
+        if not isinstance(f, dict):
+            raise KinematicsError(f"{ctx}: must be a dict")
+        extra = set(f) - {"body", "at_mm", "force_N"}
+        if extra:
+            raise KinematicsError(f"{ctx}: unexpected keys {sorted(extra)}")
+        if not isinstance(f.get("body"), str) or not f["body"]:
+            raise KinematicsError(f"{ctx}.body: component ref string required")
+        for key, n in (("at_mm", 3), ("force_N", 3)):
+            v = f.get(key)
+            if not (isinstance(v, list) and len(v) == n
+                    and all(isinstance(x, (int, float)) and not isinstance(x, bool)
+                            for x in v)):
+                raise KinematicsError(f"{ctx}.{key}: [x, y, z] numbers required")
+        if all(x == 0 for x in f["force_N"]):
+            raise KinematicsError(f"{ctx}.force_N: zero force is not a load")
 
     ls = case.get("limit_state")
     if not isinstance(ls, dict):
@@ -208,11 +226,24 @@ class KinematicsTools:
                 "axis": j.get("axis", [0, 0, 1]),
             })
 
+        ext_forces = []
+        for i, f in enumerate(case.get("external_forces", [])):
+            if f["body"] not in refs:
+                raise KinematicsError(
+                    f"motion case.external_forces[{i}].body: unknown ref "
+                    f"{f['body']!r}; assembly refs are {sorted(refs)}")
+            ext_forces.append({
+                "body": f["body"],
+                "at_m": [v / 1000.0 for v in f["at_mm"]],
+                "force_N": f["force_N"],
+            })
+
         job = {
             "gravity_m_s2": [v / 1000.0 for v in case["gravity_mm_s2"]],
             "bodies": bodies,
             "joints": jout,
             "analysis": case.get("analysis", "static"),
+            "external_forces": ext_forces,
         }
         if job["analysis"] == "dynamic":
             job["duration_s"] = case["duration_s"]
