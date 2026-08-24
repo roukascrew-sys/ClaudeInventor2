@@ -49,7 +49,20 @@ self-contained and reproducible offline:
 `gmsh` (pip) provides STEP → tetrahedral meshing for the solver and is pinned
 in `requirements.txt`.
 
-## 4. Verify
+## 4. Orchestration skill
+
+The `design-engine-loop` skill (Phase 7) packages the operating process for
+Claude Code. Canonical copy: `.claude/skills/design-engine-loop/SKILL.md` in
+this repo. Install it for the Downloads project context with:
+
+```
+copy .claude\skills\design-engine-loop\SKILL.md ^
+  %USERPROFILE%\Downloads\.claude\skills\design-engine-loop\SKILL.md
+```
+
+Keep the two copies identical (the skill's own editing notes say the same).
+
+## 5. Verify
 
 ```
 .venv\Scripts\python.exe smoke_test.py
