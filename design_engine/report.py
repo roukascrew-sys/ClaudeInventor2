@@ -210,6 +210,56 @@ def generate_report(log: ActionLog, out_path: str | Path,
                 f'<span class="mono">{_esc(r["geometry_version"])}</span>',
                 diff_html, _esc(r["reason"] or "—")])
 
+        # --- sourcing: latest BOM per geometry version ---
+        bom_rows, bom_notes, seen_bom = [], [], set()
+        for row in reversed(rows):
+            if row["action"] != "generate_bom" or row["result"] != "pass":
+                continue
+            gid = row["geometry_version"]
+            if gid in seen_bom:
+                continue
+            seen_bom.add(gid)
+            det = _details(row)
+            for ln in det.get("lines", []):
+                qty = f'{ln["qty_required"]} req'
+                if ln.get("overbuy"):
+                    qty += f' / {ln["qty_purchased"]} bought'
+                elif ln["kind"] == "stock":
+                    qty += f' / {ln.get("bars")} bar(s)'
+                bom_rows.append([
+                    f'<span class="mono">{_esc(gid)}</span>',
+                    _esc(ln["ref"]),
+                    f'<a href="{_esc(ln["source_url"])}">'
+                    f'{_esc(ln["supplier"])} #{_esc(ln["part_number"])}</a>',
+                    _esc(ln["description"]), qty,
+                    _esc(f'{ln["total_usd"]:.2f}'),
+                ])
+            budget = det.get("budget")
+            note = (f'<p><b>{_esc(gid)}</b> — {det["assemblies"]} assemblies · '
+                    f'as-specified <b>${det["as_specified_total_usd"]:.2f}</b> · '
+                    f'min-cost baseline <b>${det["min_cost_total_usd"]:.2f}</b> '
+                    f'(saving ${det["min_cost_saving_usd"]:.2f})')
+            if budget:
+                note += (f' · budget ${budget["budget_usd"]:.2f} → '
+                         f'<b>{_esc(budget["label"])}</b>')
+            note += "</p>"
+            for sub in det.get("substitutions", []):
+                note += (f'<div class="warn">Min-cost substitution '
+                         f'<span class="mono">{_esc(sub["from_sku"])} → '
+                         f'{_esc(sub["sku"])}</span> saves '
+                         f'${sub["saving_usd"]:.2f} — NOT applied to the '
+                         f'as-specified BOM. Caveat: {_esc(sub["caveat"])}</div>')
+            pricing = det.get("pricing", {})
+            note += (f'<p class="meta">Prices as of {_esc(pricing.get("price_as_of"))} '
+                     f'({_esc(pricing.get("age_days"))} days old) · '
+                     f'{_esc(pricing.get("basis"))}</p>')
+            if pricing.get("staleness_warning"):
+                note += (f'<div class="missing">STALE PRICING: '
+                         f'{_esc(pricing["staleness_warning"])}</div>')
+            bom_notes.append(note)
+        bom_notes.reverse()
+        bom_rows.reverse()
+
         pending = [r for r in log.pending_actions() if r["id"] != action_id]
         pending_note = "" if not pending else (
             f'<div class="warn">⚠ {len(pending)} action(s) were never '
@@ -246,6 +296,10 @@ never authored independently.</p>
         val_rows, "No validation runs recorded yet — Phase 4 not started.")}
 <h2>Diagnostic images (from validation runs)</h2>
 {_embed_images(rows, data_root)}
+<h2>Sourcing / BOM — cached public pricing, not live supplier data</h2>
+{"".join(bom_notes)}
+{_table(["Version", "Ref", "Supplier / part #", "Description", "Qty", "USD"],
+        bom_rows, "No BOM generated yet — production is gated on sign-off.")}
 <h2>Failure log (FRACAS)</h2>
 {_table(["#", "When (UTC)", "Action", "Target", "Failure mode", "Reason given"],
         fail_rows, "No failures recorded.")}

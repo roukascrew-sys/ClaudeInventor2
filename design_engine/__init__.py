@@ -36,9 +36,12 @@ class DesignEngine:
         self.assemblies = AssemblyStore(self.root, self.log, self.parts)
         from .fea import ValidationTools
         from .production import ProductionTools
+        from .sourcing import SourcingTools
         self.validation = ValidationTools(
             self.root, self.log, self.parts, ccx_path or _DEFAULT_CCX)
         self.production = ProductionTools(self.root, self.log, self.parts)
+        self.sourcing = SourcingTools(
+            self.root, self.log, self.parts, self.production)
 
     # Phase 1 contracts
     def create_part(self, spec: dict, reason: str) -> dict:
@@ -57,6 +60,11 @@ class DesignEngine:
 
     def export_production_package(self, geometry_id: str, reason: str) -> dict:
         return self.production.export_production_package(geometry_id, reason)
+
+    def generate_bom(self, geometry_id: str, bom_spec: dict, reason: str,
+                     budget_usd: float | None = None) -> dict:
+        return self.sourcing.generate_bom(geometry_id, bom_spec, reason,
+                                          budget_usd=budget_usd)
 
     def get_part(self, geometry_id: str) -> dict:
         return self.parts.get_part(geometry_id)
