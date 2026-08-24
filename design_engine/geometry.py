@@ -48,6 +48,15 @@ class GeometryError(RuntimeError):
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-_]*$")
 _BASE_OPS = ("box", "cylinder")
 _ALL_OPS = ("box", "cylinder", "hole", "fillet")
+# Unknown keys are rejected, not ignored: a typo'd dimension name that silently
+# does nothing while the log records a successful edit is a worst-case failure.
+_ALLOWED_KEYS = {
+    "box": {"op", "x", "y", "z", "at", "mode"},
+    "cylinder": {"op", "d", "h", "at", "mode"},
+    "hole": {"op", "d", "at", "face"},
+    "fillet": {"op", "radius", "edges"},
+}
+_ALLOWED_TOP = {"name", "units", "features", "density_kg_m3", "notes", "description"}
 
 
 def canonical_json(spec: dict) -> str:
@@ -77,6 +86,9 @@ def validate_spec(spec: dict) -> None:
         raise SpecError(f"spec.name must match {_NAME_RE.pattern}, got {name!r}")
     if spec.get("units") != "mm":
         raise SpecError(f"spec.units must be 'mm', got {spec.get('units')!r}")
+    extra_top = set(spec) - _ALLOWED_TOP
+    if extra_top:
+        raise SpecError(f"spec has unexpected keys: {sorted(extra_top)}")
     feats = spec.get("features")
     if not isinstance(feats, list) or not feats:
         raise SpecError("spec.features must be a non-empty list")
@@ -86,6 +98,11 @@ def validate_spec(spec: dict) -> None:
         op = feat.get("op")
         if op not in _ALL_OPS:
             raise SpecError(f"features[{idx}].op: unknown op {op!r}, supported: {_ALL_OPS}")
+        extra = set(feat) - _ALLOWED_KEYS[op]
+        if extra:
+            raise SpecError(
+                f"features[{idx}] ({op}): unexpected keys {sorted(extra)} — "
+                f"allowed: {sorted(_ALLOWED_KEYS[op])}")
         if idx == 0:
             if op not in _BASE_OPS:
                 raise SpecError(f"features[0] must be a base solid {_BASE_OPS}, got {op!r}")

@@ -122,5 +122,51 @@ class ActionLog:
         rows = self.rows(geometry_version=geometry_version, result="pass")
         return rows[-1] if rows else None
 
+    # ---------- Phase 2: FRACAS queries ----------
+
+    def failures(self, failure_mode_like: str | None = None) -> list[sqlite3.Row]:
+        """All fail rows, optionally filtered by failure-mode substring."""
+        if failure_mode_like is None:
+            return self.rows(result="fail")
+        return list(self._conn.execute(
+            "SELECT * FROM actions WHERE result = 'fail'"
+            " AND failure_mode LIKE ? ORDER BY id",
+            (f"%{failure_mode_like}%",)))
+
+    def failure_mode_counts(self) -> list[tuple[str, int]]:
+        """Failure modes ranked by frequency — the FRACAS 'what keeps breaking' view."""
+        return [
+            (r["failure_mode"], r["n"])
+            for r in self._conn.execute(
+                "SELECT failure_mode, COUNT(*) AS n FROM actions"
+                " WHERE result = 'fail' GROUP BY failure_mode"
+                " ORDER BY n DESC, failure_mode")
+        ]
+
+    def version_history(self, part_number: str) -> list[sqlite3.Row]:
+        """Passed create/edit rows for every version of a part, oldest first."""
+        return list(self._conn.execute(
+            "SELECT * FROM actions WHERE result = 'pass'"
+            " AND action IN ('create_part', 'edit_part')"
+            " AND geometry_version LIKE ? ORDER BY id",
+            (f"{part_number}@v%",)))
+
+    def lineage(self, geometry_version: str) -> list[sqlite3.Row]:
+        """Rows from this version back to its root, walking linked_parent_id."""
+        chain: list[sqlite3.Row] = []
+        row = self.latest_pass_for(geometry_version)
+        seen: set[int] = set()
+        while row is not None and row["id"] not in seen:
+            chain.append(row)
+            seen.add(row["id"])
+            parent_id = row["linked_parent_id"]
+            row = None if parent_id is None else self._conn.execute(
+                "SELECT * FROM actions WHERE id = ?", (parent_id,)).fetchone()
+        return chain
+
+    def pending_actions(self) -> list[sqlite3.Row]:
+        """Rows never finalized — evidence of a crashed or interrupted run."""
+        return self.rows(result="pending")
+
     def close(self) -> None:
         self._conn.close()

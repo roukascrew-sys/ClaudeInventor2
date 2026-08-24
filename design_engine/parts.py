@@ -136,6 +136,6 @@ class PartStore:
         }
         self.log.close_action(action_id, "pass", geometry_version=gid,
                               details={"diff": diff, "property_delta": prop_delta,
-                                       "parent": geometry_id})
+                                       "parent": geometry_id, "properties": props})
         return {"new_geometry_id": gid, "step_file_path": str(step_path),
                 "properties": props, "diff": diff}
