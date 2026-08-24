@@ -138,9 +138,9 @@ def check_element_quality(mesh: dict, max_size_mm: float) -> dict:
     return stats
 
 
-def select_nodes(mesh: dict, where: dict) -> np.ndarray:
-    """Node tags on an axis-aligned plane: {'axis': 'x|y|z', 'at': 'min'|'max'|float,
-    'tol': mm (default 0.01)}. Raises MeshError if the selection is empty."""
+def _axis_mask(mesh: dict, where: dict) -> np.ndarray:
+    """Boolean mask for one axis-aligned window: {'axis': 'x|y|z',
+    'at': 'min'|'max'|float, 'tol': mm (default 0.01)}."""
     allowed = {"axis", "at", "tol"}
     extra = set(where) - allowed
     if extra:
@@ -159,9 +159,38 @@ def select_nodes(mesh: dict, where: dict) -> np.ndarray:
     else:
         raise MeshError(f"selector 'at' must be 'min', 'max' or a number, got {at!r}")
     tol = where.get("tol", 0.01)
-    mask = np.abs(col - target) <= tol
+    return np.abs(col - target) <= tol
+
+
+def select_nodes(mesh: dict, where: dict) -> np.ndarray:
+    """Node tags matching a selector.
+
+    Single-axis window: {'axis': 'x|y|z', 'at': 'min'|'max'|float,
+    'tol': mm (default 0.01)}.
+
+    Compound (AND) window: {'all': [selector, selector, ...]} — each inner
+    selector uses the same axis/at/tol keys. Needed for a load or constraint
+    that lives on an interior strip of a face rather than the whole face,
+    e.g. a mid-span loading patch on a beam's top face: the top face alone
+    (y='max') is one plane: the load patch is that plane intersected with a
+    narrow z-window around the load point.
+
+    Raises MeshError if the selection (or, for 'all', the intersection) is
+    empty — an empty selection is always a spec error, never a silent no-op.
+    """
+    if "all" in where:
+        extra = set(where) - {"all"}
+        if extra:
+            raise MeshError(
+                f"compound selector 'all' takes no other keys, got {sorted(extra)}")
+        subs = where["all"]
+        if not isinstance(subs, list) or len(subs) < 2:
+            raise MeshError(
+                "selector 'all' must be a list of 2 or more axis selectors")
+        mask = np.logical_and.reduce([_axis_mask(mesh, w) for w in subs])
+    else:
+        mask = _axis_mask(mesh, where)
     tags = mesh["node_tags"][mask]
     if len(tags) == 0:
-        raise MeshError(
-            f"selector {where} matched 0 nodes ({where['axis']}={target}, tol={tol})")
+        raise MeshError(f"selector {where} matched 0 nodes")
     return tags
