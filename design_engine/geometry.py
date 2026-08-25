@@ -143,17 +143,35 @@ def build(spec: dict) -> cq.Workplane:
     validate_spec(spec)
     try:
         result = _make_primitive(spec["features"][0])
-        for feat in spec["features"][1:]:
+        for idx, feat in enumerate(spec["features"][1:], start=1):
             op = feat["op"]
             if op in _BASE_OPS:
                 prim = _make_primitive(feat)
                 result = result.union(prim) if feat["mode"] == "union" else result.cut(prim)
             elif op == "hole":
                 face = feat.get("face", ">Z")
+                before = result.val().Volume()
                 result = (
                     result.faces(face).workplane()
                     .pushPoints([tuple(feat["at"])]).hole(feat["d"])
                 )
+                # A hole that removes NOTHING is a silent no-op: the 'at'
+                # point missed the material on that face, usually because the
+                # face's local (u, v) axes are not what the caller assumed
+                # (they are face-relative and can be mirrored -- on a ">Y"
+                # face, u runs along -X). Caught for real: a shoe bracket was
+                # built, validated and nearly signed off with a bolt hole
+                # that did not exist, because the op silently did nothing.
+                # Same principle as rejecting unknown spec keys.
+                removed = before - result.val().Volume()
+                if removed <= 1e-9:
+                    raise SpecError(
+                        f"features[{idx}] (hole): removed no material - the "
+                        f"'at' point {feat['at']} misses the solid on face "
+                        f"{face!r}. Face-local (u, v) axes are not world x/y "
+                        f"and may be mirrored; verify where the point lands "
+                        f"before relying on it. A hole that silently cuts "
+                        f"nothing is exactly the failure this engine refuses.")
             elif op == "fillet":
                 result = result.edges(feat["edges"]).fillet(feat["radius"])
         solids = result.solids().vals()

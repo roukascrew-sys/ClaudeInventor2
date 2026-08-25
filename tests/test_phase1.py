@@ -143,3 +143,37 @@ def test_assembly_rejects_unknown_component(eng):
         eng.create_assembly(_assembly_spec("P0042@v1", {"min": 0.05}),
                             reason="should fail: component doesn't exist")
     assert eng.log.rows(action="create_assembly", result="fail")
+
+
+def test_hole_that_removes_nothing_is_refused(eng):
+    """A hole whose 'at' point misses the material must not silently no-op.
+
+    Caught in real use: a shoe bracket was built, validated and nearly signed
+    off carrying a bolt hole that did not exist. The face's local (u, v) axes
+    are face-relative and can be mirrored (on a '>Y' face u runs along -X),
+    so an 'at' that looks right in world coordinates can land in empty space.
+    Same principle as rejecting unknown spec keys: silence is the danger.
+    """
+    spec = {
+        "name": "missed-hole", "units": "mm",
+        "features": [
+            {"op": "box", "x": 76.2, "y": 60.0, "z": 6.35},
+            {"op": "box", "x": 76.2, "y": 6.35, "z": 70.0,
+             "at": [0, 26.825, 0], "mode": "union"},
+            # (y=0, z=55) on the '>X' face is empty space: the upstand is at
+            # y 23.65..30, and the sole only reaches z=6.35
+            {"op": "hole", "d": 8.5, "at": [0.0, 55.0], "face": ">X"},
+        ],
+    }
+    with pytest.raises(SpecError, match="removed no material"):
+        eng.create_part(spec, reason="hole that misses the solid")
+    assert eng.log.rows(action="create_part", result="fail")
+
+    # the same bracket with the hole placed on the face it actually meets
+    # ('>Y', whose u axis is mirrored: at=[u, v] -> world x=-u, z=v) builds
+    good = dict(spec)
+    good["name"] = "hit-hole"
+    good["features"] = spec["features"][:2] + [
+        {"op": "hole", "d": 8.5, "at": [0.0, 55.0], "face": ">Y"}]
+    out = eng.create_part(good, reason="hole placed on the correct face")
+    assert out["properties"]["volume_mm3"] > 0
