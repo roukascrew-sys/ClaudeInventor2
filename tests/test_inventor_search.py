@@ -519,3 +519,39 @@ def test_repeated_identical_runs_are_bit_identical():
              round(c.result.metrics.get("mass_kg", -1), 9))
             for c in run.all_candidates])
     assert fingerprints[0] == fingerprints[1] == fingerprints[2]
+
+
+def test_report_warns_when_robustness_fidelity_is_below_the_constraint():
+    """Caught in a real run: the headline safety factor came from FEA
+    (SF 2.56) while the robustness sweep re-evaluated the same metric with the
+    cheap analytic model (SF ~7.1). Same metric name, different model, 3x
+    apart. The report must say so or a reader will believe the sweep
+    validated the solver result."""
+    from design_engine.inventor import explain_candidate, render_text
+    from design_engine.inventor.analysis import RobustnessResult
+    reqs = make_reqs(sf_min=2.5)
+    c = _cand(1.0, 10.0)
+    c.result.metrics["sf.yield_von_mises"] = 2.56
+    c.result.metric_fidelity["sf.yield_von_mises"] = Fidelity.L3_HIGH_FEA
+    c.result.apply_requirements(reqs)
+    rb = RobustnessResult(
+        samples=40, nominal_feasible=True, failure_rate=0.0,
+        failing_classes={},
+        metric_stats={"sf.yield_von_mises": {"mean": 7.14, "stdev": 0.29,
+                                             "min": 6.48, "max": 7.77, "n": 40}},
+        worst_case={"sf.yield_von_mises": 6.48}, perturbations=["h+/-1.0"],
+        fidelity=int(Fidelity.L0_ANALYTIC))
+    exp = explain_candidate(c, reqs, [c], role="balanced", robustness=rb)
+    text = render_text(exp, reqs)
+    assert "WARNING" in text
+    assert "does NOT show that the" in text
+
+    # and NO warning when the sweep ran at the same fidelity as the claim
+    rb_same = RobustnessResult(
+        samples=40, nominal_feasible=True, failure_rate=0.0, failing_classes={},
+        metric_stats={"sf.yield_von_mises": {"mean": 2.6, "stdev": 0.1,
+                                             "min": 2.5, "max": 2.7, "n": 40}},
+        worst_case={"sf.yield_von_mises": 2.5}, perturbations=["h+/-1.0"],
+        fidelity=int(Fidelity.L3_HIGH_FEA))
+    text2 = render_text(explain_candidate(c, reqs, [c], robustness=rb_same), reqs)
+    assert "WARNING" not in text2

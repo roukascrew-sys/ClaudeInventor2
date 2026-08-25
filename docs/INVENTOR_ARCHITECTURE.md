@@ -131,3 +131,37 @@ changed. `create_part`, `edit_part`, `run_fea_static`, `run_fea_buckling`,
 `sign_off`, `export_production_package`, `generate_bom`, `generate_viewer`
 and `generate_report` behave exactly as before, and the 88 pre-existing tests
 pass unmodified.
+
+## Measured performance (Phase 21)
+
+`designs/benchmark_optimizers.py`, 5 seeds per cell, shared hypervolume
+reference `[0.23967, 191.49606]`, L0+L1 screening on the L-bracket problem
+(9 variables, 5 feasibility rules, 2 objectives, 5 hard constraints).
+
+| optimizer@budget | HV mean | HV sd | feasible | front size | best mass (kg) | best cost ($) | sec |
+|---|---|---|---|---|---|---|---|
+| evolutionary@192 | **14.87** | 1.90 | 146.2 | 3.4 | 0.1050 | 80.04 | 9.7 |
+| random@192 | 6.62 | 3.02 | 94.6 | 2.8 | 0.1413 | 112.50 | 8.7 |
+| evolutionary@480 | **19.99** | 0.39 | 336.8 | 15.0 | 0.0761 | 66.95 | 22.3 |
+| random@480 | 9.97 | 3.27 | 235.0 | 2.8 | 0.1265 | 97.24 | 24.9 |
+
+Head-to-head per seed (whose frontier dominates the other's):
+**evolutionary 5/5 at budget 192, and 5/5 at budget 480.**
+
+Two things worth stating plainly:
+
+* **`evolutionary@192` beats `random@480`** on hypervolume (14.87 vs 9.97) —
+  better trade-offs from 2.5x fewer evaluations. That is the claim the staged
+  architecture exists to support, and it is measured rather than asserted.
+* **Random search is high variance** (HV sd 3.0–3.3 versus 0.39–1.90). A
+  single seed of this benchmark showed random winning outright, which is why
+  the benchmark takes multiple seeds. One seed is an anecdote.
+
+Cost accounting from a real end-to-end run (`bracket_optimization_run.py`,
+192 screened + 3 promoted): 192 L1 evaluations in 12.1 s, then 3 real
+CalculiX solves in 18.2 s (6.07 s each). The promoted candidates reused their
+cached L0/L1 stages — only the FEA stage ran fresh.
+
+**The solver demoted 2 of the 3 promoted candidates.** Their analytic
+screening safety factors did not survive contact with a real mesh. That is
+the multi-fidelity contract working as intended, not a defect.

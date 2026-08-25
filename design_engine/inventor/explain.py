@@ -23,6 +23,14 @@ from .pareto import pareto_front
 from .requirements import Objective, RequirementSet, Sense, Status
 
 
+_FIDELITY_ORDER = [f.label for f in sorted(Fidelity, key=int)]
+
+
+def _fidelity_rank(label: str) -> int:
+    """Order a fidelity label; -1 for 'not evaluated' or anything unknown."""
+    return _FIDELITY_ORDER.index(label) if label in _FIDELITY_ORDER else -1
+
+
 def _fmt(v, unit: str = "") -> str:
     if v is None:
         return "UNKNOWN"
@@ -66,7 +74,8 @@ def explain_candidate(cand: Candidate, reqs: RequirementSet,
     constraints = []
     for r in res.constraint_results:
         constraints.append({
-            "name": r.constraint.name, "status": r.status.value,
+            "name": r.constraint.name, "metric": r.constraint.metric,
+            "status": r.status.value,
             "actual": r.actual, "required": r.constraint.bound,
             "op": r.constraint.op.value, "units": r.constraint.units,
             "normalized_margin": r.normalized_margin,
@@ -186,16 +195,34 @@ def render_text(exp: dict, reqs: RequirementSet, alternatives: dict | None = Non
 
     if exp.get("robustness"):
         rb = exp["robustness"]
+        rb_label = Fidelity(rb["fidelity"]).label
         L.append("\nROBUSTNESS")
         L.append(f"  perturbations: {', '.join(rb['perturbations'])}")
-        L.append(f"  {rb['samples']} perturbed samples at "
-                 f"fidelity L{rb['fidelity']}; observed failure fraction "
+        L.append(f"  {rb['samples']} perturbed samples, all re-evaluated at "
+                 f"[{rb_label}] fidelity; observed failure fraction "
                  f"{rb['failure_rate']:.3f}")
         L.append("  (an observed fraction over a finite sample - NOT a "
                  "reliability figure; no distribution was fitted)")
+        # A sweep run at cheap fidelity reports the CHEAP model's value for a
+        # metric whose headline number came from the solver. Same metric name,
+        # different model, wildly different number - so say so explicitly
+        # rather than letting a reader assume the sweep validated the
+        # authoritative figure.
+        swept = set(rb.get("metric_stats", {}))
         for m, s in rb.get("metric_stats", {}).items():
             L.append(f"    {m}: mean {s['mean']:.4g}, worst {s['min']:.4g}, "
-                     f"sd {s['stdev']:.4g} (n={s['n']})")
+                     f"sd {s['stdev']:.4g} (n={s['n']})  [{rb_label}]")
+        rb_rank = _fidelity_rank(rb_label)
+        for c in exp["constraints"]:
+            if c["metric"] not in swept:
+                continue
+            if _fidelity_rank(c["fidelity"]) > rb_rank:
+                L.append(f"  WARNING: '{c['name']}' is reported above as "
+                         f"{_fmt(c['actual'], c['units'])} from [{c['fidelity']}], "
+                         f"but this sweep re-evaluated the same metric at "
+                         f"[{rb_label}]. The sweep shows sensitivity to "
+                         f"perturbation; it does NOT show that the "
+                         f"solver-grade result holds across it.")
 
     if sensitivity:
         L.append("\nWHICH VARIABLES ACTUALLY MATTER  (Spearman rank correlation)")
