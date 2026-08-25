@@ -38,6 +38,7 @@ class DesignEngine:
         from .production import ProductionTools
         from .sourcing import SourcingTools
         from .kinematics import KinematicsTools
+        from .massprops import MassPropsTools
         from .viewer import ViewerTools
         self.validation = ValidationTools(
             self.root, self.log, self.parts, ccx_path or _DEFAULT_CCX)
@@ -47,6 +48,8 @@ class DesignEngine:
         self.viewer = ViewerTools(
             self.root, self.log, self.parts, self.production, self.assemblies)
         self.kinematics = KinematicsTools(
+            self.root, self.log, self.parts, self.assemblies)
+        self.massprops = MassPropsTools(
             self.root, self.log, self.parts, self.assemblies)
 
     # Phase 1 contracts
@@ -68,6 +71,10 @@ class DesignEngine:
     def run_kinematics(self, assembly_id: str, motion_case: dict,
                        reason: str) -> dict:
         return self.kinematics.run_kinematics(assembly_id, motion_case, reason)
+
+    def check_mass_properties(self, assembly_id: str, case: dict,
+                              reason: str) -> dict:
+        return self.massprops.check_mass_properties(assembly_id, case, reason)
 
     def sign_off(self, geometry_id: str, signed_off_by: str, statement: str) -> dict:
         return self.production.sign_off(geometry_id, signed_off_by, statement)

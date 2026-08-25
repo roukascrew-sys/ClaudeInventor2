@@ -155,6 +155,17 @@ def build(spec: dict) -> cq.Workplane:
                     result.faces(face).workplane()
                     .pushPoints([tuple(feat["at"])]).hole(feat["d"])
                 )
+                # ORIGIN, verified empirically 2026-08-25 on P0026@v3: the
+                # workplane CadQuery builds on a selected face uses
+                # centerOption="ProjectedOrigin" — the GLOBAL origin projected
+                # onto the face plane, NOT the face's own centre. So on an
+                # axis-normal face the 'at' pair reads as the two global
+                # coordinates that are not the face normal (on a '>X' face,
+                # at=[y, z] in world mm). The natural assumption that 'at' is
+                # measured from the middle of the face is WRONG and would put
+                # every hole in the wrong place on any part whose faces are
+                # not centred on the origin.
+                #
                 # A hole that removes NOTHING is a silent no-op: the 'at'
                 # point missed the material on that face, usually because the
                 # face's local (u, v) axes are not what the caller assumed

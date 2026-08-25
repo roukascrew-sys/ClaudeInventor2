@@ -45,7 +45,9 @@ class FeaError(RuntimeError):
 
 
 _CASE_KEYS = {"material", "mesh", "constraints", "loads", "limit_state"}
-_MATERIAL_KEYS = {"name", "E_MPa", "nu", "yield_MPa", "source"}
+_MATERIAL_KEYS = {"name", "E_MPa", "nu", "yield_MPa", "source",
+                  "service_temp_C", "yield_derate_curve", "E_derate_curve",
+                  "derate_source"}
 _MESH_KEYS = {"max_size_mm", "min_size_mm"}
 _CONSTRAINT_KEYS = {"where", "dof"}
 _LOAD_KEYS = {"where", "force_total_N"}
@@ -69,6 +71,84 @@ def _num(d: dict, key: str, ctx: str, *, lo=None, hi=None) -> float:
     return float(val)
 
 
+def _validate_derate_curve(curve, ctx: str) -> None:
+    if not isinstance(curve, list) or len(curve) < 2:
+        raise FeaError(f"{ctx}: must be a list of at least 2 [temp_C, factor] pairs")
+    last_t = None
+    for i, pt in enumerate(curve):
+        if (not isinstance(pt, (list, tuple)) or len(pt) != 2
+                or any(not isinstance(v, (int, float)) or isinstance(v, bool)
+                       for v in pt)):
+            raise FeaError(f"{ctx}[{i}]: must be [temp_C, factor] numbers")
+        t, k = float(pt[0]), float(pt[1])
+        if not 0.0 <= k <= 1.0:
+            raise FeaError(
+                f"{ctx}[{i}]: factor {k} outside [0, 1] - a derating factor is "
+                f"a fraction of the room-temperature value")
+        if last_t is not None and t <= last_t:
+            raise FeaError(
+                f"{ctx}[{i}]: temperatures must strictly increase (got {t} "
+                f"after {last_t})")
+        last_t = t
+
+
+def derate_factor(curve: list, temp_C: float, ctx: str) -> float:
+    """Linearly interpolate a derating curve at temp_C.
+
+    REFUSES to extrapolate. A material derating curve is measured data over a
+    stated range; silently extending it past either end invents material
+    behaviour, which is exactly the class of quiet-wrong answer this engine
+    exists to prevent. Out of range is a spec error, not a clamp.
+    """
+    lo_t, hi_t = float(curve[0][0]), float(curve[-1][0])
+    if not lo_t <= temp_C <= hi_t:
+        raise FeaError(
+            f"{ctx}: service temperature {temp_C} C is outside the derating "
+            f"curve's range [{lo_t}, {hi_t}] C. This engine will not "
+            f"extrapolate material data - supply a curve that covers the "
+            f"service temperature, or state a temperature the data covers.")
+    for (t0, k0), (t1, k1) in zip(curve, curve[1:]):
+        if float(t0) <= temp_C <= float(t1):
+            span = float(t1) - float(t0)
+            if span == 0:
+                return float(k0)
+            frac = (temp_C - float(t0)) / span
+            return float(k0) + frac * (float(k1) - float(k0))
+    return float(curve[-1][1])
+
+
+def effective_material(mat: dict) -> dict:
+    """Room-temperature or temperature-derated E and yield, plus provenance.
+
+    When the material carries a service_temp_C, the values actually used by
+    the solver and the gate are the DERATED ones. A 6061-T6 frame rated at
+    276 MPa at 20 C retains only 55% of that at 250 C (EN 1999-1-2 Table 1a),
+    so gating a hot structure on its room-temperature yield overstates its
+    strength by nearly 2x.
+    """
+    E = float(mat["E_MPa"])
+    fy = float(mat["yield_MPa"])
+    temp = mat.get("service_temp_C")
+    out = {"service_temp_C": temp,
+           "E_MPa_room": E, "yield_MPa_room": fy,
+           "E_MPa_effective": E, "yield_MPa_effective": fy,
+           "k_yield": 1.0, "k_E": 1.0,
+           "derate_source": mat.get("derate_source")}
+    if temp is None:
+        return out
+    if mat.get("yield_derate_curve"):
+        k = derate_factor(mat["yield_derate_curve"], float(temp),
+                          "case.material.yield_derate_curve")
+        out["k_yield"] = k
+        out["yield_MPa_effective"] = fy * k
+    if mat.get("E_derate_curve"):
+        k = derate_factor(mat["E_derate_curve"], float(temp),
+                          "case.material.E_derate_curve")
+        out["k_E"] = k
+        out["E_MPa_effective"] = E * k
+    return out
+
+
 def validate_case(case: dict) -> None:
     if not isinstance(case, dict):
         raise FeaError("case must be a dict")
@@ -88,6 +168,32 @@ def validate_case(case: dict) -> None:
     _num(mat, "E_MPa", "case.material", lo=0)
     _num(mat, "nu", "case.material", lo=0, hi=0.5)
     _num(mat, "yield_MPa", "case.material", lo=0)
+
+    # --- temperature derating (optional, but all-or-nothing and sourced) ---
+    has_curve = bool(mat.get("yield_derate_curve") or mat.get("E_derate_curve"))
+    if mat.get("service_temp_C") is not None:
+        _num(mat, "service_temp_C", "case.material", lo=-273.15)
+        if not has_curve:
+            raise FeaError(
+                "case.material.service_temp_C given with no derating curve - "
+                "a service temperature with no curve would silently be "
+                "ignored and the part gated at its room-temperature strength")
+    if has_curve:
+        if mat.get("service_temp_C") is None:
+            raise FeaError(
+                "case.material: a derating curve was supplied with no "
+                "service_temp_C - nothing would be derated")
+        if not isinstance(mat.get("derate_source"), str) or not mat["derate_source"].strip():
+            raise FeaError(
+                "case.material.derate_source: required whenever a derating "
+                "curve is given - cite the standard or test data the curve "
+                "comes from; this engine does not accept unsourced derating")
+        if mat.get("yield_derate_curve"):
+            _validate_derate_curve(mat["yield_derate_curve"],
+                                   "case.material.yield_derate_curve")
+        if mat.get("E_derate_curve"):
+            _validate_derate_curve(mat["E_derate_curve"],
+                                   "case.material.E_derate_curve")
 
     _reject_extra(case["mesh"], _MESH_KEYS, "case.mesh")
     _num(case["mesh"], "max_size_mm", "case.mesh", lo=0)
@@ -115,12 +221,20 @@ def validate_case(case: dict) -> None:
 
     ls = case["limit_state"]
     _reject_extra(ls, _LIMIT_KEYS, "case.limit_state")
-    allowed_states = ("yield_von_mises", "elastic_buckling")
+    allowed_states = ("yield_von_mises", "elastic_buckling",
+                      "thermal_derated_yield")
     if ls.get("name") not in allowed_states:
         raise FeaError(
             f"case.limit_state.name: must be one of {allowed_states}, got "
             f"{ls.get('name')!r} — the gate must name its limit state")
     _num(ls, "required_SF", "case.limit_state", lo=0)
+    if ls["name"] == "thermal_derated_yield":
+        if mat.get("service_temp_C") is None or not mat.get("yield_derate_curve"):
+            raise FeaError(
+                "limit_state 'thermal_derated_yield' requires "
+                "case.material.service_temp_C and "
+                "case.material.yield_derate_curve - otherwise it is just "
+                "yield_von_mises wearing a different name")
 
 
 def check_rigid_body_modes(mesh: dict, constraint_sets: list,
@@ -248,9 +362,16 @@ def _write_inp(path: Path, mesh: dict, case: dict,
         lines.append(f"*NSET, NSET=FIX{i}")
         lines += [", ".join(str(t) for t in tags[j:j + 8])
                   for j in range(0, len(tags), 8)]
+    # Derated modulus when the material states a service temperature. This
+    # matters most for BUCKLING, where P_cr is directly proportional to E:
+    # solving a hot column with room-temperature stiffness overstates its
+    # critical load. For a single-material static stress solve under force
+    # boundary conditions the stress field is essentially E-independent, so
+    # derating E there changes displacements, not the yield gate.
+    eff = effective_material(mat)
     lines += [f"*MATERIAL, NAME=MAT",
               "*ELASTIC",
-              f"{mat['E_MPa']:.9g}, {mat['nu']:.9g}",
+              f"{eff['E_MPa_effective']:.9g}, {mat['nu']:.9g}",
               "*SOLID SECTION, ELSET=EALL, MATERIAL=MAT",
               "*STEP"]
     if analysis == "buckle":
@@ -629,6 +750,10 @@ class ValidationTools:
                 "limit_state": "elastic_buckling",
                 "required_SF": required,
                 "safety_factor": round(lowest, 6),
+                # P_cr is directly proportional to E, so a derated modulus
+                # lowers the critical load proportionally. Recorded here so a
+                # hot buckling factor is never mistaken for a cold one.
+                "thermal_derating": effective_material(case["material"]),
                 "buckling_factors": [round(f, 6) for f in factors],
                 "scaling_check": {"factor_at_1x": round(lowest, 6),
                                   "factor_at_half_load": round(lowest_2x, 6),
@@ -748,29 +873,45 @@ class ValidationTools:
                            for u in disp.values())
 
             mat = case["material"]
-            sf = math.inf if max_vm == 0 else mat["yield_MPa"] / max_vm
-            required = case["limit_state"]["required_SF"]
             ls_name = case["limit_state"]["name"]
+            eff = effective_material(mat)
+            # The allowable is the DERATED yield whenever the material states
+            # a service temperature. Gating a hot part on its room-temperature
+            # yield is the silent-overstrength failure this limit state exists
+            # to close.
+            allowable = (eff["yield_MPa_effective"]
+                         if ls_name == "thermal_derated_yield"
+                         else mat["yield_MPa"])
+            sf = math.inf if max_vm == 0 else allowable / max_vm
+            required = case["limit_state"]["required_SF"]
 
             png_rel = f"validation/{run_dir.name}/von_mises.png"
+            _allow_note = (
+                f"derated yield {allowable:.1f} MPa "
+                f"(k={eff['k_yield']:.3f} @ {eff['service_temp_C']} C, "
+                f"room {mat['yield_MPa']} MPa)"
+                if ls_name == "thermal_derated_yield"
+                else f"yield {mat['yield_MPa']} MPa")
             _diagnostic_png(
                 self.root / png_rel, m, vm,
                 f"{geometry_id} — {ls_name}: SF={sf:.3f} "
                 f"(required {required}) — max vM {max_vm:.1f} MPa vs "
-                f"yield {mat['yield_MPa']} MPa [{mat['name']}]")
+                f"{_allow_note} [{mat['name']}]")
 
             details = {
                 "material": mat,
                 "limit_state": ls_name,
                 "required_SF": required,
                 "safety_factor": round(sf, 6) if sf != math.inf else "inf",
+                "allowable_MPa": round(allowable, 6),
+                "thermal_derating": eff,
                 "max_von_mises_MPa": round(max_vm, 6),
                 "median_von_mises_MPa": round(median_vm, 6),
                 "p99_9_von_mises_MPa": round(p999, 6),
                 "stress_outlier_ratio": round(outlier_ratio, 4),
                 "stress_outlier_warning": outlier_warning,
                 "max_von_mises_node": int(max_node),
-                "max_von_mises_at_mm": [round(v, 3) for v in coords[int(max_node)]],
+                "max_von_mises_at_mm": [round(float(v), 3) for v in coords[int(max_node)]],
                 "max_displacement_mm": round(max_disp, 9),
                 "nodes": int(len(m["node_tags"])),
                 "result_records": {"disp": len(disp), "stress": len(stress)},
@@ -796,16 +937,29 @@ class ValidationTools:
                 action_id, "fail", details=details,
                 failure_mode=(
                     f"{ls_name}: SF={sf:.3f} < required {required} "
-                    f"(max vM {max_vm:.1f} MPa vs yield {mat['yield_MPa']} MPa "
+                    f"(max vM {max_vm:.1f} MPa vs allowable {allowable:.1f} MPa "
+                    f"[{_allow_note}] "
                     f"at node {int(max_node)} {details['max_von_mises_at_mm']} mm)"))
         return {
             "result": "pass" if passed else "fail",
             "action_id": action_id,
             "failure_id": None if passed else action_id,
             "safety_factor": sf,
+            # The allowable and the outlier advisory used to live only in the
+            # log details, so a caller printing the return value saw
+            # "allowable=None" and never saw the warning at all. That is how a
+            # constraint-singularity artifact (P0028@v1: peak 183.6 MPa sitting
+            # exactly on the constraint patch corner, outlier ratio 2.48) can
+            # be mistaken for a real structural failure. Surfaced here.
+            "allowable_MPa": allowable,
             "max_von_mises_MPa": max_vm,
             "median_von_mises_MPa": median_vm,
+            "p99_9_von_mises_MPa": p999,
+            "stress_outlier_ratio": outlier_ratio,
+            "stress_outlier_warning": outlier_warning,
+            "max_von_mises_at_mm": details["max_von_mises_at_mm"],
             "max_displacement_mm": max_disp,
+            "thermal_derating": eff,
             "artifacts": [png_rel],
             "run_dir": str(run_dir),
         }

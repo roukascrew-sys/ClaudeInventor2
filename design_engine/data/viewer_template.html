@@ -159,7 +159,15 @@
 
   var scene = new THREE.Scene();
   scene.background = new THREE.Color(0x06090f);
-  scene.fog = new THREE.Fog(0x06090f, 400, 1600);
+  // NO FOG. There was a THREE.Fog(0x06090f, 400, 1600) here. Its far plane
+  // was a hardcoded 1600mm while the orbit control lets you zoom out to
+  // radius*40 (18,800mm on the 800mm jetpack frame), so any part bigger
+  // than a ladder rung faded to solid background the moment you pulled
+  // back - reported from real use. Depth cueing is not worth a viewer that
+  // hides the geometry it exists to show; lighting and the edge overlay
+  // already carry depth. If fog is ever re-added it MUST be scaled off
+  // `radius` (computed below, after the mesh loads) and its far plane kept
+  // beyond the control's max zoom, or this bug returns at the next scale up.
 
   var camera = new THREE.PerspectiveCamera(
     45, window.innerWidth / window.innerHeight, 0.1, 20000);
