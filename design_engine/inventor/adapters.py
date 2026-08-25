@@ -231,7 +231,23 @@ class FeaStage:
     def __init__(self, case_builder: Callable[[Candidate, EvalContext], dict],
                  analysis: str = "static", mesh_mm: float | None = None,
                  fidelity: Fidelity = Fidelity.L3_HIGH_FEA,
-                 name: str | None = None, n_modes: int = 3):
+                 name: str | None = None, n_modes: int = 3,
+                 mesh_ladder: list[float] | None = None):
+        """`mesh_ladder`: successively finer sizes to try when the quality
+        gate refuses a mesh.
+
+        The audit established that meshing is NON-MONOTONIC - a part that
+        meshes at 3mm and 8mm can fail the Jacobian gate at 5mm - and that a
+        refusal says nothing about whether the DESIGN is good. Without a
+        ladder an automated promotion just returns UNKNOWN and the candidate
+        is never evaluated, which is how a whole region of the design space
+        silently goes unvalidated. Observed for real on the jetpack frame:
+        5mm refused on all three promoted candidates because of the 6.5mm
+        harness lug holes.
+
+        Bounded on purpose. If every rung is refused the stage still returns
+        UNKNOWN rather than pretending, and the attempts are recorded.
+        """
         if analysis not in ("static", "buckling"):
             raise ValueError("analysis must be 'static' or 'buckling'")
         self.case_builder = case_builder
@@ -239,12 +255,13 @@ class FeaStage:
         self.mesh_mm = mesh_mm
         self.fidelity = fidelity
         self.n_modes = n_modes
+        self.mesh_ladder = list(mesh_ladder) if mesh_ladder else None
         self.name = name or f"fea_{analysis}_L{int(fidelity)}"
         self._materialized: dict[str, str] = {}   # spec_digest -> geometry_id
 
     def config_digest(self) -> str:
         return digest_of([self.analysis, self.mesh_mm, int(self.fidelity),
-                          self.n_modes,
+                          self.n_modes, self.mesh_ladder,
                           getattr(self.case_builder, "__name__", "case")])
 
     # -- materialisation ------------------------------------------------
@@ -303,30 +320,53 @@ class FeaStage:
         ls = case["limit_state"]["name"]
 
         t0 = time.perf_counter()
+        ladder = self.mesh_ladder or [case.get("mesh", {}).get("max_size_mm")]
+        mesh_attempts: list[dict] = []
+        out = None
         try:
             gid = self.materialize(cand, ctx)
-            if self.analysis == "static":
-                out = ctx.engine.run_fea_static(
-                    gid, case, reason=(
-                        f"optimisation: {ls} on candidate {cand.candidate_id} "
-                        f"at {self.fidelity.label}"))
-            else:
-                out = ctx.engine.run_fea_buckling(
-                    gid, case, reason=(
-                        f"optimisation: {ls} on candidate {cand.candidate_id} "
-                        f"at {self.fidelity.label}"), n_modes=self.n_modes)
-        except MeshError as exc:
-            # Measured during the audit: a part that meshes at 3mm and 8mm can
-            # fail the Jacobian gate at 5mm. Non-monotonic. This says nothing
-            # about whether the DESIGN is good.
-            return StageResult(
-                self.name, self.fidelity, Status.UNKNOWN,
-                seconds=time.perf_counter() - t0,
-                failures=[FailureRecord(
-                    failure_class=FailureClass.NUMERICAL,
-                    message=f"mesh refused: {exc}",
-                    fidelity=self.fidelity, trustworthy=False)],
-                warnings=["mesh failure is not evidence of infeasibility"])
+            last_mesh_exc = None
+            for size in ladder:
+                attempt_case = dict(case)
+                if size is not None:
+                    attempt_case["mesh"] = dict(attempt_case.get("mesh", {}))
+                    attempt_case["mesh"]["max_size_mm"] = size
+                try:
+                    if self.analysis == "static":
+                        out = ctx.engine.run_fea_static(
+                            gid, attempt_case, reason=(
+                                f"optimisation: {ls} on candidate "
+                                f"{cand.candidate_id} at {self.fidelity.label}, "
+                                f"mesh {size} mm"))
+                    else:
+                        out = ctx.engine.run_fea_buckling(
+                            gid, attempt_case, reason=(
+                                f"optimisation: {ls} on candidate "
+                                f"{cand.candidate_id} at {self.fidelity.label}, "
+                                f"mesh {size} mm"), n_modes=self.n_modes)
+                    mesh_attempts.append({"mesh_mm": size, "meshed": True})
+                    case = attempt_case
+                    break
+                except MeshError as exc:
+                    # Non-monotonic by measurement: a part that meshes at 3mm
+                    # and 8mm can fail the Jacobian gate at 5mm. Refusing is
+                    # the mesher protecting the solver, and says nothing about
+                    # whether the DESIGN is good - so refine and try again.
+                    mesh_attempts.append({"mesh_mm": size, "meshed": False,
+                                          "reason": str(exc)[:160]})
+                    last_mesh_exc = exc
+            if out is None:
+                return StageResult(
+                    self.name, self.fidelity, Status.UNKNOWN,
+                    seconds=time.perf_counter() - t0,
+                    failures=[FailureRecord(
+                        failure_class=FailureClass.NUMERICAL,
+                        message=(f"every mesh size in {ladder} was refused; "
+                                 f"last: {last_mesh_exc}"),
+                        fidelity=self.fidelity, trustworthy=False)],
+                    warnings=["mesh failure is not evidence of infeasibility"],
+                    provenance={"mesh_attempts": mesh_attempts,
+                                "geometry_id": cand.geometry_id})
         except (FeaError, Exception) as exc:
             return StageResult(
                 self.name, self.fidelity, Status.UNKNOWN,
@@ -364,6 +404,8 @@ class FeaStage:
             failures=failures, warnings=warnings, seconds=seconds,
             provenance={"geometry_id": cand.geometry_id, "limit_state": ls,
                         "analysis": self.analysis,
+                        "mesh_mm": case.get("mesh", {}).get("max_size_mm"),
+                        "mesh_attempts": mesh_attempts,
                         "run_dir": out.get("run_dir"),
                         "action_id": out.get("action_id")})
 

@@ -177,9 +177,20 @@ class EvaluationResult:
         # would both mislabel the result and rob the optimiser of the
         # information that this region is actually bad.
         stage_refused = any(s.status is Status.INVALID for s in self.stages)
+        # A stage that RAN and could not produce an answer degrades the whole
+        # result to UNKNOWN, even when every constraint currently reads VALID.
+        # Caught in a real jetpack promotion: the L3 solver stage errored out,
+        # but `sf.thermal_derated_yield` was already present from the L0 beam
+        # model, so the constraint passed AT L0 FIDELITY and the candidate
+        # reported VALID with no solver run and no part ever materialised.
+        # A failed promotion must never leave a design looking validated at a
+        # fidelity that never executed. Note this only fires for stages that
+        # actually ran - a stage skipped by a fidelity ceiling is
+        # NOT_EVALUATED, so ordinary cheap screening is unaffected.
+        stage_unknown = any(s.status is Status.UNKNOWN for s in self.stages)
         if hard_fail or stage_refused:
             self.status = Status.INVALID
-        elif hard_unknown:
+        elif hard_unknown or stage_unknown:
             self.status = Status.UNKNOWN
         else:
             self.status = Status.VALID

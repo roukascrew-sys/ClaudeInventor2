@@ -555,3 +555,41 @@ def test_report_warns_when_robustness_fidelity_is_below_the_constraint():
         fidelity=int(Fidelity.L3_HIGH_FEA))
     text2 = render_text(explain_candidate(c, reqs, [c], robustness=rb_same), reqs)
     assert "WARNING" not in text2
+
+
+def test_failed_promotion_cannot_leave_a_design_looking_validated():
+    """The most dangerous failure mode this layer can have.
+
+    Caught in a real jetpack promotion: the L3 solver stage errored out, but
+    `sf.yield_von_mises` was already present from the L0 beam model, so the
+    constraint evaluated VALID *at L0 fidelity* and the candidate reported
+    VALID - with no solver run and no part materialised. The run printed
+    "3 solved in 0.0s ... PASS".
+
+    A stage that RAN and could not answer must degrade the result to UNKNOWN.
+    """
+    def l0(values, ctx):
+        return {"mass_kg": 1.0, "section_I_mm4": 1.0,
+                "sf.yield_von_mises": 9.0}          # optimistic cheap estimate
+
+    def broken_solver(cand, ctx):
+        raise RuntimeError("solver could not be reached")
+
+    reqs = make_reqs(sf_min=2.0)
+    ev = Evaluator([AnalyticStage(l0, name="l0"),
+                    CallableStage(broken_solver, "fea", Fidelity.L3_HIGH_FEA)],
+                   EvalContext(space=make_space(), requirements=reqs))
+    c = Candidate(values={"w": 20.0, "h": 40.0})
+
+    # screening only: the expensive stage never runs, so the cheap answer stands
+    ev.evaluate(c, max_fidelity=Fidelity.L1_GEOMETRY)
+    assert c.status is Status.VALID
+    assert c.result.max_fidelity is Fidelity.L0_ANALYTIC
+
+    # promotion: the solver stage RAN and failed -> must not still read VALID
+    ev.evaluate(c, max_fidelity=Fidelity.L3_HIGH_FEA)
+    assert c.status is Status.UNKNOWN
+    assert not c.feasible
+    assert any(not f.trustworthy for f in c.result.failures)
+    # and it must not be recommendable
+    assert pareto_front([c], reqs.objectives) == []

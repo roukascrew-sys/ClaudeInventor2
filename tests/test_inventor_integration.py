@@ -241,3 +241,66 @@ def test_fea_stage_runs_the_real_solver_and_overrides_the_estimate(tmp_path):
     rows_after = [r for r in engine.log.rows(action="fea_static")]
     assert len([r for r in rows_after if r["result"] != "pending"]) == len(
         [r for r in rows if r["result"] != "pending"])
+
+
+def test_mesh_ladder_refines_instead_of_giving_up():
+    """A refused mesh must not end the evaluation.
+
+    Meshing is non-monotonic, so the first size can be refused on a part that
+    meshes fine slightly finer. Observed for real: all three promoted jetpack
+    frames were refused at 5mm because of their 6.5mm lug holes, and the whole
+    promotion returned UNKNOWN without a single solve.
+    """
+    from design_engine.inventor import FeaStage
+    from design_engine.mesh import MeshError
+
+    calls = []
+
+    class FakeEngine:
+        def run_fea_static(self, gid, case, reason):
+            size = case["mesh"]["max_size_mm"]
+            calls.append(size)
+            if size > 3.5:
+                raise MeshError(f"degenerate_mesh at {size}mm")
+            return {"result": "pass", "safety_factor": 4.2,
+                    "max_von_mises_MPa": 60.0, "run_dir": "x", "action_id": 1}
+
+    space, reqs = plate_space(), plate_reqs()
+    ctx = EvalContext(space=space, requirements=reqs, engine=FakeEngine())
+    stage = FeaStage(lambda c, x: {"mesh": {"max_size_mm": 5.0},
+                                   "limit_state": {"name": "yield_von_mises",
+                                                   "required_SF": 1.5}},
+                     analysis="static", mesh_ladder=[5.0, 4.0, 3.2])
+    cand = Candidate(values=space.resolve({"length": 100.0, "width": 50.0,
+                                           "thick": 10.0, "bossed": False}))
+    cand.spec = plate_spec(cand.values, ctx)
+    cand.geometry_id = "P9999@v1"          # pretend already materialised
+    sr = stage.run(cand, ctx)
+    assert calls == [5.0, 4.0, 3.2]        # refined until it meshed
+    assert sr.status is Status.VALID
+    assert sr.provenance["mesh_mm"] == 3.2
+    assert [a["meshed"] for a in sr.provenance["mesh_attempts"]] == [False, False, True]
+
+
+def test_mesh_ladder_exhausted_is_unknown_not_a_pass():
+    from design_engine.inventor import FeaStage
+    from design_engine.mesh import MeshError
+
+    class AlwaysRefuses:
+        def run_fea_static(self, gid, case, reason):
+            raise MeshError("degenerate_mesh everywhere")
+
+    space, reqs = plate_space(), plate_reqs()
+    ctx = EvalContext(space=space, requirements=reqs, engine=AlwaysRefuses())
+    stage = FeaStage(lambda c, x: {"mesh": {"max_size_mm": 5.0},
+                                   "limit_state": {"name": "yield_von_mises",
+                                                   "required_SF": 1.5}},
+                     analysis="static", mesh_ladder=[5.0, 4.0])
+    cand = Candidate(values=space.resolve({"length": 100.0, "width": 50.0,
+                                           "thick": 10.0, "bossed": False}))
+    cand.spec = plate_spec(cand.values, ctx)
+    cand.geometry_id = "P9999@v1"
+    sr = stage.run(cand, ctx)
+    assert sr.status is Status.UNKNOWN          # never a pass
+    assert sr.failures[0].trustworthy is False
+    assert len(sr.provenance["mesh_attempts"]) == 2
