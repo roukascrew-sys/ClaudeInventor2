@@ -170,3 +170,62 @@ def archetypes(front: Sequence[Candidate], reqs: RequirementSet) -> dict:
         out["most_preferred"] = max(front, key=lambda c: _pref_score(c, reqs))
 
     return out
+
+
+def hypervolume(front: Sequence[Candidate], objectives: list[Objective],
+                reference: Sequence[float] | None = None) -> float | None:
+    """Dominated hypervolume in LOSS space (larger is better).
+
+    Exact for two objectives via a sweep. For three or more this returns None
+    rather than an approximation, because a Monte-Carlo estimate reported
+    without its error bars is precisely the kind of fake precision this
+    project refuses; use `compare_fronts` instead, which works in any
+    dimension.
+
+    `reference` defaults to the componentwise worst point of the front plus a
+    10% pad, so the number is only meaningful when comparing two fronts
+    against the SAME reference — pass one explicitly to compare runs.
+    """
+    if len(objectives) != 2:
+        return None
+    pairs = [c.result.objective_vector(objectives) for c in front]
+    pairs = [p for p in pairs if p is not None]
+    if not pairs:
+        return 0.0
+    if reference is None:
+        ref = [max(p[i] for p in pairs) for i in range(2)]
+        ref = [r + 0.1 * abs(r) + 1e-9 for r in ref]
+    else:
+        ref = list(reference)
+    pts = sorted({(p[0], p[1]) for p in pairs})
+    hv, prev_y = 0.0, ref[1]
+    for x, y in pts:
+        if x >= ref[0] or y >= ref[1]:
+            continue
+        if y < prev_y:
+            hv += (ref[0] - x) * (prev_y - y)
+            prev_y = y
+    return hv
+
+
+def compare_fronts(a: Sequence[Candidate], b: Sequence[Candidate],
+                   objectives: list[Objective]) -> dict:
+    """How two Pareto fronts relate, in any number of dimensions.
+
+    Comparing multi-objective searches on a single objective is a category
+    error: an NSGA-II run deliberately spends budget spreading along the
+    frontier rather than driving one axis to its extreme, so it can lose on
+    "best mass" while producing a strictly better set of trade-offs. This
+    counts, for each front, how many of the other's points it dominates.
+    """
+    va = [(c, c.result.objective_vector(objectives)) for c in a]
+    vb = [(c, c.result.objective_vector(objectives)) for c in b]
+    va = [(c, v) for c, v in va if v is not None]
+    vb = [(c, v) for c, v in vb if v is not None]
+    a_dom_b = sum(1 for _, y in vb if any(dominates(x, y) for _, x in va))
+    b_dom_a = sum(1 for _, y in va if any(dominates(x, y) for _, x in vb))
+    return {"a_size": len(va), "b_size": len(vb),
+            "a_points_dominated_by_b": b_dom_a,
+            "b_points_dominated_by_a": a_dom_b,
+            "a_dominated_fraction": (b_dom_a / len(va)) if va else None,
+            "b_dominated_fraction": (a_dom_b / len(vb)) if vb else None}

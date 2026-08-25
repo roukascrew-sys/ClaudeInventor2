@@ -42,8 +42,8 @@ from .models import (beam_screen, cantilever_point_load, channel_section,
                      simply_supported_centre_load)
 from .optimizers import (EvolutionarySearch, OptimizationConfig, Optimizer,
                          RandomSearch, make_optimizer, total_violation)
-from .pareto import (archetypes, crowding_distance, dominates,
-                     non_dominated_sort, pareto_front)
+from .pareto import (archetypes, compare_fronts, crowding_distance,
+                     dominates, hypervolume, non_dominated_sort, pareto_front)
 from .requirements import (Constraint, ConstraintResult, Objective, Op,
                            Preference, ReqError, RequirementSet, Sense,
                            Status, digest_of)
@@ -74,8 +74,8 @@ __all__ = [
     "EvolutionarySearch", "OptimizationConfig", "Optimizer", "RandomSearch",
     "make_optimizer", "total_violation",
     # pareto
-    "archetypes", "crowding_distance", "dominates", "non_dominated_sort",
-    "pareto_front",
+    "archetypes", "compare_fronts", "crowding_distance", "dominates",
+    "hypervolume", "non_dominated_sort", "pareto_front",
     # analysis
     "FailureMemory", "Perturbation", "RobustnessResult", "robustness",
     "sensitivity", "tolerance_perturbation",

@@ -132,13 +132,13 @@ def render_text(exp: dict, reqs: RequirementSet, alternatives: dict | None = Non
                 sensitivity: dict | None = None) -> str:
     """Human-readable explanation."""
     L: list[str] = []
-    head = f"RECOMMENDED DESIGN — {exp['candidate_id']}"
+    head = f"RECOMMENDED DESIGN - {exp['candidate_id']}"
     if exp.get("role"):
         head += f"  [{exp['role']}]"
     L.append(head)
     L.append("=" * len(head))
     L.append(f"status: {exp['status'].upper()}   evidence: "
-             f"{exp['evidence_fidelity']['lowest']} → "
+             f"{exp['evidence_fidelity']['lowest']} -> "
              f"{exp['evidence_fidelity']['highest']}")
     if exp.get("geometry_id"):
         L.append(f"materialised as {exp['geometry_id']} "
@@ -169,7 +169,7 @@ def render_text(exp: dict, reqs: RequirementSet, alternatives: dict | None = Non
     if exp["binding_constraints"]:
         L.append("\nWHAT IS ACTUALLY LIMITING THIS DESIGN")
         for c in exp["binding_constraints"]:
-            L.append(f"  {c['name']} — normalised margin "
+            L.append(f"  {c['name']} - normalised margin "
                      f"{c['normalized_margin']:+.3f} (tightest first)")
 
     if alternatives:
@@ -191,7 +191,7 @@ def render_text(exp: dict, reqs: RequirementSet, alternatives: dict | None = Non
         L.append(f"  {rb['samples']} perturbed samples at "
                  f"fidelity L{rb['fidelity']}; observed failure fraction "
                  f"{rb['failure_rate']:.3f}")
-        L.append("  (an observed fraction over a finite sample — NOT a "
+        L.append("  (an observed fraction over a finite sample - NOT a "
                  "reliability figure; no distribution was fitted)")
         for m, s in rb.get("metric_stats", {}).items():
             L.append(f"    {m}: mean {s['mean']:.4g}, worst {s['min']:.4g}, "

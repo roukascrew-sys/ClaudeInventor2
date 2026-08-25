@@ -90,6 +90,23 @@ class Optimizer:
         self.generation = 0
 
     # -- helpers -------------------------------------------------------
+    def _activate_missing(self, values: dict) -> dict:
+        """Sample any variable that has just become active.
+
+        `DesignSpace.resolve` fills these deterministically with a neutral
+        midpoint, which is correct for reproducibility but useless for search:
+        every design that switched a rib on would get the identical rib. The
+        optimiser is allowed to be stochastic, so it samples them here, before
+        resolve sees them.
+        """
+        out = dict(values)
+        for var in self.space.variables:
+            if var.type is VarType.DERIVED:
+                continue
+            if var.is_active(out) and var.name not in out:
+                out[var.name] = var.sample(self.rng, out)
+        return out
+
     def _fresh(self, values: dict, operator: str, reason: str,
                parent: Candidate | None = None) -> Candidate | None:
         """Build a candidate, skipping designs already seen.
@@ -97,7 +114,7 @@ class Optimizer:
         De-duplication is by content digest, so a design rediscovered by a
         different path is recognised and not re-evaluated.
         """
-        values = self.space.resolve(values)
+        values = self.space.resolve(self._activate_missing(values))
         digest = values_digest(values)
         if digest in self._seen:
             return None

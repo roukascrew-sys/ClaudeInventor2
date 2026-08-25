@@ -118,6 +118,28 @@ class DesignVariable:
             return rng.randint(int(math.ceil(lo)), int(math.floor(hi)))
         return self.quantize(rng.uniform(lo, hi), values)
 
+    def neutral(self, values: dict) -> Any:
+        """A DETERMINISTIC stand-in when a variable becomes active and has no
+        value yet.
+
+        This happens for real: flipping a topology switch (`ribbed` False ->
+        True) activates variables the parent design never carried. Raising
+        there would make topology mutation impossible, and sampling would make
+        `resolve` stochastic — which would break the cache, since the same
+        input must always produce the same candidate identity. So: the
+        declared default if there is one, otherwise the midpoint of the range
+        or the first choice. The optimiser separately samples newly-active
+        variables so exploration is not stuck at the midpoint.
+        """
+        if self.default is not None:
+            return self.default
+        if self.type in (VarType.DISCRETE, VarType.CATEGORICAL):
+            return self.choices(values)[0]
+        lo, hi = self.bounds(values)
+        if self.type is VarType.INTEGER:
+            return int(round((lo + hi) / 2.0))
+        return self.quantize((lo + hi) / 2.0, values)
+
     def to_dict(self) -> dict:
         return {"name": self.name, "type": self.type.value, "units": self.units,
                 "lo": self.lo, "hi": self.hi, "step": self.step,
@@ -199,12 +221,10 @@ class DesignSpace:
                         # choice (e.g. process changed); repair rather than crash
                         v = allowed[0]
                 values[var.name] = v
-            elif var.default is not None:
-                values[var.name] = var.default
             else:
-                raise ReqError(
-                    f"no value supplied for active variable {var.name!r} and "
-                    f"it has no default")
+                # Newly-active (a topology switch just turned this variable on)
+                # or simply omitted. Fill deterministically — see .neutral().
+                values[var.name] = var.neutral(values)
         for var in self.variables:
             if var.type is VarType.DERIVED and var.is_active(values):
                 values[var.name] = var.compute(values)

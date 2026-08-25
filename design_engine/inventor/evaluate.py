@@ -205,6 +205,12 @@ class Evaluator:
                  stop_on_block: bool = True) -> Candidate:
         ceiling = max_fidelity if max_fidelity is not None else self.max_fidelity
         result = EvaluationResult()
+        # Bind the in-progress result to the candidate BEFORE running stages.
+        # Later stages legitimately depend on earlier ones — a cost model
+        # needs the volume the geometry stage just computed — and with the
+        # result held only in a local they would each see an empty metrics
+        # dict and silently return nothing.
+        cand.result = result
         for stage in self.stages_upto(ceiling):
             key = EvaluationCache.key(cand, stage, self.ctx)
             payload = self.cache.get(key)

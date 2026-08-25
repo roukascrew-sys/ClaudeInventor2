@@ -458,5 +458,64 @@ def test_robustness_reports_sample_count_not_a_reliability_figure():
     ev.evaluate(c)
     r = robustness(c, ev, [tolerance_perturbation("h", 1.0)], samples=15, seed=2)
     assert r.samples <= 15 and 0.0 <= r.failure_rate <= 1.0
-    assert "h±1.0" in r.perturbations
+    assert "h+/-1.0" in r.perturbations   # ASCII label: consoles are cp1252 on Windows
     assert r.fidelity == int(Fidelity.L1_GEOMETRY)
+
+
+def test_stage_refusal_is_invalid_not_unknown():
+    """A design-space rule violation DEFINITIVELY establishes infeasibility.
+
+    Evaluation stops at the rule stage, so no metrics exist and every
+    constraint reads UNKNOWN. That must not downgrade a known refusal into
+    "we could not tell" - UNKNOWN is reserved for genuine ignorance.
+    """
+    from design_engine.inventor import FeasibilityRule
+    space = DesignSpace(
+        name="s",
+        variables=[DesignVariable("w", VarType.CONTINUOUS, lo=1.0, hi=10.0),
+                   DesignVariable("h", VarType.CONTINUOUS, lo=1.0, hi=10.0)],
+        rules=[FeasibilityRule("h_gt_w", lambda v: v["h"] > v["w"])])
+    ev = Evaluator([RuleStage(), AnalyticStage(analytic, name="a")],
+                   EvalContext(space=space, requirements=make_reqs()))
+    c = Candidate(values={"w": 9.0, "h": 2.0})
+    ev.evaluate(c)
+    assert c.result.stages[0].status is Status.INVALID
+    assert c.status is Status.INVALID           # not UNKNOWN
+    assert not c.feasible
+    # and the optimiser must still see it as violating, so it steers away
+    assert total_violation(c) > 0
+
+
+def test_genuine_ignorance_still_reports_unknown():
+    """The counterpart: when nothing refused but a gate could not be
+    evaluated, the answer really is UNKNOWN."""
+    def partial(values, ctx):
+        return {"mass_kg": 1.0, "section_I_mm4": 1.0}      # no sf metric
+    ev = Evaluator([AnalyticStage(partial, name="p")],
+                   EvalContext(space=make_space(), requirements=make_reqs()))
+    c = Candidate(values={"w": 10.0, "h": 10.0})
+    ev.evaluate(c)
+    assert c.status is Status.UNKNOWN
+
+
+def test_repeated_identical_runs_are_bit_identical():
+    """Determinism regression guard.
+
+    During integration a run of the same config in the same process produced
+    wildly different feasible counts on consecutive invocations. That was
+    traced to status being computed from missing metrics, but the symptom was
+    non-determinism, so it gets a permanent test: same seed, same config, same
+    process, same answer. If search ever becomes non-reproducible again this
+    fails immediately rather than silently degrading a design study.
+    """
+    space, reqs = make_space(), make_reqs()
+    fingerprints = []
+    for _ in range(3):
+        cfg = OptimizationConfig(population=16, generations=4, seed=99)
+        run = OptimizationRun(RandomSearch(space, reqs, cfg),
+                              make_evaluator(), reqs, cfg).run()
+        fingerprints.append([
+            (c.candidate_id, c.status.value,
+             round(c.result.metrics.get("mass_kg", -1), 9))
+            for c in run.all_candidates])
+    assert fingerprints[0] == fingerprints[1] == fingerprints[2]

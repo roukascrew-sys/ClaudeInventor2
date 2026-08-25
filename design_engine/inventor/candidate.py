@@ -168,7 +168,16 @@ class EvaluationResult:
         hard_unknown = [c for c in self.constraint_results
                         if c.constraint.severity == "mandatory"
                         and c.status in (Status.UNKNOWN, Status.NOT_EVALUATED)]
-        if hard_fail:
+        # A stage that returned INVALID has DEFINITIVELY established
+        # infeasibility (a design-space rule was violated, a spec would not
+        # build, a solver said the safety factor is short). Evaluation then
+        # stops, so no metrics exist and every constraint reads UNKNOWN --
+        # which must NOT be allowed to downgrade a known refusal to "we could
+        # not tell". UNKNOWN is for genuine ignorance only; conflating the two
+        # would both mislabel the result and rob the optimiser of the
+        # information that this region is actually bad.
+        stage_refused = any(s.status is Status.INVALID for s in self.stages)
+        if hard_fail or stage_refused:
             self.status = Status.INVALID
         elif hard_unknown:
             self.status = Status.UNKNOWN

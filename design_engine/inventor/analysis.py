@@ -199,7 +199,7 @@ def tolerance_perturbation(variable: str, sigma: float,
         if isinstance(out.get(variable), (int, float)):
             out[variable] = float(out[variable]) + rng.gauss(0.0, sigma)
         return out
-    return Perturbation(f"{variable}±{sigma}", _apply,
+    return Perturbation(f"{variable}+/-{sigma}", _apply,
                         description or f"manufacturing variation on {variable}")
 
 
