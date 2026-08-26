@@ -36,6 +36,7 @@ from .candidate import (Candidate, EvaluationResult, FailureClass,
                         FailureRecord, Fidelity, StageResult)
 from .evaluate import CODE_DIGEST, EvalContext, EvaluationCache, Evaluator
 from .explain import compare, explain_candidate, render_run, render_text
+from .knowledge import CorrectionEstimate, KnowledgeBase
 from .models import (beam_screen, cantilever_point_load, channel_section,
                      euler_buckling, hollow_rect_section,
                      machining_cost_model, rect_section,
@@ -66,6 +67,8 @@ __all__ = [
     # stages
     "AnalyticStage", "CallableStage", "CostStage", "FeaStage",
     "GeometryStage", "RuleStage", "ARTIFACT_OUTLIER_RATIO",
+    # knowledge
+    "KnowledgeBase", "CorrectionEstimate",
     # models
     "beam_screen", "cantilever_point_load", "channel_section",
     "euler_buckling", "hollow_rect_section", "machining_cost_model",
