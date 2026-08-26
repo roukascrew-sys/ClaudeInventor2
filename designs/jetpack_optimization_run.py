@@ -119,11 +119,25 @@ MATERIALS = {
         "E_derate_curve": KE_STEEL, "derate_source": EC3_SRC},
 }
 
+# --- L0 calibration against real FEA. THREE data points, all named. -------
+# Kt at the doubler step, from the hand build:
+#   P0031@v2  beam theory 31.5 MPa -> FEA 47.6 MPa   ratio 1.51
 KT_PAD_STEP = 1.5
-KT_BASIS = ("stress concentration at the doubler step, calibrated against "
-            "P0031@v2 where beam theory gave 31.5 MPa and FEA gave 47.6 MPa "
-            "(ratio 1.51). ONE data point - a screening aid, not a validated "
-            "Kt. FEA still decides.")
+# Kt at the crossbeam/spine T-junction. The first version of this model
+# applied NO concentration factor when there was no doubler, treating the
+# junction as a clean cantilever root. It is not - it is a re-entrant corner
+# where a 1280mm beam meets the spine, and the solver said so:
+#   c6357ea1badbd  L0 SF 5.226 -> FEA SF 2.968   ratio 1.76  (alu, no doubler)
+#   c9773b1e66055  L0 SF 20.53 -> FEA SF 10.45   ratio 1.96  (steel, no doubler)
+# Both had outlier ratios of 1.65/1.76, below the 1.9 artifact threshold, so
+# these are real stresses and not constraint singularities. 1.85 is the mean.
+KT_ROOT_JUNCTION = 1.85
+KT_BASIS = ("Two stated stress-concentration factors, both calibrated against "
+            "named FEA runs rather than assumed. Doubler step Kt=1.5 from "
+            "P0031@v2 (31.5 -> 47.6 MPa, ratio 1.51). T-junction Kt=1.85 from "
+            "c6357ea1badbd (SF 5.226 -> 2.968, ratio 1.76) and c9773b1e66055 "
+            "(SF 20.53 -> 10.45, ratio 1.96), mean 1.86. THREE data points "
+            "total - a screening aid, not validated Kt values. FEA decides.")
 
 # fixed masses (not searched)
 PILOT_KG, PILOT_Y = 90.0, -110.0
@@ -179,7 +193,8 @@ def analytic_screen(v, ctx) -> dict:
     # (a) at the spine root, on the full (padded) section
     root_x = v["spine_x"] / 2.0
     M_root = sum(THRUST_N * (x - root_x) for x in stations if x > root_x)
-    sig_root = M_root / section_Z(pad_t, cb_h)
+    # The T-junction is a re-entrant corner, not a clean built-in end.
+    sig_root = KT_ROOT_JUNCTION * M_root / section_Z(pad_t, cb_h)
     # (b) at the pad step, on the thin section, with the calibrated Kt
     if pad_len > 0:
         step_x = pad_len / 2.0
