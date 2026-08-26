@@ -290,11 +290,19 @@ def system_stage(cand, ctx) -> StageResult:
 def build_case(cand, ctx) -> dict:
     """Real CalculiX case on the whole frame: lugs held, engines pushing up."""
     v = cand.values
+    # The engines hang UNDER THE CROSSBEAM, whose underside sits at
+    # z = SPINE_Z/2 - cb_height/2 - NOT at the frame's global z minimum, which
+    # is the bottom of the spine. Selecting {"axis":"z","at":"min"} picked a
+    # plane where the frame is only spine_x wide, so every engine-station
+    # patch at |x| = 330..430 matched ZERO nodes and the whole promotion
+    # failed. Select the crossbeam underside explicitly.
+    cb_underside_z = SPINE_Z / 2.0 - float(v["cb_height"]) / 2.0
     loads = []
     for key in ("inner_x", "outer_x"):
         for sx in (-1.0, 1.0):
             loads.append({
-                "where": {"all": [{"axis": "z", "at": "min"},
+                "where": {"all": [{"axis": "z", "at": cb_underside_z,
+                                   "tol": 1.0},
                                   {"axis": "x", "at": sx * float(v[key]),
                                    "tol": 30.0}]},
                 "force_total_N": [0.0, 0.0, THRUST_N]})
