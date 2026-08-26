@@ -593,3 +593,33 @@ def test_failed_promotion_cannot_leave_a_design_looking_validated():
     assert any(not f.trustworthy for f in c.result.failures)
     # and it must not be recommendable
     assert pareto_front([c], reqs.objectives) == []
+
+
+def test_promotion_spends_solver_time_where_the_answer_is_in_doubt():
+    """Promotion used to sort by constraint violation, which is 0 for every
+    feasible candidate, so it took an arbitrary slice. In a real jetpack run
+    that picked the two chunkiest frontier members - screened at SF 14.7 and
+    22.6, never in doubt - and both blew the 600s solver timeout. Two
+    expensive solves, nothing learned.
+    """
+    reqs = make_reqs(sf_min=2.0)
+
+    def cand_with(mass, I, sf):
+        c = Candidate(values={"w": mass, "h": I})
+        c.result.metrics = {"mass_kg": mass, "section_I_mm4": I,
+                            "sf.yield_von_mises": sf}
+        c.result.apply_requirements(reqs)
+        return c
+
+    marginal = cand_with(3.0, 300.0, 2.05)     # right on the gate: in doubt
+    obvious = cand_with(9.0, 900.0, 22.0)      # nowhere near it
+    light = cand_with(1.0, 100.0, 8.0)
+
+    cfg = OptimizationConfig(population=4, generations=1, seed=0)
+    run = OptimizationRun(RandomSearch(make_space(), reqs, cfg),
+                          make_evaluator(), reqs, cfg)
+    run.all_candidates = [obvious, light, marginal]
+    order = run._promotion_order([obvious, light, marginal],
+                                 [obvious, light, marginal])
+    assert order[0] is marginal, "the design closest to its gate must go first"
+    assert set(id(c) for c in order) == {id(obvious), id(light), id(marginal)}

@@ -138,7 +138,7 @@ class OptimizationRun:
             return []
         front = pareto_front(self.all_candidates, self.requirements.objectives)
         pool = front or [c for c in self.all_candidates if c.feasible]
-        pool = sorted(pool, key=lambda c: total_violation(c))[:k]
+        pool = self._promotion_order(front, pool)[:k]
         promoted = []
         for cand in pool:
             self.evaluator.evaluate(cand, max_fidelity=fid)
@@ -148,6 +148,45 @@ class OptimizationRun:
             promoted.append(cand)
         self.promoted = promoted
         return promoted
+
+
+    @staticmethod
+    def _tightest_margin(cand) -> float:
+        margins = [r.normalized_margin for r in cand.result.constraint_results
+                   if r.constraint.severity == "mandatory"
+                   and r.normalized_margin is not None]
+        return min(margins) if margins else float("inf")
+
+    def _promotion_order(self, front, pool):
+        """Order candidates by how much a solver run would actually TELL us.
+
+        Sorting by constraint violation put every feasible candidate at zero
+        and then took an arbitrary slice. In a real jetpack run that picked
+        the two chunkiest frontier members - screened at SF 14.7 and 22.6, so
+        never in doubt - and both blew the 600s solver timeout at 675k and
+        431k nodes. Two expensive solves, nothing learned.
+
+        A solve is worth most where the screening answer is closest to the
+        gate, and next-most at the frontier extremes a human would actually
+        choose between. So: tightest margin first, then the objective
+        extremes and the balanced compromise, then whatever remains.
+        """
+        ordered: list = []
+
+        def add(c):
+            if c is not None and not any(c is o for o in ordered):
+                ordered.append(c)
+
+        for c in sorted(front, key=self._tightest_margin):
+            add(c)
+            break                       # the single most-in-doubt design
+        arch = archetypes(front, self.requirements)
+        for role in sorted(arch):
+            add(arch[role])
+        for c in sorted(pool, key=lambda c: (total_violation(c),
+                                             self._tightest_margin(c))):
+            add(c)
+        return ordered
 
     # -- outputs -------------------------------------------------------
     def front(self, feasible_only: bool = True) -> list[Candidate]:
