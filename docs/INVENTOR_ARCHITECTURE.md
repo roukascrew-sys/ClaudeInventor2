@@ -165,3 +165,69 @@ cached L0/L1 stages — only the FEA stage ran fresh.
 **The solver demoted 2 of the 3 promoted candidates.** Their analytic
 screening safety factors did not survive contact with a real mesh. That is
 the multi-fidelity contract working as intended, not a defect.
+
+## Case study: the jetpack frame, hand-designed vs searched
+
+The jetpack frame built by hand on 2026-08-25 was re-run as an optimisation
+problem (`designs/jetpack_optimization_run.py`). Two objectives that genuinely
+trade — frame mass and thermal headroom — with thrust/weight and thrust-CG
+offset as hard constraints.
+
+### Result, on solver evidence
+
+| | frame mass | FEA safety factor | thermal headroom | evidence |
+|---|---|---|---|---|
+| hand-built `P0031@v2` | 5.530 kg | **5.274** | ~257 C | CalculiX |
+| searched `P0047@v1` | **3.901 kg** | **3.844** | ~217 C | CalculiX |
+
+29.5% lighter, both validated, both clearing the SF 3.0 gate. **Not a strict
+win**: the hand build carries more margin and 40 C more thermal headroom.
+They are two points on one trade, and the frontier states that rather than
+hiding it behind a single score.
+
+Both max-temperature figures are recomputed from FEA-**measured** stress
+(47.6 and 65.3 MPa). That also corrects the hand build's originally reported
+273 C to 257 C — the original came from the uncalibrated screening model.
+
+### What the loop actually caught
+
+1. **A silent promotion failure.** The L3 stage errored while the L0 estimate
+   for the same metric was still present, so the constraint passed *at L0
+   fidelity* and the run printed `3 solved in 0.0s ... PASS` with no solver
+   run and no part created. Fixed: a stage that runs and cannot answer
+   degrades the whole result to UNKNOWN.
+2. **A wrong boundary condition, masked by a plausible symptom.** Load patches
+   selected the frame's global z-minimum (the spine base) instead of the
+   crossbeam underside, so every engine-station patch matched zero nodes. The
+   mesh ladder had been dutifully refining 5.0 -> 4.0 -> 3.2 against what
+   looked like a meshing problem.
+3. **A model that was optimistic by 76–96%.** Screened SF vs FEA SF was
+   5.226/2.968 and 20.532/10.454. Root cause was a real modelling gap: with
+   no doubler the model applied no concentration factor at the crossbeam/spine
+   T-junction, treating a re-entrant corner as a clean cantilever root.
+   After adding `KT_ROOT_JUNCTION = 1.85` (mean of the two measured ratios),
+   the screened SF predicted 3.912 against a measured 3.844 — **1.8% error**.
+4. **Promotion was spending solver time where nothing was in doubt.** It
+   picked the two chunkiest frontier members (screened SF 14.7 and 22.6) and
+   both blew the 600 s timeout at 675k and 431k nodes. Now ordered by
+   tightest constraint margin first.
+
+### The finding that survived every correction
+
+Recalibration changed the mass numbers but not this: **6061 saturates near
+345 C at any thickness**, because k_0,2 collapses to 0.10 at 350 C
+(EN 1999-1-2 Table 1a). Past that, no section helps and only a material change
+does. The frontier shows the discontinuity directly.
+
+And the recalibration **vindicated the hand-built doubler**: before it, the
+frontier was almost entirely doubler-free; after it, nearly every competitive
+aluminium design has one. The cheap model had been discarding a real
+structural idea because it did not know the T-junction was a stress riser.
+
+### Honest limit on the steel branch
+
+Steel frontier rows report 500–790 C of headroom. Those come from
+EN 1993-1-2 Table 3.1, a **fire-design** table (short duration, effective
+yield at 2% strain). A jetpack thermally cycles its structure every flight.
+The curve is real data; using it to claim sustained-service headroom at those
+temperatures is not defensible, and creep and oxidation are not assessed.
