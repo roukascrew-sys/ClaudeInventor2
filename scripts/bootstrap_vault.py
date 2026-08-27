@@ -22,8 +22,8 @@ from pathlib import Path
 # eagerly imports the geometry kernel, so `from design_engine.vault import ...`
 # would drag in CadQuery - and the whole point of the vault (and the knowledge
 # base) is that the reasoning layer keeps working when the kernel does not.
-# Proven necessary: Smart App Control blocked an unsigned nlopt DLL on this
-# machine and this script still has to run.
+# Proven necessary: the CAD kernel stopped importing on this machine for a
+# still-unexplained reason, and this script still had to run.
 import importlib.util
 
 _VAULT = Path(__file__).parent.parent / "design_engine" / "vault.py"
@@ -102,6 +102,7 @@ truth; this vault is reasoning truth — why the system works the way it does.
 
 ## Orientation
 - [[Current State]] — what is true right now
+- [[Project Memory]] — how it came to be true, newest first
 - [[Roadmap]] — what is worth doing next, ranked by evidence
 - [[Open Questions]] — what we do not know
 
@@ -124,7 +125,7 @@ truth; this vault is reasoning truth — why the system works the way it does.
 """, tags=["claudeinventor", "index"])
 
     v.write("00_Home", "Current State", type="index", confidence="high", body="""
-Verified against the repository at commit `6aa3ad3`, 2026-08-25.
+Verified against the repository at commit `9f8943e`, 2026-08-27.
 
 ## What exists and works
 - **Deterministic engineering engine** (`design_engine/`): geometry, meshing,
@@ -136,36 +137,38 @@ Verified against the repository at commit `6aa3ad3`, 2026-08-25.
 - **Knowledge base** (`design_engine/inventor/knowledge.py`): 73 real solver
   observations ingested from the FRACAS log, calibration pairs, and a learned
   solver cost model. Stdlib-only.
-- **156 tests passing** as of commit `6aa3ad3`.
+- **Project memory** (`design_engine/memory.py`): the chronological half of
+  this vault — validated, append-only, supersedes rather than deletes.
+  [[Project Memory]]
+- **189 tests passing**, 2026-08-27.
 
-## What is BLOCKED right now
-**Windows Smart App Control is enforcing and blocks the unsigned `_nlopt.pyd`,
-so CadQuery will not import and the engine cannot run.** See
-[[Smart App Control blocks the CAD kernel]]. The knowledge and vault layers are
-stdlib-only and unaffected.
+## Nothing is blocked
+The CAD kernel imports and the full suite runs. An earlier entry here reported
+the engine as blocked by Windows Smart App Control; **that attribution was
+wrong** — Smart App Control is still enforcing and CadQuery imports anyway. See
+[[The CAD kernel blockage was misattributed to Smart App Control]]. The
+mechanism of the original failure is still unknown.
 
 ## Best validated results
 - Jetpack frame, searched: **3.901 kg at FEA SF 3.844** (`P0047@v1`)
 - Jetpack frame, hand-built: **5.530 kg at FEA SF 5.274** (`P0031@v2`)
 - Both clear the 3.0 gate. See [[Jetpack Frame Optimization Run]].
-""", links=["Home", "Roadmap", "Open Questions"])
+""", links=["Home", "Project Memory", "Roadmap", "Open Questions"])
 
     v.write("00_Home", "Roadmap", type="index", body="""
 Ranked by expected impact, from measured evidence rather than a wishlist.
 Full reasoning in the linked notes.
 
-1. **Unblock the CAD kernel** — nothing else can proceed.
-   [[Smart App Control blocks the CAD kernel]]
-2. **Verify mesh convergence** — the headline SF 3.844 was computed at one
+1. **Verify mesh convergence** — the headline SF 3.844 was computed at one
    mesh size and never checked. [[Mesh convergence is unverified]]
-3. **Use the L2 coarse-FEA rung** — screening jumps L1 to L3, which is why a
+2. **Use the L2 coarse-FEA rung** — screening jumps L1 to L3, which is why a
    76% model error survived to the frontier. [[Multi Fidelity Evaluation]]
-4. **Make FEA parallelisable** — it is 97% of wall time and runs serial.
+3. **Make FEA parallelisable** — it is 97% of wall time and runs serial.
    [[Solver runs cannot be parallelised]]
-5. **Automate model calibration** — currently a human reads FEA results and
+4. **Automate model calibration** — currently a human reads FEA results and
    edits a constant. [[Screening models need automatic calibration]]
-6. **Recover from solver timeouts** — [[Solver timeout wastes the full budget]]
-7. **Extend search to the system level** — only the frame is searched today.
+5. **Recover from solver timeouts** — [[Solver timeout wastes the full budget]]
+6. **Extend search to the system level** — only the frame is searched today.
 """, links=["Current State", "Open Questions"])
 
     v.write("00_Home", "Open Questions", type="open-question", confidence="unknown",
@@ -464,7 +467,7 @@ nicety here; it is the only reason search is possible at all.
 **The L2 rung is defined but unused, and that is a real gap.** Screening jumps
 L1 → L3, which is how a 76% model error survived long enough to shape an
 entire Pareto frontier. A coarse 8-second rung would have exposed it after a
-handful of solves. Ranked #3 on [[Roadmap]].
+handful of solves. Ranked #2 on [[Roadmap]].
 """, links=["Design Engine", "Optimization Engine", "Roadmap",
             "Screening models are optimistic in the unsafe direction"])
 
@@ -825,15 +828,24 @@ Restricting the fit does not tighten it.
 """, links=["Engineering Knowledge Base",
             "Promotion spent solver time where nothing was in doubt", "Roadmap"])
 
+    # Kept verbatim as the historical record. The conclusion was wrong, and
+    # deleting it would remove exactly the reasoning that shows how.
     v.write("05_Failures/Bugs", "Smart App Control blocks the CAD kernel",
-            type="failure", status="active", confidence="high",
-            extra={"severity": "critical", "failure_kind": "environment"}, body="""
+            type="failure", status="superseded", confidence="low",
+            extra={"severity": "critical", "failure_kind": "environment",
+                   "superseded_by":
+                       "[[The CAD kernel blockage was misattributed to Smart App Control]]"},
+            body="""
+> **This note's conclusion was wrong.** It is kept because the reasoning error
+> is more instructive than the fix. See
+> [[The CAD kernel blockage was misattributed to Smart App Control]].
+
 **Symptom:** `import cadquery` fails with
 `DLL load failed while importing _nlopt: An Application Control policy has
 blocked this file.` The entire engine is unusable; the test suite cannot even
 be collected.
 
-**Diagnosis (read-only, no attempt to circumvent):**
+**Diagnosis at the time (read-only, no attempt to circumvent):**
 - Smart App Control is **ON and enforcing** —
   `HKLM:\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy\\VerifiedAndReputablePolicyState = 1`
 - `_nlopt.pyd` is **NotSigned**, and has no Mark-of-the-Web, so `Unblock-File`
@@ -842,18 +854,55 @@ be collected.
   passed 156 tests earlier the same day.
 
 **Import chain:** `cadquery → sketch → sketch_solver → nlopt → _nlopt.pyd`.
-An earlier "VTK not installed" message is a caught warning, not the cause.
 
-**Not a code regression.** This is an OS security posture change.
+**Conclusion drawn (wrong):** that Smart App Control was blocking the DLL, that
+this was an OS security posture change, and that the only practical remedy was
+to disable Smart App Control — a one-way action requiring a Windows reinstall
+to reverse.
 
-**Resolution requires a decision from Gideon.** Smart App Control has no
-user-facing per-file allowlist; the practical option is to turn it off — and
-**that is one-way: it cannot be re-enabled without reinstalling Windows.**
-That trade is his to make, not mine.
+**Where the reasoning failed:** every observation above is still true today,
+and CadQuery imports fine. An enforcing policy plus an unsigned DLL is a
+correlation. It was never tested as a mechanism.
+""", links=["The CAD kernel blockage was misattributed to Smart App Control",
+            "The knowledge layer is stdlib-only", "Current State"])
 
-**What still works:** everything stdlib-only — the knowledge base (15 tests)
-and this vault. [[The knowledge layer is stdlib-only]]
-""", links=["The knowledge layer is stdlib-only", "Current State", "Roadmap"])
+    v.write("05_Failures/Bugs",
+            "The CAD kernel blockage was misattributed to Smart App Control",
+            type="failure", status="resolved", confidence="high",
+            extra={"severity": "critical", "failure_kind": "reasoning"}, body="""
+**Symptom:** the engine was reported unrunnable and a one-way remedy was
+recommended — disabling Windows Smart App Control, which cannot be re-enabled
+without reinstalling Windows.
+
+**What is observed now (2026-08-27):**
+- `import cadquery` succeeds. CadQuery 2.8.0, 3.7 s.
+- `import nlopt` succeeds.
+- Full suite: **189 passed**.
+- `VerifiedAndReputablePolicyState = 1` — **still enforcing, unchanged.**
+- Nothing was altered to achieve this. No security setting was touched.
+
+**Root cause of the misdiagnosis:** a policy state present both when the import
+failed and when it succeeds cannot be what distinguishes the two cases. Smart
+App Control being enforcing was treated as the mechanism on the strength of it
+being plausible and concurrent.
+
+**Root cause of the original import failure:** **Unknown.** A transient file
+lock, an in-progress antimalware scan, and a first-run reputation check are all
+consistent with the evidence. None was confirmed, and saying which one it was
+would be inventing an answer.
+
+**Fix:** none was required. The recommendation to disable Smart App Control is
+withdrawn.
+
+**If it recurs:** capture the Code Integrity operational event log at the
+moment of failure. Reasoning backwards from policy state afterwards is what
+produced the wrong answer the first time.
+
+**Lesson:** before attributing a failure to an environment control — especially
+one whose remedy is irreversible — establish the mechanism, or say plainly that
+the cause is unknown. [[Refuse rather than invent]]
+""", links=["Smart App Control blocks the CAD kernel", "Refuse rather than invent",
+            "Current State", "Project Memory"])
 
     v.write("05_Failures/Engineering_Failures",
             "Analytic section models must match the real section",
@@ -901,7 +950,7 @@ log writes, and a lock (or a monotonic counter) around part-number allocation.
 Both are small, additive and testable — but must not be attempted while the
 CAD kernel is blocked, because they cannot be verified.
 
-Ranked #4 on [[Roadmap]].
+Ranked #3 on [[Roadmap]].
 """, links=["Roadmap", "Design Engine", "Optimization Engine"])
 
     v.write("04_Optimization/Surrogates", "Screening models need automatic calibration",
@@ -929,7 +978,7 @@ on a T-junction beam must not silently be applied to a pressure vessel. The
 `problem` field exists for this and is currently set by the caller, which is a
 weak guarantee.
 
-Ranked #5 on [[Roadmap]].
+Ranked #4 on [[Roadmap]].
 """, links=["Roadmap", "Engineering Knowledge Base",
             "Screening models are optimistic in the unsafe direction"])
 
@@ -1032,7 +1081,7 @@ that the reported safety factor is asymptoting. Expensive — 401k nodes took
 381 s, and 2.2 mm would be several times that — but it is the difference
 between a number and a measurement.
 
-Ranked #2 on [[Roadmap]], behind only unblocking the kernel.
+Ranked #1 on [[Roadmap]].
 """, links=["Jetpack Frame Optimization Run", "Roadmap", "Jetpack Frame"])
 
     # ------------------------------------------------------------ session
@@ -1066,7 +1115,8 @@ crucially nothing between "do nothing" and "build geometry in the kernel".
 ## Failures
 [[Silent promotion failure]] · [[Load selector picked the wrong face]] ·
 [[Promotion spent solver time where nothing was in doubt]] ·
-[[Meshing is non-monotonic]] · [[Smart App Control blocks the CAD kernel]]
+[[Meshing is non-monotonic]] ·
+[[The CAD kernel blockage was misattributed to Smart App Control]]
 
 ## Decisions
 [[UNKNOWN is not a pass]] · [[Numerical artifacts must not steer search]] ·
@@ -1074,12 +1124,11 @@ crucially nothing between "do nothing" and "build geometry in the kernel".
 [[The knowledge layer is stdlib-only]]
 
 ## Tests
-156 passing at commit `6aa3ad3` (88 pre-existing, unmodified). A further 15
-knowledge-base tests pass with the CAD kernel down.
+189 passing as of 2026-08-27 (88 pre-existing, unmodified).
 
 ## Remaining Work
-See [[Roadmap]]. The kernel is currently blocked by Smart App Control and
-that gates everything else.
+See [[Roadmap]]. Mesh convergence for the headline SF 3.844 is the top item;
+nothing is blocked.
 
 ## Important Context
 I over-claimed once in this session — reporting a 23% mass win from screened

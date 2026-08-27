@@ -35,12 +35,16 @@ kbm = _load()
 
 
 def test_module_is_stdlib_only():
-    """No runtime dependency on the geometry kernel, by construction."""
-    import sys
-    for banned in ("cadquery", "OCP", "nlopt"):
-        assert banned not in sys.modules, (
-            f"{banned} was imported by the knowledge module; it must stay "
-            f"usable when the CAD kernel is unavailable")
+    """No runtime dependency on the geometry kernel, by construction.
+
+    Checked in a clean subprocess rather than against this process's
+    `sys.modules`: once the full suite has run other files, cadquery is already
+    imported, and an in-process check quietly becomes "has anyone imported
+    cadquery" — passing in isolation, failing in the suite, and proving nothing
+    in either case.
+    """
+    from test_memory import assert_loads_without_cad_kernel
+    assert_loads_without_cad_kernel(_MOD)
 
 
 class FakeLog:
