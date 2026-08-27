@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS observations (
     elements INTEGER,
     mesh_mm REAL,
     solve_seconds REAL,
+    peak_rss_mb REAL,
     outlier_ratio REAL,
     service_temp_C REAL,
     failure_mode TEXT,
@@ -197,8 +198,9 @@ class KnowledgeBase:
                         " project, geometry_id, action, limit_state, material,"
                         " result, safety_factor, required_sf, max_von_mises_MPa,"
                         " allowable_MPa, nodes, elements, mesh_mm, solve_seconds,"
-                        " outlier_ratio, service_temp_C, failure_mode, reason)"
-                        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        " peak_rss_mb, outlier_ratio, service_temp_C,"
+                        " failure_mode, reason)"
+                        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (row["id"], time.time(), project, row["geometry_version"],
                          action, d.get("limit_state"),
                          mat.get("name") if isinstance(mat, dict) else None,
@@ -208,6 +210,7 @@ class KnowledgeBase:
                          d.get("nodes"), d.get("elements"),
                          _num((d.get("mesh") or {}).get("max_size_mm")),
                          _num(d.get("solve_seconds")),
+                         _num(d.get("peak_rss_mb")),
                          _num(d.get("stress_outlier_ratio")),
                          _num(derate.get("service_temp_C")),
                          row["failure_mode"], row["reason"]))
@@ -446,12 +449,116 @@ class KnowledgeBase:
                 "low_s": round(est / band, 1), "high_s": round(est * band, 1),
                 "n": m["n"], "band_multiplier": band}
 
-    def affordable(self, nodes: int, budget_s: float) -> dict:
-        """Should this candidate be promoted, given a solver budget?"""
+    def solver_memory_model(self) -> dict | None:
+        """What a solve costs in MEMORY, learned the same way as time.
+
+        This exists because time was never the binding constraint. On
+        2026-08-27 a 504k-node solve was predicted at 589 s, had a 3600 s
+        budget, and died anyway — an access violation at a 6.1 GB working set
+        on a machine with 1.3 GB free. `affordable()` had said yes, because it
+        only ever modelled seconds. A plan that assumes "we can always refine
+        further, it just costs hours" is wrong whenever RAM runs out first.
+
+        Same log-log fit as the cost model: a direct sparse solve's fill-in
+        grows as a power of the node count, so memory takes the same shape.
+        """
+        rows = self._conn.execute(
+            "SELECT nodes, peak_rss_mb FROM observations"
+            " WHERE nodes > 0 AND peak_rss_mb > 0").fetchall()
+        pts = [(math.log(r["nodes"]), math.log(r["peak_rss_mb"])) for r in rows]
+        if len(pts) < 4:
+            return None
+        mx = statistics.fmean(p[0] for p in pts)
+        my = statistics.fmean(p[1] for p in pts)
+        denom = sum((p[0] - mx) ** 2 for p in pts)
+        if denom == 0:
+            return None
+        slope = sum((p[0] - mx) * (p[1] - my) for p in pts) / denom
+        intercept = my - slope * mx
+        resid = [p[1] - (intercept + slope * p[0]) for p in pts]
+        sigma = statistics.pstdev(resid) if len(resid) > 1 else 0.0
+        return {"exponent": round(slope, 3),
+                "mb_at_100k_nodes": round(
+                    math.exp(intercept + slope * math.log(1e5)), 1),
+                "n": len(pts),
+                "log_residual_sigma": round(sigma, 3),
+                "band_multiplier": round(math.exp(sigma), 2),
+                "note": "peak working set vs node count, from real runs. Budget "
+                        "against the HIGH end: exceeding available memory does "
+                        "not slow the solve down, it kills it outright."}
+
+    def predict_memory(self, nodes: int) -> dict | None:
+        """Peak memory estimate for a solve of this size, with its band."""
+        m = self.solver_memory_model()
+        if not m or nodes <= 0:
+            return None
+        est = m["mb_at_100k_nodes"] * (nodes / 1e5) ** m["exponent"]
+        band = m["band_multiplier"]
+        return {"nodes": nodes, "estimate_mb": round(est, 1),
+                "low_mb": round(est / band, 1), "high_mb": round(est * band, 1),
+                "n": m["n"], "band_multiplier": band}
+
+    @staticmethod
+    def available_memory_mb() -> float | None:
+        """Physical memory currently available, or None if unknowable.
+
+        Deliberately reports AVAILABLE rather than total: a machine with 15.5
+        GB installed and 1.3 GB free cannot run a 6 GB solve, and only the
+        second number predicts that.
+        """
+        try:
+            import ctypes
+
+            class _MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_uint32),
+                            ("dwMemoryLoad", ctypes.c_uint32),
+                            ("ullTotalPhys", ctypes.c_uint64),
+                            ("ullAvailPhys", ctypes.c_uint64),
+                            ("ullTotalPageFile", ctypes.c_uint64),
+                            ("ullAvailPageFile", ctypes.c_uint64),
+                            ("ullTotalVirtual", ctypes.c_uint64),
+                            ("ullAvailVirtual", ctypes.c_uint64),
+                            ("ullAvailExtendedVirtual", ctypes.c_uint64)]
+
+            if not hasattr(ctypes, "windll"):
+                return None
+            st = _MEMORYSTATUSEX()
+            st.dwLength = ctypes.sizeof(st)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                return None
+            return round(st.ullAvailPhys / (1024 * 1024), 1)
+        except (OSError, AttributeError, ImportError):
+            return None
+
+    def affordable(self, nodes: int, budget_s: float,
+                   memory_mb: float | None = None) -> dict:
+        """Should this candidate be promoted, given a solver budget?
+
+        Checks memory FIRST when a model exists. Running out of memory does not
+        make a solve slow, it makes it return nothing — so a time verdict on a
+        solve that cannot fit is a confident answer to the wrong question.
+
+        `memory_mb` defaults to what is actually free right now, not to the
+        machine's installed total.
+        """
+        mem = self.predict_memory(nodes)
+        if mem is not None:
+            limit = memory_mb if memory_mb is not None else self.available_memory_mb()
+            if limit is not None and mem["high_mb"] > limit:
+                verdict = "no" if mem["estimate_mb"] > limit else "marginal"
+                return {"verdict": verdict,
+                        "reason": (f"predicted peak memory "
+                                   f"{mem['estimate_mb']:.0f} MB (band to "
+                                   f"{mem['high_mb']:.0f} MB) against "
+                                   f"{limit:.0f} MB available; memory, not "
+                                   f"time, is the binding constraint here"),
+                        "prediction": self.predict_solve(nodes),
+                        "memory": mem, "available_mb": limit}
+
         p = self.predict_solve(nodes)
         if p is None:
             return {"verdict": "unknown", "reason": "no cost model yet",
-                    "prediction": None}
+                    "prediction": None, "memory": mem}
         # Three verdicts, not two. Measured on this repo's own history the
         # band is x1.5-1.9 wide and restricting the fit does not tighten it
         # (the exponent goes physically implausible as n drops), so a binary
@@ -462,16 +569,16 @@ class KnowledgeBase:
             return {"verdict": "no",
                     "reason": (f"central estimate {p['estimate_s']:.0f}s already "
                                f"exceeds the {budget_s:.0f}s budget"),
-                    "prediction": p}
+                    "prediction": p, "memory": mem}
         if p["high_s"] > budget_s:
             return {"verdict": "marginal",
                     "reason": (f"estimate {p['estimate_s']:.0f}s fits but the band "
                                f"reaches {p['high_s']:.0f}s; on n={p['n']} runs "
                                f"this model cannot tell you which"),
-                    "prediction": p}
+                    "prediction": p, "memory": mem}
         return {"verdict": "yes",
                 "reason": f"upper estimate {p['high_s']:.0f}s fits {budget_s:.0f}s",
-                "prediction": p}
+                "prediction": p, "memory": mem}
 
     def report(self) -> dict:
         obs = self._conn.execute(

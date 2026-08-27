@@ -257,3 +257,99 @@ def test_report_summarises_without_inventing(kb):
     assert r["observations"] == 1
     assert r["calibrations"] == 0
     assert r["solver_cost"] is None          # not enough data -> None, not a guess
+
+
+# ------------------------------------------------------------ solver memory
+def _seed_memory(kb, pairs):
+    """pairs: (nodes, peak_rss_mb)"""
+    rows = [_row(i, details={"nodes": n, "solve_seconds": 1.0, "peak_rss_mb": mb})
+            for i, (n, mb) in enumerate(pairs, start=1)]
+    kb.ingest_log(FakeLog(rows))
+
+
+def test_peak_memory_is_ingested_from_the_log(kb):
+    _seed_memory(kb, [(50_000, 900.0)])
+    row = kb._conn.execute("SELECT peak_rss_mb FROM observations").fetchone()
+    assert row["peak_rss_mb"] == pytest.approx(900.0)
+
+
+def test_unmeasured_memory_stays_null_never_zero(kb):
+    """A missing measurement must not read as 'this solve was free' — that
+    would teach the model that big solves cost nothing."""
+    kb.ingest_log(FakeLog([_row(1, details={"nodes": 50_000,
+                                            "solve_seconds": 12.0})]))
+    row = kb._conn.execute("SELECT peak_rss_mb FROM observations").fetchone()
+    assert row["peak_rss_mb"] is None
+
+
+def test_memory_model_needs_data(kb):
+    _seed_memory(kb, [(1000, 20.0), (2000, 30.0)])
+    assert kb.solver_memory_model() is None
+    assert kb.predict_memory(500_000) is None
+
+
+def test_memory_model_recovers_a_known_power_law(kb):
+    # exact mb = 0.02 * n^1.2
+    pairs = [(n, 0.02 * n ** 1.2)
+             for n in (10_000, 50_000, 100_000, 400_000, 800_000)]
+    _seed_memory(kb, pairs)
+    m = kb.solver_memory_model()
+    assert m["exponent"] == pytest.approx(1.2, abs=0.02)
+    assert m["n"] == 5
+
+
+def test_memory_veto_overrides_a_comfortable_time_budget(kb):
+    """The 2026-08-27 failure in one test: a solve well inside its time budget
+    that could not physically run. Time was never the binding constraint.
+
+    Magnitudes are chosen to resemble the real machine — ~2.5 GB at 500k nodes
+    — so the assertions describe a situation that actually occurs.
+    """
+    rows = [_row(i, details={"nodes": n, "solve_seconds": 1e-5 * n ** 1.5,
+                             "peak_rss_mb": 2.0 * (n / 1000) ** 1.15})
+            for i, n in enumerate((10_000, 50_000, 100_000, 400_000, 800_000),
+                                  start=1)]
+    kb.ingest_log(FakeLog(rows))
+
+    generous_time = 100_000.0
+    roomy = kb.affordable(500_000, generous_time, memory_mb=64_000)
+    assert roomy["verdict"] == "yes"
+
+    tight = kb.affordable(500_000, generous_time, memory_mb=1_300)
+    assert tight["verdict"] == "no"
+    assert "memory" in tight["reason"]
+    assert tight["memory"]["estimate_mb"] > 1_300
+    # and the time budget was never the problem
+    assert tight["prediction"]["estimate_s"] < generous_time
+
+
+def test_memory_verdict_is_three_way_like_the_time_one(kb):
+    """Real runs scatter, so the band has width, and a limit inside that band
+    is honestly 'marginal' rather than a confident call either way."""
+    scatter = (0.75, 1.3, 0.85, 1.25, 1.0)      # deliberate spread
+    rows = [_row(i, details={"nodes": n, "solve_seconds": 1.0,
+                             "peak_rss_mb": 2.0 * (n / 1000) ** 1.15 * s})
+            for i, (n, s) in enumerate(
+                zip((10_000, 50_000, 100_000, 400_000, 800_000), scatter),
+                start=1)]
+    kb.ingest_log(FakeLog(rows))
+    est = kb.predict_memory(500_000)
+    assert est["high_mb"] > est["estimate_mb"], "noisy data must give a band"
+
+    between = (est["estimate_mb"] + est["high_mb"]) / 2
+    assert kb.affordable(500_000, 1e9, memory_mb=between)["verdict"] == "marginal"
+    assert kb.affordable(500_000, 1e9,
+                         memory_mb=est["high_mb"] * 2)["verdict"] == "yes"
+
+
+def test_no_memory_model_falls_back_to_the_time_verdict(kb):
+    """Absent evidence must not become a veto — that would block every solve
+    on a fresh checkout."""
+    rows = [_row(i, details={"nodes": n, "solve_seconds": 1e-5 * n ** 1.5})
+            for i, n in enumerate((10_000, 50_000, 100_000, 400_000, 800_000),
+                                  start=1)]
+    kb.ingest_log(FakeLog(rows))
+    assert kb.solver_memory_model() is None
+    out = kb.affordable(400_000, 6000)
+    assert out["verdict"] == "yes"
+    assert out["memory"] is None

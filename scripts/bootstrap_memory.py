@@ -632,6 +632,51 @@ LATE = [
                  "Mesh convergence is unverified"]),
 
     MemoryEvent(
+        "Solver memory is now measured, so affordability can stop guessing",
+        date="2026-08-27", type="Performance", impact="High",
+        what_happened=(
+            "`fea.py` now measures the solver's PEAK working set (Windows "
+            "tracks it, so no polling) and writes `peak_rss_mb` to the FRACAS "
+            "log alongside `solve_seconds`. `knowledge.py` fits a memory model "
+            "on it exactly as it already fits the cost model, and "
+            "`affordable()` checks memory FIRST, defaulting the limit to what "
+            "is actually free rather than to installed RAM."),
+        why_it_matters=(
+            "The gap this closes was invisible and load-bearing. A 504k-node "
+            "solve was predicted at 589 s against a 3600 s budget and died "
+            "anyway at a 6.1 GB working set. `affordable()` had answered 'yes' "
+            "because seconds were the only thing it modelled — a confident "
+            "answer to the wrong question. Running out of memory does not slow "
+            "a solve down, it kills it, so a time verdict on a solve that "
+            "cannot fit is worse than no verdict."),
+        decision=(
+            "Memory is a first-class solver resource. Peak, not final: a "
+            "process that transiently took 6 GB and then crashed shows almost "
+            "nothing by the time it exits, and the peak is the number that "
+            "explains the death. An unmeasurable platform records None, never "
+            "0, so a missing measurement can never be fitted as 'free'."),
+        evidence=[
+            "Observed — 15.8 MB captured on a 999-node verification solve",
+            "Observed — 239 tests pass, including a regression that reproduces "
+            "the 2026-08-27 case: comfortable time budget, memory veto",
+            "Observed — pre-instrumentation rows correctly read `peak_rss_mb` "
+            "= None rather than 0",
+            "Inferred — the memory model will need real runs before it is "
+            "usable; four measured solves is the minimum it accepts"],
+        affected=["design_engine/fea.py", "design_engine/inventor/knowledge.py"],
+        consequences=(
+            "Solver crashes now name their memory cost in the failure message, "
+            "so an access violation at 6 GB is distinguishable from one at "
+            "500 MB without re-running anything."),
+        open_questions=(
+            "The model has no data yet — every historical row predates the "
+            "instrumentation. It stays None until four real solves accumulate, "
+            "which is the correct behaviour but means the veto is inert today."),
+        related=["Solver memory bounds mesh refinement",
+                 "Engineering Knowledge Base",
+                 "Solver timeout wastes the full budget"]),
+
+    MemoryEvent(
         "An in-process stdlib-only assertion proved nothing",
         date="2026-08-27", type="Testing", impact="Medium",
         what_happened=(

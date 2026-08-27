@@ -24,6 +24,7 @@ fully covered by boundary triangles whose nodes all lie in the selection.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import math
 import re
@@ -568,6 +569,85 @@ def parse_buckling_factors(dat_path: Path) -> list[float]:
             re.findall(r"^\s+\d+\s+(-?[\d.]+E[+-]\d+)", text, re.M)]
 
 
+class _PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+    _fields_ = [("cb", ctypes.c_uint32),
+                ("PageFaultCount", ctypes.c_uint32),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t)]
+
+
+def _peak_rss_mb(proc) -> float | None:
+    """Peak working set of a finished subprocess, in MB, or None.
+
+    PEAK, not final: a solver that transiently took 6 GB and then died shows
+    almost nothing by the time it exits, and the peak is the number that
+    explains the death. Windows tracks it for us, so no polling is needed.
+
+    Returns None rather than guessing when unavailable (non-Windows, handle
+    already closed, API failure). A missing measurement must read as missing —
+    never as zero, which would poison any model fitted on it.
+    """
+    handle = getattr(proc, "_handle", None)
+    if handle is None or not hasattr(ctypes, "windll"):
+        return None
+    try:
+        counters = _PROCESS_MEMORY_COUNTERS()
+        counters.cb = ctypes.sizeof(counters)
+        ok = ctypes.windll.psapi.GetProcessMemoryInfo(
+            ctypes.c_void_p(int(handle)), ctypes.byref(counters), counters.cb)
+        if not ok:
+            return None
+        return round(int(counters.PeakWorkingSetSize) / (1024 * 1024), 1)
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
+class _SolverRun:
+    """What `subprocess.run` returns, plus the peak memory it cost."""
+
+    def __init__(self, returncode: int, stdout: str, stderr: str,
+                 peak_rss_mb: float | None):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.peak_rss_mb = peak_rss_mb
+
+
+def _run_solver(cmd, cwd, env, timeout_s: int) -> _SolverRun:
+    """Run the solver and measure what it actually cost in memory.
+
+    Popen rather than `subprocess.run` because the peak working set has to be
+    read from the process handle, and `run()` closes it before returning.
+
+    Why this exists: on 2026-08-27 a 504k-node solve died with an access
+    violation, and nothing in the log said whether it had been near a memory
+    limit. The learned cost model predicts TIME, so `affordable()` cheerfully
+    returned `yes` for a solve that could not physically run. Time was never
+    the binding constraint on that machine; memory was, and it was invisible.
+    """
+    proc = subprocess.Popen(cmd, cwd=cwd, env=env, text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        # Read the peak BEFORE killing: a timeout at 6 GB and a timeout at
+        # 500 MB are different failures and want different remedies.
+        peak = _peak_rss_mb(proc)
+        proc.kill()
+        proc.communicate()
+        raise subprocess.TimeoutExpired(cmd, timeout_s) from None
+    finally:
+        pass
+    return _SolverRun(proc.returncode, stdout or "", stderr or "",
+                      _peak_rss_mb(proc))
+
+
 class ValidationTools:
     def __init__(self, root: str | Path, log: ActionLog, parts: PartStore,
                  ccx_path: str | Path, threads: int | None = 1,
@@ -815,9 +895,9 @@ class ValidationTools:
             binary, env, threads_used = self._solver_command()
             solve_t0 = time.time()
             try:
-                proc = subprocess.run(
-                    [str(binary), "-i", "job"], cwd=run_dir, env=env,
-                    capture_output=True, text=True, timeout=self.solve_timeout_s)
+                proc = _run_solver(
+                    [str(binary), "-i", "job"], run_dir, env,
+                    self.solve_timeout_s)
             except subprocess.TimeoutExpired:
                 raise FeaError(
                     f"solver_timeout: {binary.name} exceeded "
@@ -829,8 +909,14 @@ class ValidationTools:
             solve_s = time.time() - solve_t0
             if proc.returncode != 0 or "Job finished" not in proc.stdout:
                 (run_dir / "ccx_stdout.txt").write_text(proc.stdout, encoding="utf-8")
+                # Name the memory cost in the failure itself. An access
+                # violation at a 6 GB working set and one at 500 MB are
+                # different failures wanting different remedies, and without
+                # this the log could not tell them apart.
+                mem = (f" peak memory {proc.peak_rss_mb:.0f} MB;"
+                       if proc.peak_rss_mb else "")
                 raise FeaError(
-                    f"solver_error: {binary.name} exit {proc.returncode}; "
+                    f"solver_error: {binary.name} exit {proc.returncode};{mem} "
                     f"tail: {proc.stdout[-400:]!r}")
 
             blocks = _parse_frd(run_dir / "job.frd")
@@ -922,6 +1008,11 @@ class ValidationTools:
                 "solver_binary": binary.name,
                 "solver_threads": threads_used,
                 "solve_seconds": round(solve_s, 2),
+                # None, never 0, when the platform cannot report it: a missing
+                # measurement must stay distinguishable from a real zero, or a
+                # model fitted on this column silently learns that big solves
+                # are free.
+                "peak_rss_mb": proc.peak_rss_mb,
                 "artifacts": [png_rel],
             }
             passed = sf >= required
