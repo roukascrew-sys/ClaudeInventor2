@@ -419,6 +419,219 @@ SAC_NEW = MemoryEvent(
 
 LATE = [
     MemoryEvent(
+        "The headline safety factor was measured at a stress singularity",
+        date="2026-08-27", type="Engineering", impact="Critical",
+        what_happened=(
+            "Mesh convergence was attempted on P0047@v1's SF 3.844 and the "
+            "premise collapsed. The peak von Mises sat at [-23.505, 4.014, "
+            "199.6] — 1.28 mm off the edge where the doubler pad's underside "
+            "meets the spine wall. `build_spec` unions three boxes with no "
+            "fillet, so that edge is a sharp 270-degree re-entrant corner. "
+            "Linear elasticity has no finite stress there, so the peak grows "
+            "without bound as the mesh refines and cannot converge at all. "
+            "Adding a 10 mm fillet moved the peak onto the fillet arc and "
+            "raised SF from 3.844 to 4.633 at the same 3.2 mm mesh."),
+        why_it_matters=(
+            "SF 3.844 was never a conservative number, it was a meaningless "
+            "one — it measured how finely that corner happened to be meshed. "
+            "The whole Pareto frontier was ranked on peak stresses read off "
+            "unfilleted box unions, so every design in it has the same defect. "
+            "A geometry built by unioning primitives has singular corners "
+            "everywhere, and the solver reports a confident number at each."),
+        decision=(
+            "A safety factor is only meaningful if the stress it derives from "
+            "converges. Before trusting a peak, identify the feature it sits "
+            "on: if that feature is a sharp re-entrant corner, no amount of "
+            "solver time will validate the number, and the fix is geometric."),
+        evidence=[
+            "Observed — sharp P0047@v1 at 3.2 mm: 65.340 MPa, SF 3.844, "
+            "outlier ratio 1.633 (log action 213)",
+            "Observed — filleted P0048@v1 at 3.2 mm: 54.207 MPa, SF 4.633, "
+            "outlier ratio 1.219 (log action 217)",
+            "Observed — the filleted peak lies 9.9998 mm from the 10 mm arc "
+            "centre, i.e. on the fillet surface, off by 0.2 micrometres",
+            "Calculated — 3 of 4 quadrants around the edge are material, "
+            "giving a 270-degree material angle",
+            "Inferred — Williams (1952) gives sigma ~ r**-0.4555 for such a "
+            "corner; the divergence rate itself is not yet measured"],
+        affected=["designs/jetpack_optimization_run.py", "design_engine/geometry.py"],
+        consequences=(
+            "`FILLET_R = 10 mm` added to `build_spec`, costing +4.4 g on "
+            "3.901 kg (+0.113%, measured). `geometry.py` gained a structured "
+            "edge selector, because CadQuery string selectors cannot name an "
+            "interior edge by coordinate, and a fillet matching no edges is "
+            "now refused outright."),
+        open_questions=(
+            "The frontier has not been re-run with fillets, so the ranking is "
+            "still built on unconverged peaks. The pad/crossbeam step at "
+            "|x| = 120 and the lug holes are still sharp."),
+        related=["Peak stress at a sharp re-entrant corner cannot converge",
+                 "Mesh convergence is unverified", "Jetpack Frame",
+                 "Screened is not validated"]),
+
+    MemoryEvent(
+        "The stress outlier ratio does not detect geometric singularities",
+        date="2026-08-27", type="Failure", impact="High",
+        what_happened=(
+            "The heuristic trusted to separate real stresses from numerical "
+            "artifacts read 1.633 on a peak that was entirely a discretisation "
+            "artifact. The ratio compares the peak against the bulk field, "
+            "which catches a hot spot pinned to a CONSTRAINT patch. A "
+            "geometric singularity at a re-entrant corner is fed by the "
+            "surrounding field rather than decoupled from it, so the ratio "
+            "stays low while the stress is still unbounded."),
+        why_it_matters=(
+            "The vault recorded the wrong inference as a validated decision: "
+            "'outlier ratios of 1.63-1.76 confirmed the demotions were real "
+            "and not artifacts'. Low ratio means 'not a constraint artifact'. "
+            "It has never meant 'physically real'. A heuristic's name is not "
+            "its scope, and this one was trusted outside it."),
+        decision=(
+            "The outlier ratio may never be cited as evidence that a stress is "
+            "convergeable. It answers one narrow question about constraint "
+            "patches and nothing else."),
+        evidence=[
+            "Observed — P0047@v1 ratio 1.633 with the peak on a sharp corner",
+            "Observed — filleting drops the ratio to 1.219, inside the "
+            "1.00-1.20 band the vault documents for sound models",
+            "Observed — c6357ea1badbd (1.76) and c9773b1e66055 (1.96), the two "
+            "runs KT_ROOT_JUNCTION = 1.85 was fitted to, were both unfilleted",
+            "Inferred — that Kt cannot be better than the non-converged peaks "
+            "it was fitted to; how much worse is unmeasured"],
+        affected=["design_engine/fea.py", "design_engine/inventor/adapters.py",
+                  "designs/jetpack_optimization_run.py"],
+        consequences=(
+            "The architecture decision note is corrected in place and the Kt "
+            "constant annotated rather than deleted, since it remains the best "
+            "available screening aid."),
+        open_questions=(
+            "Whether a cheap test for geometric singularity exists — comparing "
+            "the peak across two mesh sizes would do it, but that costs a "
+            "second solve on every candidate."),
+        related=["The outlier ratio does not detect geometric singularities",
+                 "Numerical artifacts must not steer search",
+                 "Peak stress at a sharp re-entrant corner cannot converge"]),
+
+    MemoryEvent(
+        "Solver memory bounds mesh refinement, and nothing models it",
+        date="2026-08-27", type="Performance", impact="High",
+        what_happened=(
+            "A 2.8 mm mesh (~504k nodes, predicted 589 s) crashed ccx.exe with "
+            "0xC0000005 after 469 s at a 6.1 GB working set, on a machine with "
+            "1.3 GB available and 20.9 GB of a 29 GB commit limit already in "
+            "use. The same geometry at 3.2 mm (337k nodes) solves fine. "
+            "Freeing memory by closing 24 Chrome and 38 WebView processes "
+            "returned only 0.48 GB net, because the running solver immediately "
+            "claimed it; the retry succeeded only after the solver had exited "
+            "and released its pages."),
+        why_it_matters=(
+            "The learned solver cost model predicts TIME. There is no model of "
+            "MEMORY at all, so `affordable()` will return 'yes' for a solve "
+            "that cannot physically run. Every plan resting on 'we can always "
+            "refine further, it just costs hours' is wrong on this machine — "
+            "the binding constraint was never time."),
+        decision=(
+            "Treat memory as a first-class solver resource. Until it is "
+            "modelled, ~3.2 mm is the practical ceiling on this geometry, and "
+            "refinement plans must say so rather than assuming time is the "
+            "only budget."),
+        evidence=[
+            "Observed — ccx.exe exit 3221225477 (0xC0000005) at 6.1 GB, 469 s",
+            "Observed — 3.2 mm at 337k nodes completes in 318 s",
+            "Observed — available memory 1.3 GB at failure, 5.9 GB at retry",
+            "Inferred — out of memory. CalculiX does not fail cleanly on a "
+            "failed allocation; the mechanism was not isolated"],
+        affected=["design_engine/fea.py", "design_engine/inventor/knowledge.py"],
+        consequences=(
+            "The refinement study was capped, and the 2.0 mm point (~1.38M "
+            "nodes) was never attempted."),
+        open_questions=(
+            "Peak solver RSS is not recorded per run, so no memory model can "
+            "be fitted from history yet. Submodelling the junction, or an "
+            "iterative solver, would both sidestep the wall — but a solver "
+            "change needs validating against known-good results first."),
+        related=["Solver memory bounds mesh refinement",
+                 "Solver timeout wastes the full budget",
+                 "ccx_MT produces wrong answers", "Engineering Knowledge Base"]),
+
+    MemoryEvent(
+        "The second brain was written to but not read",
+        date="2026-08-27", type="Direction", impact="Medium",
+        what_happened=(
+            "Asked to verify mesh convergence, I went straight from the "
+            "request to the database and the source without reading the vault "
+            "— two days after building it, and against an explicit rule in "
+            "CLAUDE.md. Gideon asked whether I had used it. I had not."),
+        why_it_matters=(
+            "The vault already contained the session's central finding. "
+            "'Numerical artifacts must not steer search' recorded the exact "
+            "over-claim about outlier ratios as a validated decision, and "
+            "'Mesh convergence is unverified' already prescribed the mesh "
+            "sizes and carried a cost data point I did not have. Hours went "
+            "into re-deriving what was written down."),
+        decision=(
+            "A second brain that is written to but never read is a diary. The "
+            "read step is not diligence, it is the payoff — and it has to "
+            "happen before the first tool call on a substantial task, because "
+            "afterwards the reasoning has already been re-done."),
+        evidence=[
+            "Observed — the outlier-ratio over-claim was already written in "
+            "the vault and is the finding I re-derived from geometry",
+            "Observed — the note prescribed 3.2 / 2.6 / 2.2 mm; I chose "
+            "2.8 / 2.4 without consulting it"],
+        affected=["CLAUDE.md", "ClaudeInventor vault"],
+        consequences=(
+            "Recorded as a lesson so the rule carries its evidence rather than "
+            "being an instruction to comply with."),
+        open_questions=(
+            "Nothing enforces the read step. Unlike the write path, which "
+            "refuses fabricated or duplicate entries in code, reading is still "
+            "just an instruction — and this is what instructions are worth."),
+        related=["Read the vault before deciding, not after", "Home",
+                 "Refuse rather than invent"]),
+
+    MemoryEvent(
+        "The 2.8 mm memory ceiling is geometry-independent",
+        date="2026-08-27", type="Engineering", impact="Medium",
+        what_happened=(
+            "After freeing memory (Chrome closed, 5.9 GB available), 2.8 mm "
+            "was retried on both P0047@v1 (sharp) and P0048@v1 (filleted). "
+            "Both crashed with the identical signature (ccx.exe exit "
+            "3221225477 / 0xC0000005). The sharp run died at 416 s; the "
+            "filleted run — different node distribution near the junction — "
+            "died at 1665 s, nearly 28 minutes in."),
+        why_it_matters=(
+            "This rules out the geometric singularity as the cause of the "
+            "crash. A singular corner concentrates elements locally; if that "
+            "were driving the failure, fixing it should have changed the "
+            "outcome. It did not — only the time to failure changed. The wall "
+            "is memory, full stop, and it is independent of whether the "
+            "engineering fix (the fillet) is present."),
+        decision=(
+            "Do not read 'the fillet is present' as 'refinement will now "
+            "succeed'. The two questions — is the peak physically meaningful, "
+            "and can this machine refine past 3.2 mm — are independent, and "
+            "conflating them would have produced false confidence."),
+        evidence=[
+            "Observed — sharp 2.8 mm: 0xC0000005 at 416 s",
+            "Observed — filleted 2.8 mm: 0xC0000005 at 1665 s, same exit code",
+            "Observed — available memory was 5.9 GB at launch, well above the "
+            "1.3 GB present during the first crash"],
+        affected=["designs/jetpack_convergence_round2.py"],
+        consequences=(
+            "SF 4.633 for the filleted design stands as a single-mesh result. "
+            "The singularity claim rests on the geometric argument and the "
+            "peak's position on the fillet arc, not on mesh-refinement "
+            "convergence, which remains genuinely unverified for both."),
+        open_questions=(
+            "Whether a coarser but still-valid mesh near 3.0 mm would show any "
+            "trend at all, or whether 3.2 mm is simply this machine's ceiling "
+            "regardless of target size."),
+        related=["Solver memory bounds mesh refinement",
+                 "Peak stress at a sharp re-entrant corner cannot converge",
+                 "Mesh convergence is unverified"]),
+
+    MemoryEvent(
         "An in-process stdlib-only assertion proved nothing",
         date="2026-08-27", type="Testing", impact="Medium",
         what_happened=(

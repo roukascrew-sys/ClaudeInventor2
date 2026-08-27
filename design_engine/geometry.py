@@ -23,7 +23,28 @@ Conventions:
 - box/cylinder after the first feature need "mode": "union" or "cut".
 - hole: through-everything, drilled normal to the selected face (default ">Z"),
   "at" is [x, y] in that face's workplane coordinates.
-- fillet: CadQuery edge selector string (e.g. "|Z", ">Z").
+- fillet: applied to the solid as it stands at that point in the feature list,
+  so a fillet placed before a hole does not round the hole. "edges" is either
+
+    a CadQuery selector string   {"op": "fillet", "radius": 1.5, "edges": "|Z"}
+
+  or a structured selector, for edge sets a string cannot express:
+
+    {"op": "fillet", "radius": 10.0,
+     "edges": {"parallel_to": "Y",
+               "at": {"x": [-22.225, 22.225], "z": [199.6, 250.4]},
+               "tol": 0.01}}
+
+  `parallel_to` keeps only edges running along that axis; `at` keeps only
+  those whose midpoint matches one of the listed coordinates on each named
+  axis, within `tol`. Added because CadQuery's string selectors address edges
+  by extreme or direction ("|Y", ">Z") and cannot say "the four re-entrant
+  edges where the doubler pad meets the spine" — which is exactly the fillet
+  that governs the jetpack frame's peak stress.
+
+  A fillet whose selector matches NO edges is refused, for the same reason a
+  hole that removes no material is refused: silently doing nothing while the
+  log records success is the worst failure this engine can have.
 """
 
 from __future__ import annotations
@@ -121,11 +142,83 @@ def validate_spec(spec: dict) -> None:
                 raise SpecError(f"features[{idx}] (hole): 'at' must be [x, y]")
         elif op == "fillet":
             _require(feat, idx, "radius")
-            if not isinstance(feat.get("edges"), str):
-                raise SpecError(f"features[{idx}] (fillet): 'edges' selector string required")
+            _validate_edge_selector(feat.get("edges"), idx)
         if op in _BASE_OPS and idx > 0 and feat.get("mode") not in ("union", "cut"):
             raise SpecError(
                 f"features[{idx}] ({op}): needs 'mode': 'union'|'cut' after the base")
+
+
+_SEL_KEYS = {"parallel_to", "at", "tol"}
+_AXES = ("X", "Y", "Z")
+
+
+def _validate_edge_selector(sel: Any, idx: int) -> None:
+    """A string selector, or a structured one — anything else is refused."""
+    if isinstance(sel, str):
+        return
+    if not isinstance(sel, dict):
+        raise SpecError(
+            f"features[{idx}] (fillet): 'edges' must be a CadQuery selector "
+            f"string or a structured selector dict, got {type(sel).__name__}")
+    unknown = set(sel) - _SEL_KEYS
+    if unknown:
+        raise SpecError(
+            f"features[{idx}] (fillet): unknown selector keys {sorted(unknown)}, "
+            f"supported: {sorted(_SEL_KEYS)}")
+    if not sel:
+        raise SpecError(
+            f"features[{idx}] (fillet): empty selector would match every edge; "
+            f"say which edges explicitly")
+    axis = sel.get("parallel_to")
+    if axis is not None and axis not in _AXES:
+        raise SpecError(
+            f"features[{idx}] (fillet): 'parallel_to' must be one of {_AXES}, "
+            f"got {axis!r}")
+    at = sel.get("at", {})
+    if not isinstance(at, dict):
+        raise SpecError(f"features[{idx}] (fillet): 'at' must be a dict of axis -> values")
+    for k, vals in at.items():
+        if k not in ("x", "y", "z"):
+            raise SpecError(
+                f"features[{idx}] (fillet): 'at' axis {k!r} must be x, y or z")
+        if not (isinstance(vals, list) and vals
+                and all(isinstance(v, (int, float)) for v in vals)):
+            raise SpecError(
+                f"features[{idx}] (fillet): 'at'[{k!r}] must be a non-empty "
+                f"list of numbers")
+
+
+class _StructuredEdgeSelector(cq.selectors.Selector):
+    """Select edges by orientation and position.
+
+    CadQuery's string selectors pick edges by direction or by being extreme on
+    an axis. Neither can name an interior edge at a known coordinate, which is
+    what a fillet at a specific structural junction needs.
+    """
+
+    def __init__(self, sel: dict):
+        self.axis = sel.get("parallel_to")
+        self.at = sel.get("at", {})
+        self.tol = float(sel.get("tol", 0.01))
+
+    def _keep(self, edge) -> bool:
+        bb = edge.BoundingBox()
+        spans = {"X": bb.xlen, "Y": bb.ylen, "Z": bb.zlen}
+        if self.axis:
+            # runs along the named axis and is flat in the other two
+            if spans[self.axis] <= self.tol:
+                return False
+            if any(spans[o] > self.tol for o in _AXES if o != self.axis):
+                return False
+        mid = {"x": (bb.xmin + bb.xmax) / 2.0,
+               "y": (bb.ymin + bb.ymax) / 2.0,
+               "z": (bb.zmin + bb.zmax) / 2.0}
+        return all(
+            any(abs(mid[k] - float(v)) <= self.tol for v in vals)
+            for k, vals in self.at.items())
+
+    def filter(self, objectList):
+        return [o for o in objectList if self._keep(o)]
 
 
 def _make_primitive(feat: dict) -> cq.Workplane:
@@ -184,7 +277,20 @@ def build(spec: dict) -> cq.Workplane:
                         f"before relying on it. A hole that silently cuts "
                         f"nothing is exactly the failure this engine refuses.")
             elif op == "fillet":
-                result = result.edges(feat["edges"]).fillet(feat["radius"])
+                sel = feat["edges"]
+                picked = result.edges(
+                    sel if isinstance(sel, str) else _StructuredEdgeSelector(sel))
+                # Same principle as a hole that removes nothing: a fillet that
+                # rounds no edges is a silent no-op, and the part would be
+                # validated and signed off without the feature the engineer
+                # believes is carrying the stress.
+                if not picked.vals():
+                    raise SpecError(
+                        f"features[{idx}] (fillet): selector {sel!r} matched no "
+                        f"edges, so the fillet would do nothing. Check the "
+                        f"coordinates against the solid as it stands at this "
+                        f"point in the feature list.")
+                result = picked.fillet(feat["radius"])
         solids = result.solids().vals()
         if len(solids) != 1:
             raise GeometryError(

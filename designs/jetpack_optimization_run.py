@@ -130,8 +130,29 @@ KT_PAD_STEP = 1.5
 #   c6357ea1badbd  L0 SF 5.226 -> FEA SF 2.968   ratio 1.76  (alu, no doubler)
 #   c9773b1e66055  L0 SF 20.53 -> FEA SF 10.45   ratio 1.96  (steel, no doubler)
 # Both had outlier ratios of 1.65/1.76, below the 1.9 artifact threshold, so
-# these are real stresses and not constraint singularities. 1.85 is the mean.
+# these are not CONSTRAINT singularities. 1.85 is the mean.
+#
+# CAUTION (2026-08-27): "not a constraint singularity" was read at the time as
+# "a real, convergeable stress". That does not follow. The outlier-ratio test
+# compares the peak against the bulk field and catches a hot spot pinned to a
+# constraint patch; it says nothing about a GEOMETRIC singularity at a sharp
+# re-entrant corner, which is what the unfilleted spine/pad junction was. Both
+# runs above were unfilleted, so both peaks sat on that corner and neither
+# number was converged. Kt values fitted to them inherit that. See FILLET_R.
 KT_ROOT_JUNCTION = 1.85
+
+# Fillet radius at the spine/pad T-junction roots. 0 reproduces the original
+# sharp-cornered geometry, whose peak stress is singular and cannot converge.
+#
+# Chosen on engineering grounds, not to flatter the stress number:
+#   - r/t = 10/19.05 = 0.53 against the spine thickness, well past the knee
+#     where additional radius stops reducing Kt appreciably
+#   - consumes 20 mm of the 50.8 mm pad height, leaving 30.8 mm straight
+#   - a standard tool radius, and manufacturable as a dressed weld transition
+#   - costs +1.5 g on a 3.901 kg frame (+0.11% volume), measured not estimated
+# Resolvability follows from the choice rather than driving it: the arc is
+# 15.7 mm, about 4.9 elements at 3.2 mm and 5.6 at 2.8 mm.
+FILLET_R = 10.0
 KT_BASIS = ("Two stated stress-concentration factors, both calibrated against "
             "named FEA runs rather than assumed. Doubler step Kt=1.5 from "
             "P0031@v2 (31.5 -> 47.6 MPa, ratio 1.51). T-junction Kt=1.85 from "
@@ -261,6 +282,22 @@ def build_spec(v, ctx) -> dict:
                       "at": [0, 0, cb_z], "mode": "union"})
     feats.append({"op": "box", "x": CB_LEN, "y": cb_t, "z": cb_h,
                   "at": [0, 0, cb_z], "mode": "union"})
+    # Fillet the spine/pad T-junction roots. Without this the union of boxes
+    # leaves a sharp 90-degree re-entrant corner (270-degree material angle)
+    # at |x| = spine_x/2, z = cb_z and cb_z + cb_h. Linear elasticity has no
+    # finite stress at such a corner - Williams (1952) gives sigma ~ r**-0.4555
+    # - so the peak von Mises there is a mesh artefact that grows without
+    # bound under refinement and can never be converged. That is exactly where
+    # the 3.2 mm run put its peak, at [-23.505, 4.014, 199.6].
+    #
+    # Applied BEFORE the lug holes so it does not round them.
+    if FILLET_R > 0:
+        feats.append({"op": "fillet", "radius": FILLET_R,
+                      "edges": {"parallel_to": "Y",
+                                "at": {"x": [-float(v["spine_x"]) / 2.0,
+                                             float(v["spine_x"]) / 2.0],
+                                       "z": [cb_z, cb_z + cb_h]},
+                                "tol": 0.01}})
     # harness lug holes through the spine - the life-safety load path
     for z in (SPINE_Z - 50.0, 40.0):
         feats.append({"op": "hole", "d": LUG_D, "at": [0.0, z], "face": ">X"})

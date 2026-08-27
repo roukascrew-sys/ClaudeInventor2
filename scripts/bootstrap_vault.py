@@ -344,9 +344,19 @@ rules follow:
 
 **Evidence:** The 1.9 threshold is calibrated on 24 real runs — physically
 sound models sat at 1.00–1.20, artificial constraint singularities at
-1.95–2.12. Used correctly in the jetpack promotions, where outlier ratios of
-1.63–1.76 confirmed the demotions were *real* and not artifacts.
-""", links=["Meshing is non-monotonic", "Optimization Engine"])
+1.95–2.12.
+
+**CORRECTION (2026-08-27).** This note previously read the jetpack promotions'
+outlier ratios of 1.63–1.76 as confirming those stresses were *real*. **That
+inference was wrong and is withdrawn.** A low ratio means the peak is not
+pinned to a constraint patch. It says nothing about a **geometric**
+singularity, and the jetpack peaks sat on an unfilleted re-entrant corner
+where linear elasticity has no finite stress at all. The decision above still
+stands — separating numerical from physical failures is right — but the ratio
+must never be read as evidence that a stress is convergeable.
+→ [[The outlier ratio does not detect geometric singularities]]
+""", links=["Meshing is non-monotonic", "Optimization Engine",
+            "The outlier ratio does not detect geometric singularities"])
 
     v.write("06_Architecture/Architecture_Decisions",
             "Cache keys include the engineering source digest", type="decision",
@@ -990,6 +1000,38 @@ Ranked #4 on [[Roadmap]].
 - [[Refuse rather than invent]]
 """)
 
+    v.write("11_Lessons", "Read the vault before deciding, not after",
+            type="lesson", confidence="high", body="""
+On 2026-08-27 I was asked to verify mesh convergence for SF 3.844. I went
+straight from the request to the database and the source, and did **not** read
+this vault first — despite the rule in `CLAUDE.md` saying to, and despite
+having built the vault two days earlier.
+
+I then spent hours re-deriving, from the geometry, that the stress-outlier
+heuristic cannot distinguish a geometric singularity from a real stress.
+
+**That finding was already written down.**
+[[Numerical artifacts must not steer search]] contained the sentence
+*"outlier ratios of 1.63–1.76 confirmed the demotions were real and not
+artifacts"* — the exact over-claim, recorded as a **validated architecture
+decision**. Reading one note would have pointed straight at it.
+
+Two further things the vault would have supplied for free:
+- [[Mesh convergence is unverified]] already prescribed the mesh sizes to use
+  (3.2 / 2.6 / 2.2 mm). I picked 2.8 / 2.4 without looking.
+- It recorded "401k nodes took 381 s", a cost data point I did not have.
+
+**The rule:** the cost of reading is one minute. The cost of not reading is
+re-deriving something the project already knew, and possibly re-deriving it
+*wrong*. Read `00_Home/Current State`, the relevant decisions and the prior
+failures BEFORE writing code — not to be thorough, but because past-you already
+did some of the work.
+
+**The sharper version:** a second brain that is written to but never read is
+not a second brain, it is a diary.
+""", links=["Numerical artifacts must not steer search",
+            "Mesh convergence is unverified", "Home", "Current State"])
+
     v.write("11_Lessons", "Screened is not validated", type="lesson",
             confidence="high", body="""
 I reported that the optimiser beat the hand-built frame by 23% on mass at
@@ -1081,8 +1123,151 @@ that the reported safety factor is asymptoting. Expensive — 401k nodes took
 381 s, and 2.2 mm would be several times that — but it is the difference
 between a number and a measurement.
 
+**ATTEMPTED 2026-08-27, and the premise turned out to be wrong.** The study
+cannot succeed as written, because SF 3.844 is not a converging quantity:
+the peak sits on a sharp re-entrant corner, where refining the mesh raises the
+stress without bound. Convergence is a property the number does not have.
+→ [[Peak stress at a sharp re-entrant corner cannot converge]]
+
+The refinement runs also hit a second, independent wall: 2.8 mm (504k nodes)
+crashed the solver at a 6.1 GB working set on a machine with 1.3 GB free.
+→ [[Solver memory bounds mesh refinement]]
+
 Ranked #1 on [[Roadmap]].
-""", links=["Jetpack Frame Optimization Run", "Roadmap", "Jetpack Frame"])
+""", links=["Jetpack Frame Optimization Run", "Roadmap", "Jetpack Frame",
+            "Peak stress at a sharp re-entrant corner cannot converge",
+            "Solver memory bounds mesh refinement"])
+
+    v.write("05_Failures/Engineering_Failures",
+            "Peak stress at a sharp re-entrant corner cannot converge",
+            type="failure", status="resolved", confidence="high",
+            extra={"severity": "critical", "failure_kind": "modelling"}, body="""
+**Symptom:** `P0047@v1` reported FEA SF 3.844 at 3.2 mm, and the mesh
+convergence study meant to confirm it could not, in principle, succeed.
+
+**Root cause:** `build_spec` unions three boxes — spine, doubler pad,
+crossbeam — and applied no fillet anywhere. Where the pad's underside meets
+the spine's side face, three of the four quadrants around the edge are
+material and one is void: a 270° material angle, a sharp re-entrant corner.
+
+    x < -22.225, z < 199.6  ->  VOID
+    x < -22.225, z > 199.6  ->  MATERIAL
+    x > -22.225, z < 199.6  ->  MATERIAL
+    x > -22.225, z > 199.6  ->  MATERIAL
+
+Linear elasticity has **no finite stress** at such a corner. Williams' angular
+eigenfunction expansion gives σ ~ r^(λ-1) with λ ≈ 0.5445 for a traction-free
+270° corner, so the peak grows without bound as h → 0.
+
+> M. L. Williams, *Stress Singularities Resulting from Various Boundary
+> Conditions in Angular Corners of Plates in Extension*, Journal of Applied
+> Mechanics **19** (1952) 526–528.
+
+The 3.2 mm run put its peak at `[-23.505, 4.014, 199.6]` — 1.28 mm outboard of
+that edge and exactly on its plane. Not a load patch (those are at |x| = 330,
+550) and not a constraint (lugs at z = 400, 40).
+
+**Why the safeguards missed it:** the stress-outlier gate was designed to catch
+peaks pinned to *constraint* patches and read 1.63, comfortably "clean".
+→ [[The outlier ratio does not detect geometric singularities]]
+
+**Fix:** `FILLET_R = 10 mm` on the four junction roots, costing +4.4 g on a
+3.901 kg frame (+0.113%, measured). Chosen on r/t ≈ 0.53 and tool availability,
+not to flatter the number.
+
+**Lesson:** a safety factor is only meaningful if the stress it derives from
+converges. Before trusting a peak, check what feature it sits on — a union of
+primitives with no blend produces singular corners everywhere, and the solver
+will report a confident number at every one of them.
+""", links=["Mesh convergence is unverified",
+            "The outlier ratio does not detect geometric singularities",
+            "Jetpack Frame", "Screened is not validated"])
+
+    v.write("05_Failures/Engineering_Failures",
+            "The outlier ratio does not detect geometric singularities",
+            type="failure", status="resolved", confidence="high",
+            extra={"severity": "high", "failure_kind": "heuristic"}, body="""
+**Symptom:** a heuristic trusted to separate real stresses from numerical
+artifacts passed a stress that was purely a discretisation artifact.
+
+**What the ratio actually measures:** peak von Mises against the bulk field
+(p99.9). A constraint singularity produces a hot spot decoupled from its
+surroundings, hence a high ratio — calibrated at 1.95–2.12 on artificial cases
+against 1.00–1.20 on sound ones, with ~1.9 as the threshold.
+
+**What it does not measure:** whether the peak is *convergeable*. A geometric
+singularity at a sharp re-entrant corner is fed by the surrounding stress
+field rather than decoupled from it, so the ratio stays low while the stress
+is still unbounded.
+
+**Evidence:** three jetpack runs sat at 1.63–1.76, below threshold, and were
+recorded as confirming the stresses were real:
+- `P0047@v1` ratio 1.633 — peak on the unfilleted spine/pad corner
+- `c6357ea1badbd` ratio 1.76, `c9773b1e66055` ratio 1.96 — the two runs
+  `KT_ROOT_JUNCTION = 1.85` was fitted to, both unfilleted
+
+**Consequence:** `KT_ROOT_JUNCTION = 1.85` was calibrated against two
+non-converged peaks and cannot be better than they were. The constant is
+annotated in `designs/jetpack_optimization_run.py` rather than deleted, since
+it is still the best available screening aid.
+
+**Lesson:** "below the artifact threshold" means *not a constraint artifact*.
+It has never meant *physically real*. A heuristic's name is not its scope.
+""", links=["Numerical artifacts must not steer search",
+            "Peak stress at a sharp re-entrant corner cannot converge",
+            "Refuse rather than invent"])
+
+    v.write("05_Failures/Simulation_Failures", "Solver memory bounds mesh refinement",
+            type="failure", status="active", confidence="high",
+            extra={"severity": "high", "failure_kind": "environment"}, body="""
+**Symptom:** `ccx.exe` exits `3221225477` (`0xC0000005`, access violation)
+partway through a solve, after the process has grown to several GB.
+
+**Observed 2026-08-27:** a 2.8 mm mesh of the jetpack frame (~504k nodes,
+predicted 589 s) reached a **6.1 GB** working set and crashed at 469 s. The
+machine had 15.5 GB total, **1.3 GB available**, and 20.9 GB already committed
+against a 29 GB limit. The same geometry at 3.2 mm (337k nodes) had solved fine.
+
+**Inferred, not confirmed:** out of memory. CalculiX does not always fail
+cleanly on a failed allocation, and an access violation is what that looks
+like from outside. The mechanism was not isolated.
+
+**Why this matters more than it looks:** the learned solver cost model predicts
+**time** and there is no model of **memory** at all. `affordable()` will
+happily return `yes` for a solve that cannot physically run, because time was
+never the binding constraint — memory was. Every plan that assumes "we can
+always refine further, it just costs hours" is wrong on this machine.
+
+**Practical ceiling today:** ~3.2 mm on this geometry, unless RAM is freed or
+the model is reduced. Closing 24 Chrome and 38 WebView processes returned only
+0.48 GB net, because the running solver immediately claimed it.
+
+**Confirmed geometry-independent, same day.** With Chrome closed and 5.9 GB
+available — 4.5x the headroom of the first crash — 2.8 mm was retried on BOTH
+the sharp corner (P0047@v1) and the filleted design (P0048@v1). Both crashed
+with the identical exit code. The sharp run died at 416 s; the filleted run,
+with a different node distribution near the junction, died at 1665 s. Only the
+time to failure changed, not the outcome. This rules out the re-entrant corner
+as the cause — a singularity concentrates elements locally, and if that were
+driving the crash the fix should have changed the result. It did not. The wall
+is memory alone, and it applies regardless of whether the engineering fix
+([[Peak stress at a sharp re-entrant corner cannot converge]]) is present.
+
+**Consequence for that finding:** SF 4.633 on the filleted design is a
+single-mesh result. The claim that the peak is now physically meaningful rests
+on the geometric argument and the peak sitting on the fillet arc, NOT on
+mesh-refinement convergence — which remains genuinely unverified for both
+geometries, for an unrelated reason.
+
+**What would fix it properly:**
+- record peak solver RSS per run in the FRACAS log, and fit a memory model
+  alongside the cost model
+- submodel the junction region instead of refining the whole 1280 mm frame
+- or an iterative solver, which trades memory for time — but a solver change
+  needs validation against known-good results first
+  [[ccx_MT produces wrong answers]]
+""", links=["Engineering Knowledge Base", "Solver timeout wastes the full budget",
+            "ccx_MT produces wrong answers", "Mesh convergence is unverified"])
 
     # ------------------------------------------------------------ session
     v.write("09_Sessions", "2026-08-25 Design intelligence layer and second brain",
