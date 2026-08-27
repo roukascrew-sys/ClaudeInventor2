@@ -38,13 +38,33 @@ def eng(tmp_path_factory):
     return DesignEngine(tmp_path_factory.mktemp("p5") / "data")
 
 
-@pytest.fixture(scope="module")
-def validated_gid(eng):
-    gid = eng.create_part(BAR, reason="sign-off test bar")["geometry_id"]
+@pytest.fixture
+def validated_gid(eng, request):
+    """A fresh, FEA-validated, *unsigned* geometry version.
+
+    Function-scoped on purpose. Sign-off state is per-version and the tests
+    below mutate it (sign it, tamper with the spec, invalidate it with a failed
+    re-check). A module-scoped part made every test's precondition depend on
+    which other tests had already run in the same process, so a test could pass
+    in file order and fail alone or under -k. Each test now establishes its own
+    precondition; the engine (and its log) stays module-scoped.
+    """
+    gid = eng.create_part({**BAR, "name": f"signed-bar-{request.node.name}"},
+                          reason="sign-off test bar")["geometry_id"]
     run = eng.run_fea_static(gid, _case(1000),
                              reason="validate before sign-off tests")
     assert run["result"] == "pass"
     return gid
+
+
+@pytest.fixture
+def signed_gid(eng, validated_gid):
+    """`validated_gid` with a sign-off explicitly recorded against it — the
+    precondition for every test whose subject is what *invalidates* one."""
+    eng.sign_off(validated_gid, "Gideon",
+                 "approve signed-bar v1 for prototype production, "
+                 "500 N service load envelope")
+    return validated_gid
 
 
 def test_production_locked_without_sign_off(eng, validated_gid):
@@ -100,30 +120,32 @@ def test_new_version_needs_new_sign_off(eng, validated_gid):
         eng.export_production_package(new_gid, reason="unsigned new version")
 
 
-def test_tampered_spec_invalidates_sign_off(eng, validated_gid):
-    spec_path = (eng.parts.root / validated_gid.split("@")[0]
-                 / f"v{validated_gid.split('@v')[1]}" / "spec.json")
+def test_tampered_spec_invalidates_sign_off(eng, signed_gid):
+    spec_path = (eng.parts.root / signed_gid.split("@")[0]
+                 / f"v{signed_gid.split('@v')[1]}" / "spec.json")
     spec = json.loads(spec_path.read_text())
     spec["features"][0]["x"] = 9.5  # silent post-sign-off tamper
     spec_path.write_text(json.dumps(spec, indent=2))
     try:
-        with pytest.raises(SignOffRequired, match="sign_off_invalid"):
-            eng.export_production_package(validated_gid,
+        # "sign_off_invalid:" with the colon — bare "sign_off_invalid" is also
+        # a prefix of "sign_off_invalidated", the *validation* refusal path.
+        with pytest.raises(SignOffRequired, match="sign_off_invalid:"):
+            eng.export_production_package(signed_gid,
                                           reason="export after tamper")
     finally:
         spec["features"][0]["x"] = 10
         spec_path.write_text(json.dumps(spec, indent=2))
     # restored spec: the sign-off is whole again
-    eng.export_production_package(validated_gid, reason="export after restore")
+    eng.export_production_package(signed_gid, reason="export after restore")
 
 
-def test_later_failed_validation_invalidates_sign_off(eng, validated_gid):
+def test_later_failed_validation_invalidates_sign_off(eng, signed_gid):
     run = eng.run_fea_static(
-        validated_gid, _case(100000, required_sf=1.5),
+        signed_gid, _case(100000, required_sf=1.5),
         reason="overload re-check after sign-off must invalidate the token")
     assert run["result"] == "fail"
     with pytest.raises(SignOffRequired, match="sign_off_invalidated"):
-        eng.export_production_package(validated_gid,
+        eng.export_production_package(signed_gid,
                                       reason="export after failed re-check")
     row = eng.log.rows(action="export_production_package", result="fail")[-1]
     assert "sign_off_invalidated" in row["failure_mode"]

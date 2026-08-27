@@ -28,9 +28,14 @@ def eng(tmp_path_factory):
     return DesignEngine(tmp_path_factory.mktemp("asmv") / "data")
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def built(eng):
-    """Two parts, both validated; only the first is signed initially."""
+    """A fresh rig: two validated parts, only the first one signed.
+
+    Function-scoped on purpose. Sign-off is append-only, so a test that signs
+    component B cannot undo it; sharing one rig across the module made "is B
+    signed yet?" depend on which other tests had already run in the process.
+    """
     a = eng.create_part({"name": "plate-a", "units": "mm",
                          "density_kg_m3": 7850,
                          "features": [{"op": "box", "x": 30, "y": 20, "z": 60}]},
@@ -56,6 +61,14 @@ def built(eng):
     eng.check_tolerance_stackup(asm)
     eng.sign_off(a, "Gideon", "approve plate-a for the rig")
     return {"a": a, "b": b, "asm": asm}
+
+
+@pytest.fixture
+def fully_signed(eng, built):
+    """`built` with component B signed too — the precondition for tests whose
+    subject is what invalidates an otherwise complete assembly release."""
+    eng.sign_off(built["b"], "Gideon", "approve post-b for the rig")
+    return built
 
 
 def test_one_unsigned_component_refuses_the_whole_render(eng, built):
@@ -98,7 +111,8 @@ def test_assembly_viewer_renders_when_all_signed(eng, built):
                                    for c in payload["components"])
 
 
-def test_tampering_with_one_component_refuses_the_assembly(eng, built):
+def test_tampering_with_one_component_refuses_the_assembly(eng, fully_signed):
+    built = fully_signed
     gid = built["b"]
     spec_path = (eng.parts.root / gid.split("@")[0]
                  / f"v{gid.split('@v')[1]}" / "spec.json")
@@ -106,7 +120,9 @@ def test_tampering_with_one_component_refuses_the_assembly(eng, built):
     spec["features"][0]["d"] = 12.5           # silent post-sign-off change
     spec_path.write_text(json.dumps(spec, indent=2))
     try:
-        with pytest.raises(SignOffRequired, match="sign_off_invalid"):
+        # "sign_off_invalid:" with the colon — bare "sign_off_invalid" is also
+        # a prefix of "sign_off_invalidated", the *validation* refusal path.
+        with pytest.raises(SignOffRequired, match="sign_off_invalid:"):
             eng.generate_assembly_viewer(built["asm"], reason="after tamper")
     finally:
         spec["features"][0]["d"] = 12
