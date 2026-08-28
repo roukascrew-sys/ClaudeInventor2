@@ -683,6 +683,56 @@ LATE = [
                  "Validation Philosophy", "Screened is not validated"]),
 
     MemoryEvent(
+        "Couplings between validators are declared, so staleness is computed",
+        date="2026-08-28", type="Architecture", impact="High",
+        what_happened=(
+            "Stages may now declare `consumes`/`produces`/`invalidates` over a "
+            "closed fact vocabulary. The evaluator resolves the graph, refuses "
+            "cycles, and reports a stage whose dependencies are unmet as "
+            "UNKNOWN rather than letting it run on an assumed value. Phase 2 "
+            "of the Declared Couplings proposal."),
+        why_it_matters=(
+            "Three of five physical couplings in the engine held only because "
+            "a person remembered them, and two did not hold at all: the 32.45 "
+            "kg of attached mass never reaches the modal solve, and the modal "
+            "finding that the frame runs at resonance never reaches the "
+            "fatigue amplitude. Both were a validator producing a confident "
+            "number from a model another validator had already contradicted."),
+        decision=(
+            "The scheduler decides what runs, in what order, and whether a "
+            "result is stale - never whether a candidate passes. Verdicts stay "
+            "in design_engine/, because the optimiser proposes and the engine "
+            "decides. A cycle is REFUSED rather than ordered: picking an "
+            "evaluation order for a feedback loop would be inventing an answer."),
+        evidence=[
+            "Observed — the proposal's own acceptance test passes: declaring "
+            "fatigue's real dependencies turns its confident life number into "
+            "a declared UNKNOWN naming `dynamics.amplification`",
+            "Observed — resolving the real graph prints both silent couplings "
+            "as blocking gaps, each with its reason",
+            "Observed — 69 pre-existing inventor tests pass untouched; "
+            "undeclared stages keep the exact cache key they had before",
+            "Observed — 323 tests pass, up from 300"],
+        affected=["design_engine/inventor/facts.py",
+                  "design_engine/inventor/coupling.py",
+                  "design_engine/inventor/evaluate.py"],
+        consequences=(
+            "An UNKNOWN stage establishes nothing, or an UNKNOWN upstream "
+            "would silently satisfy a downstream dependency - the original bug "
+            "wearing a new hat. An unmet dependency is trustworthy=False, so "
+            "it stays out of failure-informed search: the design may be fine, "
+            "the model was incomplete."),
+        open_questions=(
+            "Declaring a dependency does not satisfy it. The 32.45 kg is still "
+            "not in the mass matrix and damping is still unmeasured - the "
+            "graph makes both blocking rather than invisible, which is the "
+            "whole claim. Cyclic coupling (thermal to modulus to deflection "
+            "to contact to thermal) is refused rather than solved; "
+            "fixed-point iteration is not built."),
+        related=["System Architecture", "UNKNOWN is not a pass",
+                 "The jetpack frame resonates with its own engines"]),
+
+    MemoryEvent(
         "The validator god-class was split, and proved unchanged by deck hash",
         date="2026-08-28", type="Architecture", impact="Medium",
         what_happened=(
