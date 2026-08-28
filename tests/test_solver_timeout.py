@@ -15,8 +15,7 @@ is spawned as a direct executable with no wrapper, and the shipped CalculiX
 both halves — the guard, and the assumption that made it only a guard — so
 that pointing `ccx_path` at a wrapper script cannot quietly restore the hang.
 
-No solver is needed for any of this. A `sleep` reproduces it exactly.
-"""
+No solver is needed for any of this. A `sleep` reproduces it exactly.\n"""
 
 import os
 import subprocess
@@ -26,8 +25,9 @@ from pathlib import Path
 
 import pytest
 
-from design_engine import _DEFAULT_CCX
-from design_engine.fea import _run_solver
+from design_engine import DesignEngine, _DEFAULT_CCX
+from design_engine import fea as fea_mod
+from design_engine.fea import FeaError, _SolverTimeout, _run_solver
 
 # Small, because what is measured is the OVERSHOOT, not the wait.
 DEADLINE_S = 3
@@ -36,6 +36,16 @@ DEADLINE_S = 3
 # against, and ~20x tighter than the grandchild's own 600 s lifetime, which
 # is what the unbounded reap would have waited for.
 MAX_OVERSHOOT_S = 30.0
+
+#: The REAL interpreter, not this venv's launcher stub.
+#: Measured 2026-08-28: `.venv/Scripts/python.exe` does not exec, it
+#: CreateProcess-es the interpreter named in pyvenv.cfg and waits. Popen
+#: therefore holds the stub, whose peak working set is 4.1 MB no matter
+#: what the interpreter does (266.1 MB for the same script run directly).
+#: Harmless for the lifetime tests below — it makes them MORE faithful,
+#: since a grandchild is exactly what they are about — but fatal to a
+#: memory assertion, which must measure the process doing the work.
+BASE_PYTHON = getattr(sys, "_base_executable", None) or sys.executable
 
 
 def _alive(pid: int) -> bool:
@@ -129,6 +139,70 @@ def test_a_solver_that_finishes_in_time_still_reports_output_and_peak_memory(
         assert run.peak_rss_mb and run.peak_rss_mb > 0, (
             "peak memory went missing; a solve that dies at 6 GB and one that "
             "dies at 500 MB are different failures")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="peak working set is a Win32 API")
+def test_a_timed_out_solve_reports_the_memory_it_died_holding(tmp_path):
+    """The peak must survive the timeout, and must be read BEFORE the kill.
+
+    Reading it after `TerminateProcess` yields nothing — a solve that
+    transiently held 6 GB shows almost none of it by the time it is gone — and
+    a measurement that is taken and then dropped is the same as no measurement.
+    That is the whole reason this path uses Popen rather than subprocess.run.
+
+    The fake solver claims a quarter of a gigabyte before it hangs, which no
+    bare interpreter approaches, so a passing assertion cannot be the process's
+    own baseline footprint. It runs under BASE_PYTHON: see that constant for
+    why the venv stub would report 4.1 MB for the same work.
+    """
+    script = tmp_path / "greedy.py"
+    script.write_text(
+        "import time\n"
+        "hog = bytearray(256 * 1024 * 1024)\n"
+        "hog[::4096] = b'x' * len(hog[::4096])\n"   # touch it
+        "time.sleep(600)\n", encoding="utf-8")
+    with pytest.raises(subprocess.TimeoutExpired) as caught:
+        _run_solver([BASE_PYTHON, str(script)], tmp_path,
+                    dict(os.environ), DEADLINE_S)
+    peak = getattr(caught.value, "peak_rss_mb", None)
+    assert peak is not None, (
+        "the timeout carried no memory measurement; a timeout at 6 GB and one "
+        "at 500 MB want different remedies and now look identical in the log")
+    assert peak > 200, (
+        f"peak {peak} MB is below the 256 MB the fake solver allocated, which "
+        f"means it was read after the kill rather than before it")
+
+
+def test_the_timeout_message_names_the_peak_so_the_log_records_it(
+        tmp_path, monkeypatch):
+    """`_solve` is where the number stops being a float and starts being
+    evidence: its FeaError text is what reaches the FRACAS log."""
+    eng = DesignEngine(tmp_path / "data")
+
+    def fake_run_solver(cmd, cwd, env, timeout_s):
+        raise _SolverTimeout(cmd, timeout_s, 6144.0)
+
+    monkeypatch.setattr(fea_mod, "_run_solver", fake_run_solver)
+    with pytest.raises(FeaError) as caught:
+        eng.validation._solve(tmp_path, 504_000, what="static")
+    assert "6144 MB" in str(caught.value)
+    assert "solver_timeout" in str(caught.value)
+
+
+def test_a_timeout_with_no_measurement_still_reports_the_deadline(
+        tmp_path, monkeypatch):
+    """None must read as missing, never as zero. A plain TimeoutExpired from
+    anywhere else must not crash the handler on a missing attribute."""
+    eng = DesignEngine(tmp_path / "data")
+
+    def fake_run_solver(cmd, cwd, env, timeout_s):
+        raise subprocess.TimeoutExpired(cmd, timeout_s)
+
+    monkeypatch.setattr(fea_mod, "_run_solver", fake_run_solver)
+    with pytest.raises(FeaError) as caught:
+        eng.validation._solve(tmp_path, 504_000, what="static")
+    assert "solver_timeout" in str(caught.value)
+    assert "MB" not in str(caught.value), "invented a memory figure it never had"
 
 
 @pytest.mark.skipif(not _DEFAULT_CCX.is_file(),

@@ -656,6 +656,14 @@ def _peak_rss_mb(proc) -> float | None:
     Returns None rather than guessing when unavailable (non-Windows, handle
     already closed, API failure). A missing measurement must read as missing —
     never as zero, which would poison any model fitted on it.
+
+    KNOWN LIMIT: this is the DIRECT child's peak. If `cmd` is a launcher that
+    runs the real work in a grandchild, the number describes the launcher and
+    is quietly, plausibly wrong — measured 2026-08-28, this project's own
+    `.venv/Scripts/python.exe` stub reports 4.1 MB for a script whose
+    interpreter peaked at 266.1 MB. The solver is spawned as a direct
+    executable (`tests/test_solver_timeout.py` pins that), so it is not
+    affected; anything that grows a wrapper would be.
     """
     handle = getattr(proc, "_handle", None)
     if handle is None or not hasattr(ctypes, "windll"):
@@ -670,6 +678,20 @@ def _peak_rss_mb(proc) -> float | None:
         return round(int(counters.PeakWorkingSetSize) / (1024 * 1024), 1)
     except (OSError, AttributeError, ValueError):
         return None
+
+
+class _SolverTimeout(subprocess.TimeoutExpired):
+    """A solver deadline, carrying the peak memory it died holding.
+
+    A subclass rather than a new exception type so that every existing
+    `except subprocess.TimeoutExpired` keeps catching it, and a plain
+    TimeoutExpired arriving from anywhere else is still handled — callers
+    read the peak with `getattr`, never by assuming the subclass.
+    """
+
+    def __init__(self, cmd, timeout, peak_rss_mb: float | None = None):
+        super().__init__(cmd, timeout)
+        self.peak_rss_mb = peak_rss_mb
 
 
 class _SolverRun:
@@ -700,8 +722,11 @@ def _run_solver(cmd, cwd, env, timeout_s: int) -> _SolverRun:
     `communicate()` with NO timeout blocks until every process still holding
     the inherited stdout/stderr pipe write handles has exited - so a single
     surviving grandchild holds this function open indefinitely, deadline or
-    no deadline. That is measured, not theorised: the same shape cost the
-    Chrono bridge a ~1341 s overshoot on a 900 s deadline on 2026-08-28.
+    no deadline. That is measured, not theorised: against this function as it
+    stood, a 40 s grandchild under a 3 s deadline surfaced its TimeoutExpired
+    at 40.8 s — the overshoot IS the survivor's lifetime. It is the same shape
+    that cost the Chrono bridge a full-suite run on 2026-08-28, whose reported
+    ~1341 s overshoot is quoted from the incident, not reproduced.
 
     Today the CalculiX binaries spawn nothing - verified on the shipped
     2.23.0 win-x64 build, whose import tables contain no process-creation
@@ -718,7 +743,9 @@ def _run_solver(cmd, cwd, env, timeout_s: int) -> _SolverRun:
         stdout, stderr = proc.communicate(timeout=timeout_s)
     except subprocess.TimeoutExpired:
         # Read the peak BEFORE killing: a timeout at 6 GB and a timeout at
-        # 500 MB are different failures and want different remedies.
+        # 500 MB are different failures and want different remedies. It
+        # travels out on the exception, because a number measured here and
+        # then dropped is the same as not measuring it.
         peak = _peak_rss_mb(proc)
         kill_tree(proc)
         try:
@@ -729,7 +756,7 @@ def _run_solver(cmd, cwd, env, timeout_s: int) -> _SolverRun:
             # already lost - the run timed out. Waiting for it loses the
             # deadline too, which is the failure this guards against.
             pass
-        raise subprocess.TimeoutExpired(cmd, timeout_s) from None
+        raise _SolverTimeout(cmd, timeout_s, peak) from None
     return _SolverRun(proc.returncode, stdout or "", stderr or "",
                       _peak_rss_mb(proc))
 
@@ -945,20 +972,27 @@ class ValidationTools:
         """Run CalculiX on the deck in `run_dir`. Returns (run, binary, threads,
         seconds).
 
-        Both failure paths name what the caller needs to act on: a timeout says
-        how to make the job smaller, and a crash names the peak memory, because
-        an access violation at 6 GB and one at 500 MB want different remedies.
+        Both failure paths name what the caller needs to act on, and both name
+        the peak memory, because an access violation at 6 GB and one at 500 MB
+        want different remedies — and so do two timeouts at those sizes. Near
+        the memory ceiling a timeout is a machine that is paging, and coarsening
+        the mesh is the fix. At a few hundred MB it is not, and coarsening may
+        not help at all: a71901f measured ccx SPINNING forever in createtet on a
+        *SUBMODEL deck at trivial memory, which no smaller mesh would have
+        cured. Without the number the two are indistinguishable in the log.
         """
         binary, env, threads = self._solver_command(force_single=force_single)
         t0 = time.time()
         try:
             proc = _run_solver([str(binary), "-i", "job"], run_dir, env,
                                self.solve_timeout_s)
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as timeout:
+            peak = getattr(timeout, "peak_rss_mb", None)
+            mem = f" Peak memory at the kill: {peak:.0f} MB." if peak else ""
             raise FeaError(
                 f"solver_timeout: {binary.name} exceeded {self.solve_timeout_s}s "
                 f"on {'a ' + what + ' solve of ' if what else ''}{n_nodes} nodes "
-                f"using {threads} thread(s). Direct-solve cost grows steeply "
+                f"using {threads} thread(s).{mem} Direct-solve cost grows steeply "
                 f"with node count - coarsen case.mesh.max_size_mm (subject to "
                 f"the Jacobian gate on the thinnest feature), or raise "
                 f"ValidationTools(solve_timeout_s=...).") from None
