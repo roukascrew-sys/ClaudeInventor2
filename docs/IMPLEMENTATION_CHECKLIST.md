@@ -149,9 +149,9 @@ intended, and it means the veto is inert today.
 ## Track B · Real failure modes
 
 ### B1 — Fatigue as a named limit state
-**Status: DONE** — commit `PENDING-B1`.
+**Status: DONE** — commit `cba92b9`.
 
-| What | File | Line @ `PENDING-B1` |
+| What | File | Line @ `cba92b9` |
 |---|---|---|
 | `FatigueError` | `design_engine/fatigue.py` | 45 |
 | `SNCurve` — sourced, no defaulted endurance limit | `design_engine/fatigue.py` | 49 |
