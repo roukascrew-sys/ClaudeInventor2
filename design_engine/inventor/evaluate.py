@@ -39,6 +39,7 @@ from typing import Callable, Protocol, Sequence
 from .. import fea as _fea_mod
 from .. import geometry as _geom_mod
 from .. import mesh as _mesh_mod
+from .coupling import CouplingGraph, FactStore
 from .candidate import (Candidate, EvaluationResult, FailureClass,
                         FailureRecord, Fidelity, StageResult)
 from .requirements import RequirementSet, Status, digest_of
@@ -67,9 +68,19 @@ CODE_DIGEST = _code_digest()
 
 
 class Stage(Protocol):
-    """One rung of the fidelity ladder."""
+    """One rung of the fidelity ladder.
+
+    `consumes` / `produces` / `invalidates` are OPTIONAL and default to empty.
+    A stage that declares nothing behaves exactly as it did before coupling
+    existed, which is what makes this additive rather than a rewrite. Declaring
+    them opts a stage into dependency checking: an unmet `consumes` makes it
+    UNKNOWN instead of letting it run on an assumed value.
+    """
     name: str
     fidelity: Fidelity
+    consumes: frozenset[str]
+    produces: frozenset[str]
+    invalidates: frozenset[str]
 
     def config_digest(self) -> str: ...
     def run(self, cand: Candidate, ctx: "EvalContext") -> StageResult: ...
@@ -113,8 +124,9 @@ class EvaluationCache:
             self._conn.commit()
 
     @staticmethod
-    def key(cand: Candidate, stage: Stage, ctx: EvalContext) -> str:
-        return digest_of({
+    def key(cand: Candidate, stage: Stage, ctx: EvalContext,
+            fact_digest: str = "") -> str:
+        payload = {
             "values": {k: (round(v, 9) if isinstance(v, float) else v)
                        for k, v in sorted(cand.values.items())},
             "space": ctx.space.digest(),
@@ -122,7 +134,14 @@ class EvaluationCache:
             "stage_config": stage.config_digest(),
             "base_spec": _geom_mod.spec_digest(ctx.base_spec) if ctx.base_spec else None,
             "code": CODE_DIGEST,
-        })
+        }
+        # Staleness between stages, computed rather than remembered. Only added
+        # when the stage actually consumes something, so a stage that declares
+        # nothing keeps the exact key it had before coupling existed and its
+        # cached results stay valid across this change.
+        if fact_digest:
+            payload["facts"] = fact_digest
+        return digest_of(payload)
 
     def get(self, key: str) -> dict | None:
         with self._lock:
@@ -179,6 +198,30 @@ def _stage_from_payload(payload: dict) -> StageResult:
     return sr
 
 
+def _unmet_dependency(stage, missing: list[str]) -> StageResult:
+    """A stage asked to answer without something its answer depends on.
+
+    Deliberately NOT a failure of the design: `trustworthy=False` keeps it out
+    of failure-informed search, exactly as a mesh refusal is kept out. The
+    design may be perfectly good; the model was incomplete.
+    """
+    from . import facts as _f
+    detail = []
+    for fact in missing:
+        why = _f.why_unproduced(fact)
+        detail.append(f"{fact}" + (f" ({why})" if why else ""))
+    return StageResult(
+        stage=stage.name, fidelity=stage.fidelity, status=Status.UNKNOWN,
+        failures=[FailureRecord(
+            failure_class=FailureClass.UNKNOWN,
+            message=("unmet_dependency: " + "; ".join(detail)
+                     + ". This stage declares it depends on the above, and "
+                       "nothing established it. Running on an assumed value is "
+                       "how one validator ends up contradicting another."),
+            fidelity=stage.fidelity, trustworthy=False)],
+        provenance={"unmet": list(missing)})
+
+
 class Evaluator:
     """Runs stages in fidelity order, caching each one independently.
 
@@ -196,6 +239,13 @@ class Evaluator:
         self.max_fidelity = max_fidelity
         self.stage_seconds: dict[str, float] = {}
         self.stage_runs: dict[str, int] = {}
+        # Built once, at construction: a malformed or cyclic declaration is a
+        # programming error and should surface when the evaluator is wired up,
+        # not part-way through a population.
+        self.graph = CouplingGraph(self.stages)
+        self.graph.order()          # raises CouplingError on a cycle
+        self.coupling_report = (self.graph.report() if self.graph.declared()
+                                else None)
 
     def stages_upto(self, max_fidelity: Fidelity) -> list[Stage]:
         return [s for s in self.stages if int(s.fidelity) <= int(max_fidelity)]
@@ -211,8 +261,19 @@ class Evaluator:
         # result held only in a local they would each see an empty metrics
         # dict and silently return nothing.
         cand.result = result
+        store = FactStore()
         for stage in self.stages_upto(ceiling):
-            key = EvaluationCache.key(cand, stage, self.ctx)
+            consumes = getattr(stage, "consumes", None) or frozenset()
+            missing = store.missing(consumes)
+            if missing:
+                # UNKNOWN, never a default. We do not know the design is bad;
+                # we know this stage was asked to answer without something its
+                # answer depends on. Running it anyway is how a validator ends
+                # up contradicting one that already ran.
+                result.absorb(_unmet_dependency(stage, missing))
+                continue
+            key = EvaluationCache.key(cand, stage, self.ctx,
+                                      fact_digest=store.digest_of(consumes))
             payload = self.cache.get(key)
             if payload is not None:
                 sr = _stage_from_payload(payload)
@@ -236,6 +297,11 @@ class Evaluator:
                     self.stage_seconds.get(stage.name, 0.0) + sr.seconds)
                 self.stage_runs[stage.name] = self.stage_runs.get(stage.name, 0) + 1
             result.absorb(sr)
+            if sr.status is not Status.UNKNOWN:
+                for f in (getattr(stage, "produces", None) or ()):
+                    store.establish(f, sr.metrics.get(f))
+            for f in (getattr(stage, "invalidates", None) or ()):
+                store.retract(f)
             if stop_on_block and sr.status is Status.INVALID:
                 break
         result.apply_requirements(self.ctx.requirements)

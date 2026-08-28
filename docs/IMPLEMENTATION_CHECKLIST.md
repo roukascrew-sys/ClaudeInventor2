@@ -322,7 +322,50 @@ density checks *between* `validate_case` and the solver-presence check. Calling
 `_prepare` naively would have reordered those, changing which error a caller
 sees on a machine with no solver. `test_validation_pipeline` pins the order.
 
-**Phase 2 (declare facts, resolve the graph) is not implemented.**
+### R2 — Declare facts, resolve the graph (Declared Couplings, Phase 2)
+**Status: DONE** — commit `PENDING-R2`. Additive; every existing stage is
+untouched and 69 pre-existing inventor tests pass unchanged.
+
+| What | File |
+|---|---|
+| Closed fact vocabulary + `validate()` | `design_engine/inventor/facts.py` |
+| `UNPRODUCED_TODAY` + `why_unproduced()` | `design_engine/inventor/facts.py` |
+| `CouplingGraph` — order, cycles, unsatisfiable, report | `design_engine/inventor/coupling.py` |
+| `FactStore` — establish / retract / digest | `design_engine/inventor/coupling.py` |
+| `Stage` gains `consumes`/`produces`/`invalidates` | `design_engine/inventor/evaluate.py` |
+| `_unmet_dependency()` | `design_engine/inventor/evaluate.py` |
+| `EvaluationCache.key(..., fact_digest=)` | `design_engine/inventor/evaluate.py` |
+| Tests (23) | `tests/test_coupling.py` |
+
+**The acceptance test passed.** The proposal set its own bar — *"if it doesn't
+refuse something the engine currently reports without hesitation, it hasn't
+earned the refactor."* `test_the_acceptance_test_fatigue_becomes_unknown`
+declares fatigue's real dependencies; `dynamics.amplification` has no producer,
+so the stage **does not run at all** and the candidate degrades to UNKNOWN
+naming the missing fact.
+
+Resolving the engine's real graph:
+
+```
+geometry -> singularity -> static -> modal -> fatigue
+
+modal    needs model.attached_mass    (32.45 kg exists only as constants
+                                       in the analytic screen)
+fatigue  needs dynamics.amplification (depends on damping, never measured)
+```
+
+**Design decisions worth keeping:**
+- **Additive by construction.** Undeclared stages get empty sets, satisfy every
+  check, and keep the *exact* cache key they had before — so existing cached
+  results stay valid.
+- **A cycle is refused, not ordered.** Thermal→modulus→deflection→contact→
+  thermal is a real loop; picking an order would invent an answer. The error
+  names the path and points at fixed-point iteration as the honest remedy.
+- **An UNKNOWN stage establishes nothing.** Otherwise an UNKNOWN upstream
+  silently satisfies a downstream dependency — the original bug in a new hat.
+- **Unmet dependency is `trustworthy=False`.** The design may be fine; the
+  *model* was incomplete, so it must stay out of failure-informed search.
+- **Cycles are detected at construction**, not part-way through a population.
 
 ---
 
