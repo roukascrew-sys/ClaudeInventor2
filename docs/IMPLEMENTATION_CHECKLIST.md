@@ -266,14 +266,14 @@ two orders of magnitude of amplification.
 ## Refactors
 
 ### R1 — Split the validator god-class (Declared Couplings, Phase 1)
-**Status: DONE** — commit `PENDING-R1`. Pure refactor; one intentional
+**Status: DONE** — commit `e166d74`. Pure refactor; one intentional
 behaviour change, stated below.
 
 `ValidationTools` carried four near-identical pipelines. Each analysis now
 supplies only what is specific to it — its deck fragment, its parser, its gate —
 and walks a shared road for everything else.
 
-| What | File | Line @ `PENDING-R1` |
+| What | File | Line @ `e166d74` |
 |---|---|---|
 | `_SolveInputs` — named, not a 5-tuple | `design_engine/fea.py` | — |
 | `_SolveInputs.provenance()` — the fields every analysis logs | `design_engine/fea.py` | — |
