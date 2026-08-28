@@ -50,11 +50,16 @@ class FeaError(RuntimeError):
 _CASE_KEYS = {"material", "mesh", "constraints", "loads", "limit_state"}
 _MATERIAL_KEYS = {"name", "E_MPa", "nu", "yield_MPa", "source",
                   "service_temp_C", "yield_derate_curve", "E_derate_curve",
-                  "derate_source"}
+                  "derate_source",
+                  # Only a modal solve needs it (the mass matrix). A static
+                  # stress solve under force boundary conditions does not, and
+                  # it was previously REJECTED here as "a geometry property,
+                  # not an FEA one". That was right until *FREQUENCY existed.
+                  "density_kg_m3"}
 _MESH_KEYS = {"max_size_mm", "min_size_mm"}
 _CONSTRAINT_KEYS = {"where", "dof"}
 _LOAD_KEYS = {"where", "force_total_N"}
-_LIMIT_KEYS = {"name", "required_SF"}
+_LIMIT_KEYS = {"name", "required_SF", "excitation_hz", "harmonics"}
 
 
 def _reject_extra(d: dict, allowed: set, ctx: str) -> None:
@@ -201,9 +206,16 @@ def validate_case(case: dict) -> None:
     _reject_extra(case["mesh"], _MESH_KEYS, "case.mesh")
     _num(case["mesh"], "max_size_mm", "case.mesh", lo=0)
 
+    # Free vibration is the one analysis with nothing pushing on it: natural
+    # frequencies come from stiffness, mass and restraint alone. Constraints
+    # are still required — an unrestrained body has rigid-body modes at 0 Hz
+    # and no meaningful separation margin.
+    loads_optional = case.get("limit_state", {}).get("name") == "resonance_separation"
     for name, allowed in (("constraints", _CONSTRAINT_KEYS), ("loads", _LOAD_KEYS)):
         section = case[name]
-        if not isinstance(section, list) or not section:
+        if not isinstance(section, list):
+            raise FeaError(f"case.{name}: list required")
+        if not section and not (name == "loads" and loads_optional):
             raise FeaError(f"case.{name}: non-empty list required")
         for i, item in enumerate(section):
             _reject_extra(item, allowed, f"case.{name}[{i}]")
@@ -225,13 +237,30 @@ def validate_case(case: dict) -> None:
     ls = case["limit_state"]
     _reject_extra(ls, _LIMIT_KEYS, "case.limit_state")
     allowed_states = ("yield_von_mises", "elastic_buckling",
-                      "thermal_derated_yield")
+                      "thermal_derated_yield", "resonance_separation")
     if ls.get("name") not in allowed_states:
         raise FeaError(
             f"case.limit_state.name: must be one of {allowed_states}, got "
             f"{ls.get('name')!r} — the gate must name its limit state")
     _num(ls, "required_SF", "case.limit_state", lo=0)
-    if ls["name"] == "thermal_derated_yield":
+    if ls["name"] == "resonance_separation":
+        # A separation is a fraction, not a stress ratio. required_SF = 0.2
+        # means "every mode at least 20% clear of the excitation"; a value
+        # above 1.0 would demand the nearest mode be more than double the
+        # excitation away, which is almost certainly a units mix-up.
+        if ls["required_SF"] > 1.0:
+            raise FeaError(
+                f"limit_state 'resonance_separation': required_SF is a "
+                f"FRACTIONAL separation (0.2 = 20% clear of the excitation), "
+                f"got {ls['required_SF']} - values above 1.0 are almost "
+                f"always a stress-ratio habit applied to the wrong gate")
+        if case["loads"]:
+            raise FeaError(
+                "limit_state 'resonance_separation': free vibration takes no "
+                "loads. Natural frequencies depend on stiffness, mass and "
+                "restraint only, so supplying case.loads here would imply a "
+                "dependence the solve does not have")
+    elif ls["name"] == "thermal_derated_yield":
         if mat.get("service_temp_C") is None or not mat.get("yield_derate_curve"):
             raise FeaError(
                 "limit_state 'thermal_derated_yield' requires "
@@ -374,27 +403,43 @@ def _write_inp(path: Path, mesh: dict, case: dict,
     eff = effective_material(mat)
     lines += [f"*MATERIAL, NAME=MAT",
               "*ELASTIC",
-              f"{eff['E_MPa_effective']:.9g}, {mat['nu']:.9g}",
-              "*SOLID SECTION, ELSET=EALL, MATERIAL=MAT",
+              f"{eff['E_MPa_effective']:.9g}, {mat['nu']:.9g}"]
+    if analysis == "frequency":
+        # THE UNIT TRAP. CalculiX is unit-agnostic: it multiplies whatever
+        # numbers it is given. This deck is mm / N / MPa, and the mass unit
+        # CONSISTENT with those is the tonne, not the kilogram - because
+        # 1 N = 1 tonne * 1 mm/s^2. Feeding kg/m^3 straight in yields
+        # frequencies wrong by a factor of sqrt(1e12) = 1e6.
+        #   kg/m^3 -> t/mm^3  is  x 1e-12   (1 kg = 1e-3 t, 1 m^3 = 1e9 mm^3)
+        #   steel 7850 kg/m^3 -> 7.85e-9 t/mm^3
+        # With that, eigenfrequencies come out in Hz.
+        lines += ["*DENSITY", f"{float(mat['density_kg_m3']) * 1e-12:.9g}"]
+    lines += ["*SOLID SECTION, ELSET=EALL, MATERIAL=MAT",
               "*STEP"]
     if analysis == "buckle":
         # Linear (eigenvalue) buckling. CalculiX returns load MULTIPLIERS on
         # the applied reference load, so the lowest positive factor IS the
         # safety factor against elastic instability for that load pattern.
         lines += ["*BUCKLE", str(int(n_modes))]
+    elif analysis == "frequency":
+        # Free vibration: no applied load, so the answer depends only on
+        # stiffness, mass and restraint. STORAGE=0 keeps the .frd small; the
+        # eigenfrequencies land in the .dat.
+        lines += ["*FREQUENCY, STORAGE=0", str(int(n_modes))]
     else:
         lines.append("*STATIC")
     lines.append("*BOUNDARY")
     for i, c in enumerate(case["constraints"]):
         for dof in c["dof"]:
             lines.append(f"FIX{i}, {dof}, {dof}, 0.")
-    lines.append("*CLOAD")
-    for nodal in load_sets:  # {node_tag: [fx, fy, fz]} consistent loads
+    if analysis != "frequency":
+        lines.append("*CLOAD")
+    for nodal in (load_sets if analysis != "frequency" else []):
         for tag in sorted(nodal):
             for dof, val in enumerate(nodal[tag], start=1):
                 if val != 0:
                     lines.append(f"{tag}, {dof}, {val:.9g}")
-    if analysis == "buckle":
+    if analysis in ("buckle", "frequency"):
         # no RF/stress for an eigenvalue step: mode shapes only
         lines += ["*NODE FILE", "U", "*END STEP", ""]
     else:
@@ -650,6 +695,72 @@ def _run_solver(cmd, cwd, env, timeout_s: int) -> _SolverRun:
                       _peak_rss_mb(proc))
 
 
+def parse_eigenfrequencies(dat_path: Path) -> list[float]:
+    """Natural frequencies in Hz from a *FREQUENCY step's .dat file.
+
+    CalculiX prints, per mode:
+
+        MODE NO   EIGENVALUE   (RAD/TIME)   (CYCLES/TIME)   IMAGINARY PART
+
+    The Hz value is the CYCLES/TIME column. A mode with a NEGATIVE eigenvalue
+    reports zero real frequency and a non-zero imaginary part, which means the
+    structure is unrestrained in that direction — a rigid-body mode, not a
+    vibration. Reporting those as "0 Hz modes" would be a quiet lie about a
+    model that is not fit to answer the question, so they are refused.
+    """
+    if not dat_path.is_file():
+        raise FeaError(
+            f"solver produced no .dat file at {dat_path}; eigenfrequencies "
+            f"unavailable and no separation margin is derived")
+    text = dat_path.read_text(encoding="ascii", errors="replace")
+    if "EIGENVALUE" not in text.upper():
+        raise FeaError(
+            f"no eigenvalue output in {dat_path} - the frequency step did not "
+            f"produce results")
+
+    # SECTION-AWARE, and it has to be. CalculiX follows the eigenvalue table
+    # with PARTICIPATION FACTORS and EFFECTIVE MODAL MASS, whose rows also
+    # begin with a mode number and carry six floats. Parsing the whole file
+    # for "a row starting with an integer" picked those up as extra modes —
+    # 12 where 6 were requested — and their columns, read as frequencies,
+    # looked exactly like imaginary rigid-body modes.
+    freqs, imaginary = [], []
+    in_eigen = False
+    for line in text.splitlines():
+        upper = line.upper()
+        if "E I G E N V A L U E" in upper:
+            in_eigen = True
+            continue
+        if in_eigen and ("P A R T I C I P A T I O N" in upper
+                         or "E F F E C T I V E" in upper
+                         or "S T E P" in upper):
+            in_eigen = False
+        if not in_eigen:
+            continue
+        nums = _FRD_FLOAT.findall(line)
+        parts = line.split()
+        if len(nums) < 4 or not parts or not parts[0].isdigit():
+            continue
+        _eigen, _rad, cycles, imag = (float(nums[0]), float(nums[1]),
+                                      float(nums[2]), float(nums[3]))
+        if abs(imag) > 0:
+            imaginary.append(abs(imag))
+        else:
+            freqs.append(cycles)
+
+    if imaginary:
+        raise FeaError(
+            f"rigid_body_mode: {len(imaginary)} mode(s) came back with an "
+            f"imaginary frequency (largest {max(imaginary):.4g} rad/time), "
+            f"which means the model is unrestrained in that direction. A "
+            f"natural frequency is only meaningful for a structure that is "
+            f"actually held: check case.constraints before reading any "
+            f"separation margin from this.")
+    if not freqs:
+        raise FeaError(f"no usable modes parsed from {dat_path}")
+    return freqs
+
+
 class ValidationTools:
     def __init__(self, root: str | Path, log: ActionLog, parts: PartStore,
                  ccx_path: str | Path, threads: int | None = 1,
@@ -870,6 +981,154 @@ class ValidationTools:
                 "failure_id": None if passed else action_id,
                 "safety_factor": lowest, "buckling_factors": factors,
                 "scaling_ratio": ratio}
+
+    def fea_modal(self, geometry_id: str, case: dict, reason: str,
+                  n_modes: int = 10) -> dict:
+        """Natural frequencies against the resonance_separation limit state.
+
+        WHY THIS EXISTS. The jetpack frame carries four turbines at 98,000 rpm
+        — about 1633 Hz — bolted to a structure whose natural frequencies had
+        never been computed. If a mode sits near that, the frame is driven at
+        resonance and the stress amplitude a static solve reports is wrong by
+        whatever the damping-limited amplification happens to be. Every static
+        result on that frame rests on the unexamined assumption that no mode
+        is nearby.
+
+        THE GATE. This limit state is a SEPARATION, not a stress ratio, so
+        `required_SF` is read as the required fractional separation: 0.2 means
+        every mode must sit at least 20% away from the excitation and from
+        each harmonic checked. The reported `safety_factor` is the achieved
+        separation, so the engine's "SF >= required_SF" contract still holds
+        and reads the same way in the log.
+
+        Harmonics matter and are not optional: a rotor excites at its running
+        speed AND at multiples of it, so a mode at 2x the shaft frequency is
+        just as dangerous as one at 1x. `case.limit_state.harmonics` says how
+        many to check.
+        """
+        action_id = self.log.open_action(
+            "validation", "fea_modal", geometry_version=str(geometry_id),
+            reason=str(reason))
+        try:
+            _check_reason(reason)
+            validate_case(case)
+            ls = case["limit_state"]
+            if ls["name"] != "resonance_separation":
+                raise FeaError(
+                    f"fea_modal requires limit_state 'resonance_separation', "
+                    f"got {ls['name']!r}")
+            if "excitation_hz" not in ls:
+                raise FeaError(
+                    "case.limit_state.excitation_hz: required — a separation "
+                    "margin is meaningless without the frequency being "
+                    "separated FROM. State the driving frequency (for a rotor, "
+                    "rpm / 60) rather than leaving it implied.")
+            exc_hz = _num(ls, "excitation_hz", "case.limit_state", lo=0)
+            harmonics = int(ls.get("harmonics", 1))
+            if harmonics < 1:
+                raise FeaError("case.limit_state.harmonics: must be >= 1")
+            if case["material"].get("density_kg_m3") is None:
+                raise FeaError(
+                    "case.material.density_kg_m3: required for a modal solve. "
+                    "A natural frequency is sqrt(stiffness/mass) and there is "
+                    "no mass matrix without density — this engine will not "
+                    "assume one.")
+            _num(case["material"], "density_kg_m3", "case.material", lo=0)
+            if not self.ccx_path.is_file():
+                raise FeaError(f"ccx solver not found at {self.ccx_path}")
+
+            part = self.parts.get_part(geometry_id)
+            run_dir = self._next_run_dir()
+            m = mesh_step(part["step_file_path"], case["mesh"]["max_size_mm"],
+                          case["mesh"].get("min_size_mm"))
+            constraint_sets = [select_nodes(m, c["where"])
+                               for c in case["constraints"]]
+            rbm = check_rigid_body_modes(m, constraint_sets, case["constraints"])
+
+            _write_inp(run_dir / "job.inp", m, case, constraint_sets, [],
+                       analysis="frequency", n_modes=n_modes)
+            binary, env, threads = self._solver_command(force_single=True)
+            t0 = time.time()
+            try:
+                proc = _run_solver([str(binary), "-i", "job"], run_dir, env,
+                                   self.solve_timeout_s)
+            except subprocess.TimeoutExpired:
+                raise FeaError(
+                    f"solver_timeout: {binary.name} exceeded "
+                    f"{self.solve_timeout_s}s on a modal solve of "
+                    f"{len(m['node_tags'])} nodes")
+            solve_s = time.time() - t0
+            if proc.returncode != 0:
+                (run_dir / "ccx_stdout.txt").write_text(proc.stdout,
+                                                        encoding="utf-8")
+                mem = (f" peak memory {proc.peak_rss_mb:.0f} MB;"
+                       if proc.peak_rss_mb else "")
+                raise FeaError(f"solver_error: {binary.name} exit "
+                               f"{proc.returncode};{mem} "
+                               f"tail: {proc.stdout[-400:]!r}")
+
+            freqs = parse_eigenfrequencies(run_dir / "job.dat")
+            checked = [exc_hz * k for k in range(1, harmonics + 1)]
+            clashes, separation = [], float("inf")
+            for h_i, f_exc in enumerate(checked, start=1):
+                for mode_i, f in enumerate(freqs, start=1):
+                    sep = abs(f - f_exc) / f_exc
+                    if sep < separation:
+                        separation = sep
+                    if sep < float(ls["required_SF"]):
+                        clashes.append({
+                            "mode": mode_i, "mode_hz": round(f, 4),
+                            "harmonic": h_i,
+                            "excitation_hz": round(f_exc, 4),
+                            "separation": round(sep, 6)})
+
+            required = float(ls["required_SF"])
+            details = {
+                "limit_state": "resonance_separation",
+                "required_SF": required,
+                "safety_factor": round(separation, 6),
+                "excitation_hz": exc_hz,
+                "harmonics_checked": [round(f, 4) for f in checked],
+                "mode_frequencies_hz": [round(f, 4) for f in freqs],
+                "n_modes": len(freqs),
+                "clashes": clashes,
+                "material": case["material"],
+                "thermal_derating": effective_material(case["material"]),
+                "constraint_rank": rbm["constraint_rank"],
+                "nodes": int(len(m["node_tags"])),
+                "elements": int(len(m["connectivity"])),
+                "solver_binary": binary.name, "solver_threads": threads,
+                "solve_seconds": round(solve_s, 2),
+                "peak_rss_mb": proc.peak_rss_mb,
+                "run_dir": str(run_dir),
+                "artifacts": [],
+            }
+            passed = not clashes
+        except Exception as exc:
+            self.log.close_action(
+                action_id, "fail", failure_mode=f"{type(exc).__name__}: {exc}")
+            raise
+
+        if passed:
+            self.log.close_action(action_id, "pass", details=details)
+        else:
+            worst = min(clashes, key=lambda c: c["separation"])
+            self.log.close_action(
+                action_id, "fail", details=details,
+                failure_mode=(
+                    f"resonance_separation: mode {worst['mode']} at "
+                    f"{worst['mode_hz']:.1f} Hz is {worst['separation'] * 100:.1f}% "
+                    f"from harmonic {worst['harmonic']} of the excitation "
+                    f"({worst['excitation_hz']:.1f} Hz), inside the required "
+                    f"{required * 100:.0f}% separation"))
+        return {"result": "pass" if passed else "fail",
+                "action_id": action_id,
+                "failure_id": None if passed else action_id,
+                "safety_factor": separation,
+                "mode_frequencies_hz": freqs,
+                "excitation_hz": exc_hz,
+                "harmonics_checked": checked,
+                "clashes": clashes}
 
     def fea_static(self, geometry_id: str, case: dict, reason: str) -> dict:
         action_id = self.log.open_action(

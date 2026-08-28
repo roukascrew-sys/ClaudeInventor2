@@ -110,9 +110,13 @@ SF 4.633 is not sitting on one, but that is luck rather than design.
 | Benchmark | Where | Agreement |
 |---|---|---|
 | Cantilever bar vs analytic | `tests/test_phase4.py::test_solver_matches_analytic` | within gate |
+| Cantilever 1st natural frequency | `tests/test_modal.py::test_modal_matches_the_euler_bernoulli_closed_form` | **+0.07%** |
 | Euler buckling, fixed-pinned | `tests/test_buckling.py` | 0.16% |
 
 Still to add: plate bending, thick-walled cylinder, notch Kt vs Peterson.
+
+The modal benchmark landed as part of B2 and is listed here too, because it
+verifies the solver chain (units, deck, parser) and not only the modal feature.
 
 ---
 
@@ -148,7 +152,68 @@ intended, and it means the veto is inert today.
 **Status: TODO**
 
 ### B2 — Modal analysis and a resonance separation gate
-**Status: TODO** — the roadmap's "if only one thing gets done" item.
+**Status: DONE** — commit `PENDING-B2`. The roadmap's "if only one thing gets
+done" item, and it immediately falsified an assumption underneath a validated
+result.
+
+| What | File | Line @ `PENDING-B2` |
+|---|---|---|
+| `density_kg_m3` accepted as an FEA material key | `design_engine/fea.py` | 58 |
+| `excitation_hz` / `harmonics` limit-state keys | `design_engine/fea.py` | 62 |
+| loads optional for free vibration only | `design_engine/fea.py` | 213 |
+| `resonance_separation` validation rules | `design_engine/fea.py` | 246 |
+| `*DENSITY` with the tonne conversion | `design_engine/fea.py` | 407 |
+| `*FREQUENCY` step | `design_engine/fea.py` | 424–428 |
+| `parse_eigenfrequencies()` — section-aware | `design_engine/fea.py` | 698 |
+| `fea_modal()` + separation gate | `design_engine/fea.py` | 985 |
+| Design driver | `designs/jetpack_modal_run.py` | whole file |
+| Tests (16) | `tests/test_modal.py` | whole file |
+
+**Closed-form verification** (also advances A3). A cantilever's natural
+frequencies have an exact analytic answer, so this checks the whole chain —
+density units, deck, solver, parser — against something computed independently:
+
+| | Euler–Bernoulli | FEA | Error |
+|---|---|---|---|
+| 1st bending | 208.88 Hz | 209.0 | **+0.07%** |
+| 2nd bending | 1309.02 Hz | 1294.9 | −1.08% |
+
+Modes come in identical pairs, correct for a square section bending equally in
+two planes. The 2nd-mode error is *below* the analytic value, which is the
+physically right direction: Euler–Bernoulli neglects shear deformation, which
+matters more as the mode wavelength shortens.
+
+**The unit trap, stated because it is the failure mode here.** CalculiX is
+unit-agnostic. In a mm/N/MPa deck the consistent mass unit is the **tonne**, so
+density must be converted `kg/m³ × 1e-12`. Feeding kg/m³ straight in yields
+frequencies wrong by √(1e12) = **10⁶**, and the solver reports them without
+complaint. The closed-form test is what makes that impossible to ship.
+
+**Result on the real frame — `P0048@v1`, FAIL:**
+
+| Mode | Hz | Separation from 1633.3 Hz |
+|---|---|---|
+| 17 | 1494.4 | 8.5% |
+| **18** | **1639.4** | **0.4%** |
+| 19 | 1660.3 | 1.7% |
+| 20 | 1668.5 | 2.2% |
+
+**Mode 18 sits 0.4% from the turbine's shaft frequency** — effectively exact
+resonance. Four modes fall inside the required ±20% band.
+
+**Why the bare-frame caveat does not rescue it.** The run carries no engine,
+fuel or pilot mass, so these are an *upper bound* and the real modes sit lower.
+That does not help: above 900 Hz the mean mode spacing is 141 Hz, and the ±20%
+band is 653 Hz wide, so **4.6 modes are expected in the band on spacing alone —
+4 were observed.** Adding mass lowers every frequency and the spacing with it;
+it changes *which* modes clash, not *whether* any do. This is a modal-density
+property of the structure, not one unlucky mode.
+
+**Consequence:** the validated SF 4.633 was computed on the assumption that no
+mode is near the excitation. That assumption is now falsified. The static
+number is not wrong as arithmetic, but the load amplitude it was computed
+against is, and a lightly damped aluminium weldment at resonance can see one to
+two orders of magnitude of amplification.
 
 ### B3 — Joints modelled as joints (weld throat, HAZ knockdown, bolt preload)
 **Status: TODO**
