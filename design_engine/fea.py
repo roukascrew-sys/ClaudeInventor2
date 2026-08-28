@@ -39,6 +39,8 @@ from .log import ActionLog
 from .mesh import (MeshError, describe_axis_options, mesh_step,
                    select_nodes)
 from .parts import PartStore, _check_reason
+from .geometry import build as build_solid
+from .singularity import classify_peak
 
 
 class FeaError(RuntimeError):
@@ -955,6 +957,22 @@ class ValidationTools:
                     f"point-like restraint) rather than a physical peak. The "
                     f"safety factor derived from it is pessimistic, not "
                     f"unsafe - but do not treat it as a converged stress.")
+
+            # Geometric singularity check. The outlier ratio above compares the
+            # peak against the bulk field, which catches a peak DECOUPLED from
+            # its surroundings - a constraint singularity. A peak sitting on a
+            # sharp re-entrant corner is fed BY the surrounding field, so the
+            # ratio stays low while the stress is still unbounded. P0047@v1
+            # read 1.633 here, comfortably "clean", with its peak 1.28 mm off a
+            # 270-degree corner. Two different questions; both must be asked.
+            peak_xyz = [float(v) for v in coords[int(max_node)]]
+            try:
+                singularity = classify_peak(
+                    build_solid(part["spec"]).val(), peak_xyz,
+                    case["mesh"]["max_size_mm"])
+            except Exception as exc:        # noqa: BLE001 - never break a solve
+                singularity = {"verdict": "unknown", "singular_edges": 0,
+                               "reason": f"not analysed: {type(exc).__name__}: {exc}"}
             max_disp = max(math.sqrt(sum(v ** 2 for v in u[:3]))
                            for u in disp.values())
 
@@ -996,6 +1014,7 @@ class ValidationTools:
                 "p99_9_von_mises_MPa": round(p999, 6),
                 "stress_outlier_ratio": round(outlier_ratio, 4),
                 "stress_outlier_warning": outlier_warning,
+                "singularity": singularity,
                 "max_von_mises_node": int(max_node),
                 "max_von_mises_at_mm": [round(float(v), 3) for v in coords[int(max_node)]],
                 "max_displacement_mm": round(max_disp, 9),
@@ -1048,6 +1067,7 @@ class ValidationTools:
             "p99_9_von_mises_MPa": p999,
             "stress_outlier_ratio": outlier_ratio,
             "stress_outlier_warning": outlier_warning,
+            "singularity": singularity,
             "max_von_mises_at_mm": details["max_von_mises_at_mm"],
             "max_displacement_mm": max_disp,
             "thermal_derating": eff,
