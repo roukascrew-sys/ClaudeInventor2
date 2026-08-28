@@ -42,6 +42,10 @@ from .mesh import (MeshError, describe_axis_options, mesh_step,
 from .parts import PartStore, _check_reason
 from .geometry import build as build_solid
 from .singularity import classify_peak
+from .submodel import (SubmodelError, coplanar_risk, converged,
+                       cut_region, driven_nodes, plan,
+                       refinement_ladder, solid_bounds,
+                       submodel_deck_fragment)
 from .fatigue import SNCurve, stress_range_from_ratio
 from . import weld as _weld
 
@@ -1523,3 +1527,209 @@ class ValidationTools:
             "artifacts": [png_rel],
             "run_dir": str(run_dir),
         }
+
+    # ------------------------------------------------------------ submodel
+    def _write_submodel_inp(self, path: Path, mesh: dict, case: dict,
+                            fragment: dict) -> None:
+        """A submodel deck: same material and elements, different restraint.
+
+        There is no `*BOUNDARY` fixity and no `*CLOAD` here, and that is not
+        an omission. The driven cut surface carries the entire effect of the
+        rest of the structure - the loads that produced those displacements,
+        and the constraints that reacted them. Re-applying either would count
+        it twice.
+        """
+        mat = case["material"]
+        eff = effective_material(mat)
+        lines = ["*HEADING",
+                 f"design-engine fea_submodel, material {mat['name']}",
+                 "*NODE, NSET=NALL"]
+        for tag, (x, y, z) in zip(mesh["node_tags"], mesh["coords"]):
+            lines.append(f"{tag}, {x:.9g}, {y:.9g}, {z:.9g}")
+        lines.append("*ELEMENT, TYPE=C3D10, ELSET=EALL")
+        for eid, row in enumerate(mesh["connectivity"], start=1):
+            lines.append(f"{eid}, " + ", ".join(str(t) for t in row))
+        lines += fragment["before_step"]
+        lines += ["*MATERIAL, NAME=MAT", "*ELASTIC",
+                  f"{eff['E_MPa_effective']:.9g}, {mat['nu']:.9g}",
+                  "*SOLID SECTION, ELSET=EALL, MATERIAL=MAT",
+                  "*STEP", "*STATIC"]
+        lines += fragment["inside_step"]
+        lines += ["*NODE FILE", "U", "*EL FILE", "S", "*END STEP", ""]
+        path.write_text("\n".join(lines), encoding="ascii")
+
+    def _region_conflicts(self, gm: dict, case: dict, region) -> list:
+        """Loads or constraints that fall inside the submodel region.
+
+        Their effect is ALREADY carried by the driven cut surface, because the
+        global solve that produced those displacements had them applied.
+        Applying them again inside the submodel counts them twice, and the
+        result would still be reported as a converged local stress.
+        """
+        conflicts = []
+        for kind in ("loads", "constraints"):
+            for i, entry in enumerate(case.get(kind, [])):
+                tags = set(int(t) for t in select_nodes(gm, entry["where"]))
+                inside = sum(1 for t, xyz in zip(gm["node_tags"], gm["coords"])
+                             if int(t) in tags and region.contains(xyz))
+                if inside:
+                    conflicts.append({"kind": kind, "index": i,
+                                      "nodes_inside": inside})
+        return conflicts
+
+    def fea_submodel(self, geometry_id: str, case: dict, global_result: dict,
+                     reason: str, *, feature_mm: float,
+                     standoff_elements: float, standoff_source: str = "",
+                     centre=None, ladder_steps: int = 3,
+                     ladder_factor: float = 2.0, tol_pct: float = 5.0,
+                     allow_hanging_solver: bool = False) -> dict:
+        """Re-solve a small region around the peak, driven by a global solve.
+
+        Consumes an existing `fea_static` result rather than re-running it.
+        The expensive global solve is what found the peak in the first place,
+        and running it again to produce the same number is precisely the waste
+        this feature exists to avoid.
+
+        Answers "has the peak stopped moving", NOT "does the part pass". The
+        limit-state gate stays with `fea_static`; giving one number two gates
+        is how a result ends up with two different verdicts.
+        """
+        _check_reason(reason)
+        with self._action("fea_submodel", geometry_id, reason) as action_id:
+            for key in ("run_dir", "max_von_mises_at_mm"):
+                if key not in global_result:
+                    raise FeaError(
+                        f"global_result.{key} is required - pass the dict "
+                        f"returned by fea_static for this geometry")
+
+            # The gate, before anything is cut or meshed. A peak on a
+            # geometric singularity has no finite value to converge to, so
+            # this whole procedure would spend the solver budget producing a
+            # number that rises with every rung.
+            # Defaults to the global peak, which is the usual question. An
+            # explicit centre is allowed because the location worth resolving
+            # is not always the global maximum - a fillet you care about can
+            # sit well below a peak you have already explained.
+            peak_xyz = [float(v) for v in
+                        (centre if centre is not None
+                         else global_result["max_von_mises_at_mm"])]
+            region = plan(global_result.get("singularity"), peak_xyz,
+                          feature_mm, standoff_elements,
+                          case["mesh"]["max_size_mm"], source=standoff_source)
+
+            global_frd = Path(global_result["run_dir"]) / "job.frd"
+            if not global_frd.is_file():
+                raise FeaError(
+                    f"global results not found at {global_frd}. The submodel "
+                    f"is driven by them; without the .frd there is nothing to "
+                    f"interpolate from")
+
+            part = self.parts.get_part(geometry_id)
+            solid = build_solid(part["spec"])
+            cut, cut_report = cut_region(solid, region)
+            risks = coplanar_risk(solid_bounds(solid), region)
+
+            gm = mesh_step(part["step_file_path"], case["mesh"]["max_size_mm"],
+                           case["mesh"].get("min_size_mm"))
+            conflicts = self._region_conflicts(gm, case, region)
+            if conflicts:
+                raise FeaError(
+                    f"the region contains applied boundary conditions "
+                    f"{conflicts}. Their effect is already carried by the "
+                    f"driven cut surface, so applying them again would count "
+                    f"them twice. Submodels containing a load or a restraint "
+                    f"are not supported yet - move the region, or solve the "
+                    f"part directly")
+
+            ladder = refinement_ladder(case["mesh"]["max_size_mm"], region,
+                                       steps=ladder_steps,
+                                       factor=ladder_factor)
+
+            # MEASURED 2026-08-28: ccx 2.23 win-x64 HANGS on *SUBMODEL with
+            # this project's C3D10 meshes. Its interpolation calls createtet
+            # on the global mesh and spins, re-emitting "element N is
+            # extremely flat / the element is deleted" for the same element
+            # indefinitely - observed past 240 s on a 2093-node submodel and
+            # past 90 s on a deliberately tiny 2070-node one, so it is not
+            # slowness. Only the timeout ends it.
+            #
+            # Everything above this line is validated and cheap: the gate, the
+            # region, the cut, the driven-node classification, the boundary-
+            # condition conflict check. Only the interpolation is missing, and
+            # the honest options are to write it here (locate the global
+            # C3D10 containing each driven node and evaluate its shape
+            # functions) or to find a ccx configuration that does not spin.
+            #
+            # Refusing fast, rather than letting a caller discover this as a
+            # 15-minute timeout per rung.
+            if not allow_hanging_solver:
+                raise FeaError(
+                    f"submodel_interpolation_unavailable: CalculiX 2.23 "
+                    f"*SUBMODEL hangs on this project's C3D10 meshes "
+                    f"(measured 2026-08-28; it spins in createtet on the "
+                    f"global mesh). The region {region.to_dict()['bounds_mm']} "
+                    f"and the cut are computed and valid - only the "
+                    f"interpolation is unavailable, so the solve would not "
+                    f"terminate. Pass allow_hanging_solver=True only to "
+                    f"re-measure the solver's behaviour")
+            peaks, rungs = [], []
+            binary = threads = None
+            for mm in ladder:
+                run_dir = self._next_run_dir()
+                step_path = run_dir / "submodel.step"
+                import cadquery as cq              # noqa: PLC0415
+                cq.exporters.export(cut, str(step_path))
+                m = mesh_step(str(step_path), mm, None)
+                driven = driven_nodes(m, region)
+                rel = os.path.relpath(global_frd, run_dir).replace("\\", "/")
+                frag = submodel_deck_fragment(rel, driven)
+                self._write_submodel_inp(run_dir / "job.inp", m, case, frag)
+                _, binary, threads, solve_s = self._solve(
+                    run_dir, len(m["node_tags"]), what=f"submodel {mm:g}mm")
+                blocks = _parse_frd(run_dir / "job.frd")
+                stress = blocks.get("STRESS", {})
+                if not stress:
+                    raise FeaError(
+                        f"the submodel at {mm:g} mm produced no STRESS "
+                        f"results ({run_dir}/job.frd)")
+                peak_vm = max(von_mises(s) for s in stress.values())
+                peaks.append(peak_vm)
+                rungs.append({"mesh_mm": mm, "nodes": len(m["node_tags"]),
+                              "elements": len(m["connectivity"]),
+                              "driven_nodes": len(driven),
+                              "max_von_mises_MPa": round(peak_vm, 6),
+                              "solve_seconds": round(solve_s, 3),
+                              "run_dir": str(run_dir)})
+
+            verdict = converged(peaks, tol_pct)
+            coarse = global_result.get("max_von_mises_MPa")
+            details = {
+                "region": region.to_dict(),
+                "cut": cut_report,
+                "coplanar_risk": risks,
+                "global_run_dir": str(global_result["run_dir"]),
+                "global_max_von_mises_MPa": coarse,
+                "rungs": rungs,
+                "convergence": verdict,
+                "solver_binary": binary.name if binary else None,
+                "threads": threads,
+            }
+            if coarse:
+                # How much the coarse global solve understated the peak. This
+                # is the number the whole exercise exists to produce.
+                details["submodel_vs_global_ratio"] = round(
+                    peaks[-1] / float(coarse), 4)
+
+            converged_ok = bool(verdict.get("converged"))
+            self.log.close_action(
+                action_id, "pass" if converged_ok else "unknown",
+                details=details,
+                failure_mode=(None if converged_ok
+                              else f"not converged: {verdict['reason']}"))
+            if global_result.get("action_id") is not None:
+                self.log._conn.execute(
+                    "UPDATE actions SET linked_parent_id = ? WHERE id = ?",
+                    (global_result["action_id"], action_id))
+                self.log._conn.commit()
+            return {"action_id": action_id, "geometry_id": geometry_id,
+                    **details}

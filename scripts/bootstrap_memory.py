@@ -1147,6 +1147,72 @@ LATE = [
                  "A method with no refusal path does not belong in this engine",
                  "Adaptivity cannot rescue a singular goal",
                  "Screening models are optimistic in the unsafe direction"]),
+
+    _mem.MemoryEvent(
+        "The solver will not do the submodel interpolation",
+        type="Failure", impact="High", date="2026-08-28",
+        what_happened=(
+            "Submodelling was built as the affordable route to mesh "
+            "convergence, on the design assumption that CalculiX would do the "
+            "displacement interpolation natively. The assumption was checked "
+            "the right way first - scanning the shipped binary found the "
+            "*SUBMODEL keyword, 21 occurrences - and was still wrong in "
+            "practice. ccx 2.23 win-x64 HANGS on *SUBMODEL with this "
+            "project's C3D10 meshes: it spins in createtet on the global "
+            "mesh, re-emitting the same 'element is extremely flat / the "
+            "element is deleted' warning indefinitely."),
+        why_it_matters=(
+            "It is the difference between a feature and a trap. Left as "
+            "written, fea_submodel would have burned a 900 s timeout per "
+            "refinement rung and reported nothing, which is the exact failure "
+            "mode already recorded as 'Solver timeout wastes the full "
+            "budget'. It also shows that a keyword being PRESENT in a binary "
+            "is not evidence it WORKS - the check that felt rigorous at "
+            "design time was not."),
+        decision=(
+            "fea_submodel now refuses fast with "
+            "submodel_interpolation_unavailable before any solve, and reports "
+            "the region it computed so a retry does not start over. "
+            "allow_hanging_solver=True exists only to re-measure. The rest of "
+            "design_engine/submodel.py is unaffected and stays: region "
+            "sizing, the cut, driven-node classification, the "
+            "boundary-condition conflict check, the convergence verdict."),
+        evidence=[
+            "Observed - a 2093-node submodel driven by a 2682-node global run "
+            "was still spinning at 240 s; the test suite killed it at 900 s.",
+            "Observed - a deliberately tiny case (20x20x40 bar, 2133 global "
+            "nodes, 1148 elements, 2070 submodel nodes) also hangs past 90 s, "
+            "so it is not a size or memory problem. A 5337-equation static "
+            "solve is otherwise sub-second here.",
+            "Observed - an absolute INPUT= path fails differently and "
+            "cleanly: CalculiX truncates the card at 132 characters and "
+            "reports 'ERROR in readfrd: the input file ...sub_repro/da could "
+            "not be opened'. A separate constraint worth knowing.",
+            "Observed - the global .frd is not missing its mesh: it carries "
+            "2C with 2682 nodes and 3C with 1391 elements.",
+            "Unknown - whether a LINEAR C3D4 global mesh avoids it, or "
+            "whether TYPE=SURFACE behaves differently. Neither was tested. "
+            "The createtet warnings point at the quadratic tets, which makes "
+            "C3D4 the first question worth asking."],
+        affected=["design_engine/fea.py", "design_engine/submodel.py",
+                  "tests/test_submodel.py"],
+        consequences=(
+            "Mesh convergence stays blocked, now for a second and unrelated "
+            "reason: first the 6.1 GB memory ceiling on global refinement, "
+            "now the absence of a working interpolation for local "
+            "refinement. The open choice is to write the interpolation here - "
+            "locate the global C3D10 containing each driven node and evaluate "
+            "its shape functions, which is standard finite-element arithmetic "
+            "rather than novel numerics - or to find the ccx configuration "
+            "that does not spin."),
+        open_questions=(
+            "Does a C3D4 global mesh avoid the createtet spin? That is the "
+            "cheapest experiment and would decide whether this is a ccx "
+            "limitation or a mesh-type incompatibility."),
+        related=["CalculiX submodel interpolation hangs",
+                 "Mesh convergence is unverified",
+                 "Solver timeout wastes the full budget",
+                 "Refuse rather than invent", "Roadmap"]),
 ]
 
 

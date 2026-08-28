@@ -218,6 +218,61 @@ def plan(classification: dict | None, centre, feature_mm: float,
                           source=source)
 
 
+def cut_region(solid, region: SubmodelRegion, min_reduction: float = 0.05):
+    """Intersect the part with the region box. Returns (cut_solid, report).
+
+    The CAD kernel is imported INSIDE this function on purpose. Everything
+    else in this module is stdlib, so region sizing, node classification and
+    the convergence verdict keep working when OCP will not load — which is not
+    hypothetical on this machine.
+
+    Two refusals, both cases where the cut silently answers a different
+    question than the caller thinks:
+
+      EMPTY       The region does not intersect the part at all. Meshing that
+                  produces nothing, and a solve of nothing reports success.
+      NO SAVING   The region swallows (nearly) the whole part. The "submodel"
+                  is then the original problem with imposed boundary
+                  displacements bolted on, which is strictly worse than just
+                  solving it - and it would still be reported as a submodel.
+    """
+    import cadquery as cq                          # noqa: PLC0415 - see above
+
+    cx, cy, cz = region.centre
+    side = 2.0 * region.half_mm
+    box = cq.Workplane("XY").box(side, side, side).translate((cx, cy, cz))
+
+    shape = solid.val() if hasattr(solid, "val") else solid
+    whole = shape.Volume()
+    cut = shape.intersect(box.val())
+    kept = cut.Volume()
+
+    if kept <= 0:
+        raise SubmodelError(
+            f"the region at {region.centre} does not intersect the part. A "
+            f"mesh of nothing solves successfully and reports nothing - check "
+            f"the peak coordinates came from this geometry")
+    if kept >= whole * (1.0 - min_reduction):
+        raise SubmodelError(
+            f"the region keeps {kept / whole * 100:.1f}% of the part "
+            f"({kept:.4g} of {whole:.4g} mm^3). A submodel that is the whole "
+            f"part is the original solve with boundary displacements bolted "
+            f"on - strictly worse, and it would still be reported as a "
+            f"submodel. Shrink feature_mm or the standoff")
+
+    return cut, {"whole_volume_mm3": round(whole, 4),
+                 "submodel_volume_mm3": round(kept, 4),
+                 "fraction_kept": round(kept / whole, 6),
+                 "region": region.to_dict()}
+
+
+def solid_bounds(solid) -> tuple:
+    """(xmin, ymin, zmin, xmax, ymax, zmax) of a part, for `coplanar_risk`."""
+    shape = solid.val() if hasattr(solid, "val") else solid
+    bb = shape.BoundingBox()
+    return (bb.xmin, bb.ymin, bb.zmin, bb.xmax, bb.ymax, bb.zmax)
+
+
 def submodel_deck_fragment(global_frd_path, driven: list,
                            step: int = 1) -> dict:
     """The `*SUBMODEL` lines for a submodel deck, split by where they go.

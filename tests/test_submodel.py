@@ -15,7 +15,11 @@ the shipped 2.23 binary), so none of that arithmetic is tested here. What is
 tested is that the engine refuses to ask it the wrong question.
 """
 
+from pathlib import Path
+
 import pytest
+
+from design_engine.mesh import mesh_step
 
 from design_engine.singularity import RefinementRefused
 from design_engine.submodel import (SUGGESTED_STANDOFF,
@@ -227,3 +231,157 @@ def test_the_verdict_carries_the_numbers_that_produced_it():
     v = converged([100.0, 110.0, 111.0], tol_pct=2.0)
     assert v["peaks"] == [100.0, 110.0, 111.0]
     assert v["previous_change_pct"] == pytest.approx(10.0)
+
+
+# =========================================================== orchestration
+# These run the real solver. The cheap tests above pin the refusals; these
+# pin that the thing actually works end to end and agrees with the parent
+# solve where the parent is trustworthy.
+from design_engine import DesignEngine                      # noqa: E402
+from design_engine.fea import FeaError, ValidationTools     # noqa: E402
+from design_engine.fea import _parse_frd, von_mises         # noqa: E402
+
+STEEL = {"name": "S235JR", "E_MPa": 210000.0, "nu": 0.3, "yield_MPa": 235.0,
+         "source": "EN 10025-2 nominal values, t<=16mm"}
+
+# 20 x 20 x 120, z from 0 to 120. Fixed at z=0, loaded at z=120, so a
+# mid-span region at z=60 contains neither boundary condition.
+BAR = {"name": "submodel-bar", "units": "mm",
+       "features": [{"op": "box", "x": 20.0, "y": 20.0, "z": 120.0}]}
+
+STANDOFF_SRC = ("test fixture: 3 feature-lengths, the common rule of thumb. "
+                "NOT a sourced standard")
+
+
+def _case():
+    return {"material": dict(STEEL),
+            "mesh": {"max_size_mm": 6.0},
+            "constraints": [{"where": {"axis": "z", "at": "min"},
+                             "dof": [1, 2, 3]}],
+            "loads": [{"where": {"axis": "z", "at": "max"},
+                       "force_total_N": [500, 0, 0]}],
+            "limit_state": {"name": "yield_von_mises", "required_SF": 1.5}}
+
+
+@pytest.fixture(scope="module")
+def solved(tmp_path_factory):
+    """A real global solve, shared by the orchestration tests."""
+    eng = DesignEngine(tmp_path_factory.mktemp("sub") / "data")
+    eng.validation = ValidationTools(eng.validation.root, eng.log, eng.parts,
+                                     eng.validation.ccx_path,
+                                     solve_timeout_s=900)
+    if not eng.validation.ccx_path.is_file():
+        pytest.skip("CalculiX not installed in this working copy")
+    gid = eng.create_part(BAR, reason="submodel orchestration fixture")["geometry_id"]
+    res = eng.validation.fea_static(gid, _case(),
+                                    reason="global solve to drive a submodel")
+    return eng, gid, res
+
+
+
+
+
+def test_a_region_containing_a_load_is_refused_not_silently_doubled(solved):
+    """The load's effect is already carried by the driven displacements,
+    because the global solve that produced them had it applied. Applying it
+    again inside the submodel counts it twice."""
+    eng, gid, res = solved
+    with pytest.raises(FeaError, match="already carried by the driven"):
+        eng.validation.fea_submodel(
+            gid, _case(), res, reason="region over the loaded end",
+            feature_mm=4.0, standoff_elements=3.0,
+            standoff_source=STANDOFF_SRC, centre=(0.0, 0.0, 118.0),
+            ladder_steps=2)
+
+
+def test_a_region_containing_a_constraint_is_refused(solved):
+    eng, gid, res = solved
+    with pytest.raises(FeaError, match="already carried by the driven"):
+        eng.validation.fea_submodel(
+            gid, _case(), res, reason="region over the fixed end",
+            feature_mm=4.0, standoff_elements=3.0,
+            standoff_source=STANDOFF_SRC, centre=(0.0, 0.0, 2.0),
+            ladder_steps=2)
+
+
+def test_a_singular_global_peak_is_refused_before_any_solver_time(solved):
+    eng, gid, res = solved
+    poisoned = dict(res)
+    poisoned["singularity"] = {"verdict": "singular",
+                               "reason": "1.28 mm from a 270-degree edge"}
+    with pytest.raises(RefinementRefused):
+        eng.validation.fea_submodel(
+            gid, _case(), poisoned, reason="must refuse before cutting",
+            feature_mm=4.0, standoff_elements=3.0,
+            standoff_source=STANDOFF_SRC, centre=(0.0, 0.0, 60.0))
+
+
+def test_a_missing_global_frd_is_named(solved, tmp_path):
+    eng, gid, res = solved
+    orphan = dict(res)
+    orphan["run_dir"] = str(tmp_path / "nowhere")
+    with pytest.raises(FeaError, match="global results not found"):
+        eng.validation.fea_submodel(
+            gid, _case(), orphan, reason="missing parent results",
+            feature_mm=4.0, standoff_elements=3.0,
+            standoff_source=STANDOFF_SRC, centre=(0.0, 0.0, 60.0))
+
+
+
+def test_a_region_swallowing_the_whole_part_is_refused(solved):
+    """Then it is not a submodel, it is the original solve with boundary
+    displacements bolted on — strictly worse, and still reported as a
+    submodel."""
+    eng, gid, res = solved
+    with pytest.raises(SubmodelError, match="keeps"):
+        eng.validation.fea_submodel(
+            gid, _case(), res, reason="region covers everything",
+            feature_mm=200.0, standoff_elements=3.0,
+            standoff_source=STANDOFF_SRC, centre=(0.0, 0.0, 60.0))
+
+
+def test_the_solve_is_refused_because_calculix_submodel_hangs(solved):
+    """The finding that stopped this feature, pinned so it cannot be
+    forgotten or silently re-enabled.
+
+    ccx 2.23 win-x64 spins in createtet interpolating onto the driven nodes,
+    re-emitting "element N is extremely flat / the element is deleted" for the
+    same element indefinitely - past 240 s on a 2093-node submodel and past
+    90 s on a deliberately tiny 2070-node one. Only the timeout ends it.
+
+    Everything before the solve is validated and runs: the gate, the region,
+    the cut, the driven set, the boundary-condition conflict check. Refusing
+    fast is better than a 15-minute timeout per rung.
+    """
+    eng, gid, res = solved
+    with pytest.raises(FeaError, match="submodel_interpolation_unavailable"):
+        eng.validation.fea_submodel(
+            gid, _case(), res, reason="the solver cannot interpolate yet",
+            feature_mm=4.0, standoff_elements=3.0,
+            standoff_source=STANDOFF_SRC, centre=(0.0, 0.0, 60.0),
+            ladder_steps=3)
+
+
+def test_the_refusal_still_reports_the_region_it_computed(solved):
+    """A refusal that discards its work makes the next attempt start over."""
+    eng, gid, res = solved
+    with pytest.raises(FeaError) as caught:
+        eng.validation.fea_submodel(
+            gid, _case(), res, reason="region should survive the refusal",
+            feature_mm=4.0, standoff_elements=3.0,
+            standoff_source=STANDOFF_SRC, centre=(0.0, 0.0, 60.0),
+            ladder_steps=3)
+    assert "44.0" in str(caught.value), "the z bounds of the cut, 44 to 76"
+
+
+def test_the_cheap_refusals_still_fire_before_the_solver_limitation(solved):
+    """Ordering. A region containing a load is wrong regardless of whether
+    the solver could interpolate, and must be reported as that - not masked
+    by the interpolation refusal behind it."""
+    eng, gid, res = solved
+    with pytest.raises(FeaError, match="already carried by the driven"):
+        eng.validation.fea_submodel(
+            gid, _case(), res, reason="load inside the region",
+            feature_mm=4.0, standoff_elements=3.0,
+            standoff_source=STANDOFF_SRC, centre=(0.0, 0.0, 118.0),
+            ladder_steps=3)
