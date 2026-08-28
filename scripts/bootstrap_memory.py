@@ -683,6 +683,52 @@ LATE = [
                  "Validation Philosophy", "Screened is not validated"]),
 
     MemoryEvent(
+        "The validator god-class was split, and proved unchanged by deck hash",
+        date="2026-08-28", type="Architecture", impact="Medium",
+        what_happened=(
+            "`ValidationTools` carried four near-identical pipelines. The "
+            "shared road - open action, validate, mesh, check restraint, "
+            "solve, close action - was extracted into `_action`, `_prepare`, "
+            "`_face_loads` and `_solve`, leaving each analysis with only its "
+            "deck fragment, parser and gate. Phase 1 of the Declared Couplings "
+            "proposal; Phase 2 is not implemented."),
+        why_it_matters=(
+            "Not for the line count, which barely moved: ~100 lines of shared "
+            "machinery replaced ~110 lines of copies. It matters because Track "
+            "B has more limit states to add, and each one previously cost "
+            "another ~150-line near-duplicate. It also surfaced a real gap - "
+            "buckling had been running through a raw subprocess.run and "
+            "recorded no memory measurement at all."),
+        decision=(
+            "A pure refactor of engineering code must be PROVED, not asserted. "
+            "The acceptance test was written first, against the unrefactored "
+            "code, and a numerical baseline was captured before any edit."),
+        evidence=[
+            "Observed — static deck SHA 1576da1aaea98b1d74b3 identical before "
+            "and after; a byte-identical solver input cannot behave differently",
+            "Observed — static, buckling and modal results identical to nine "
+            "decimal places, including all buckling factors and mode frequencies",
+            "Observed — 300 tests pass; 11 of them written before the refactor",
+            "Observed — duplicated call sites collapsed: open_action 4->1, "
+            "mesh_step 3->1, _solver_command 3->1",
+            "Observed — buckling now logs peak_rss_mb, measured at 36.7 MB"],
+        affected=["design_engine/fea.py", "tests/test_validation_pipeline.py"],
+        consequences=(
+            "One intentional behaviour change: buckling gained the memory "
+            "instrumentation every other analysis already had. Modal's check "
+            "ordering was preserved deliberately - it validates density before "
+            "looking for the solver, so a naive extraction would have changed "
+            "which error a caller sees on a machine without CalculiX."),
+        open_questions=(
+            "Phase 2 - validators declaring consumes/produces/invalidates so "
+            "coupling staleness is computed rather than remembered - is "
+            "proposed but not built. Two couplings remain silent: attached "
+            "mass never reaches the modal solve, and the modal result never "
+            "reaches the fatigue amplitude."),
+        related=["System Architecture", "Design Engine",
+                 "The jetpack frame resonates with its own engines"]),
+
+    MemoryEvent(
         "Fatigue is modelled, and aluminium's missing endurance limit is why",
         date="2026-08-28", type="Engineering", impact="Critical",
         what_happened=(
