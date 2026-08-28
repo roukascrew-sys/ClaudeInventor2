@@ -557,6 +557,15 @@ beyond plausible authority. Outboard-and-in-plane brings it to ~77 mm.
 - `P0031@v2` hand-built — 5.530 kg, FEA SF 5.274, ~257 °C headroom
 - `P0047@v1` searched — 3.901 kg, FEA SF 3.844, ~217 °C headroom
 
+**RESONANCE — the frame does not currently pass (2026-08-28).** Modal analysis
+puts mode 18 at 1639.4 Hz, **0.4% from the 1633.3 Hz shaft frequency** at
+98,000 rpm, with four modes inside the required 20% band. Above 900 Hz the mean
+mode spacing is 141 Hz against a 653 Hz band, so this is a modal-density
+property rather than one unlucky mode: adding the engine, fuel and pilot masses
+lowers every frequency AND the spacing, changing which modes clash rather than
+whether any do. SF 4.633 was computed assuming no mode was nearby.
+→ [[The jetpack frame resonates with its own engines]]
+
 **NOT covered:** propulsion, fuel systems and fire, fatigue at 98,000 rpm,
 exhaust plume mapping, attitude control, and any physical qualification.
 Those are what actually kill jetpack pilots.
@@ -1137,6 +1146,52 @@ Ranked #1 on [[Roadmap]].
 """, links=["Jetpack Frame Optimization Run", "Roadmap", "Jetpack Frame",
             "Peak stress at a sharp re-entrant corner cannot converge",
             "Solver memory bounds mesh refinement"])
+
+    v.write("05_Failures/Engineering_Failures",
+            "The jetpack frame resonates with its own engines",
+            type="failure", status="active", confidence="high",
+            extra={"severity": "critical", "failure_kind": "dynamics"}, body="""
+**Symptom:** the frame fails the `resonance_separation` gate. Mode 18 sits at
+1639.4 Hz against a 1633.3 Hz shaft frequency (98,000 rpm) — **0.4% away**,
+effectively exact resonance — with four of the first twenty modes inside the
+required 20% band.
+
+    mode 17   1494.4 Hz     8.5%
+    mode 18   1639.4 Hz     0.4%   <-- effectively exact
+    mode 19   1660.3 Hz     1.7%
+    mode 20   1668.5 Hz     2.2%
+
+**Why it was never seen:** the engine had no modal capability at all until
+2026-08-28. Every static result on this frame, [[Jetpack Frame]]'s validated
+SF 4.633 included, was computed on the unexamined assumption that no mode sat
+near the excitation. Nothing in the static solve could have revealed it, and no
+amount of mesh refinement would have either.
+
+**Why the caveat does not rescue it.** The run is the bare frame: it carries no
+engine, fuel or pilot mass, so the frequencies are an UPPER BOUND and the real
+structure sits lower. That does not help. Above 900 Hz the mean mode spacing is
+141 Hz and the ±20% band is 653 Hz wide, so **4.6 modes are expected in the band
+on spacing alone, and 4 were observed.** Adding mass lowers every frequency and
+the spacing with it — it changes *which* modes clash, not *whether* any do.
+This is a modal-density property of the structure, not one unlucky mode.
+
+**Consequence:** the static arithmetic is not wrong, but the load amplitude it
+was computed against is. A lightly damped aluminium weldment driven at
+resonance can see one to two orders of magnitude of amplification, which is a
+different regime from the one SF 4.633 describes.
+
+**Open, and genuinely unresolved:** whether this frame can be separated at all
+at this rpm. Stiffening moves modes up, added mass moves them down, and with
+this modal density both may simply relocate the clash. Isolation mounts or an
+rpm restriction may be the honest answers. Not yet determined.
+
+**Method note:** the modal chain is verified against a closed form — cantilever
+first bending 209.0 Hz vs 208.88 Hz analytic, +0.07% — which matters because a
+modal solve with the wrong mass units returns confident, plausible numbers
+wrong by a factor of a million.
+""", links=["Jetpack Frame", "Physical Realism Roadmap",
+            "Validation Philosophy", "Screened is not validated",
+            "Mesh convergence is unverified"])
 
     v.write("05_Failures/Engineering_Failures",
             "Peak stress at a sharp re-entrant corner cannot converge",

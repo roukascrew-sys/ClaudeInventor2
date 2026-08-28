@@ -152,11 +152,11 @@ intended, and it means the veto is inert today.
 **Status: TODO**
 
 ### B2 — Modal analysis and a resonance separation gate
-**Status: DONE** — commit `PENDING-B2`. The roadmap's "if only one thing gets
+**Status: DONE** — commit `a630ade`. The roadmap's "if only one thing gets
 done" item, and it immediately falsified an assumption underneath a validated
 result.
 
-| What | File | Line @ `PENDING-B2` |
+| What | File | Line @ `a630ade` |
 |---|---|---|
 | `density_kg_m3` accepted as an FEA material key | `design_engine/fea.py` | 58 |
 | `excitation_hz` / `harmonics` limit-state keys | `design_engine/fea.py` | 62 |

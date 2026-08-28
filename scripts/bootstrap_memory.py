@@ -632,6 +632,57 @@ LATE = [
                  "Mesh convergence is unverified"]),
 
     MemoryEvent(
+        "The jetpack frame resonates with its own engines",
+        date="2026-08-28", type="Engineering", impact="Critical",
+        what_happened=(
+            "Modal analysis was added (`fea_modal`, limit state "
+            "`resonance_separation`) and run on P0048@v1 against the JetCat "
+            "P400-PRO shaft frequency of 1633.3 Hz at 98,000 rpm. Four of the "
+            "first 20 modes fall inside the required 20% separation band, and "
+            "mode 18 at 1639.4 Hz sits 0.4% from the excitation -- effectively "
+            "exact resonance."),
+        why_it_matters=(
+            "Every static result on this frame, including the validated "
+            "SF 4.633, was computed on the unexamined assumption that no mode "
+            "sits near the excitation. That assumption is now false. The "
+            "static arithmetic is not wrong, but the load amplitude it was "
+            "computed against is: a lightly damped aluminium weldment driven "
+            "at resonance can see one to two orders of magnitude of "
+            "amplification, and no amount of mesh refinement would have "
+            "revealed it."),
+        decision=(
+            "Resonance separation is a named limit state and the frame does "
+            "not currently pass it. The design needs stiffening, mass "
+            "redistribution, an rpm restriction, or isolation mounts -- and "
+            "which of those is right is not yet determined."),
+        evidence=[
+            "Observed — 20 modes from 28.0 to 1668.5 Hz; modes 17-20 at "
+            "1494.4 / 1639.4 / 1660.3 / 1668.5 Hz clash with the 1633.3 Hz "
+            "fundamental",
+            "Calculated — above 900 Hz the mean mode spacing is 141 Hz against "
+            "a 653 Hz band, so 4.6 modes are EXPECTED in the band on spacing "
+            "alone and 4 were observed",
+            "Calculated — the modal chain is verified against Euler-Bernoulli: "
+            "cantilever 1st bending 209.0 Hz vs 208.88 analytic, +0.07%",
+            "Observed — 270 tests pass, 16 of them new"],
+        affected=["design_engine/fea.py", "designs/jetpack_modal_run.py",
+                  "Jetpack Frame"],
+        consequences=(
+            "The bare-frame caveat does NOT rescue the result. The run carries "
+            "no engine, fuel or pilot mass, so the frequencies are an upper "
+            "bound and the real structure sits lower -- but adding mass lowers "
+            "the spacing along with the frequencies, so it changes which modes "
+            "clash rather than whether any do. This is a modal-density "
+            "property of the structure."),
+        open_questions=(
+            "Whether the frame can be separated at all at this rpm, or whether "
+            "isolation mounts or an rpm restriction are required. The engine, "
+            "fuel and pilot masses are not yet carried in the modal deck, so "
+            "the true frequencies are Unknown -- only bounded above."),
+        related=["Jetpack Frame", "Physical Realism Roadmap",
+                 "Validation Philosophy", "Screened is not validated"]),
+
+    MemoryEvent(
         "Geometric singularities are now detected, and the fillet is a 2D fix",
         date="2026-08-27", type="Engineering", impact="Critical",
         what_happened=(
