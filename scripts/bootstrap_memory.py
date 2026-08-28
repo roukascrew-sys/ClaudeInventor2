@@ -1080,6 +1080,73 @@ LATE = [
             "Whether newest-first ordering stays readable as the document grows. "
             "If it does not, the fix is a derived index, not a second file."),
         related=["Project Memory", "Home", "The knowledge layer is stdlib-only"]),
+
+    _mem.MemoryEvent(
+        "The engine already measures what the literature says to decide on",
+        type="Research", impact="High", date="2026-08-28",
+        what_happened=(
+            "Seven papers on multi-fidelity optimisation, Bayesian "
+            "optimisation, pool-based active learning, reliability-based "
+            "robust design, goal-oriented adaptive FEM and ML topology "
+            "optimisation were read and mapped onto this codebase. The "
+            "expected output was a list of capabilities to build. The actual "
+            "result was that the highest-value items are wiring, not "
+            "algorithms: three quantities the papers say a solve decision "
+            "should key on are already computed here, tested, and consumed by "
+            "nothing outside the test suite."),
+        why_it_matters=(
+            "It changes what the research roadmap is for. A gap between "
+            "MEASURING a quantity and CONSUMING it looks identical, from "
+            "outside the code, to a missing feature — so it attracts "
+            "estimates sized for new development and gets deferred. Reading "
+            "the papers was worth it mostly because it named the decisions "
+            "these existing measurements were supposed to serve."),
+        decision=(
+            "No production code changed in this pass, deliberately. The "
+            "output is vault knowledge and a prioritised list. Activating the "
+            "L2 coarse-FEA rung ranks first because `FeaStage.__init__` "
+            "already accepts `fidelity` and `mesh_mm` and its docstring "
+            "already says L2/L3 — it is a configuration change."),
+        evidence=[
+            "Observed — `KnowledgeBase.correction()` (knowledge.py:279) has no "
+            "caller outside tests/test_inventor_knowledge.py; grepped "
+            "2026-08-28.",
+            "Observed — `predict_solve()` (knowledge.py:434) is consumed only "
+            "by `affordable()` (knowledge.py:533), which itself has no caller "
+            "outside tests. The chain terminates in the test suite.",
+            "Observed — `Fidelity.L2_COARSE_FEA` (candidate.py:32) appears in "
+            "one test fixture (test_inventor_search.py:376) and nowhere in "
+            "production code.",
+            "Observed — 13 principle notes written to the vault; 68 notes "
+            "total, zero broken links; 345 tests pass.",
+            "Inferred — the L1 to L3 jump is why a 76-96% screening error "
+            "survived to shape a Pareto frontier: with no rung in between, "
+            "the surrogate's error is never observable at a price worth "
+            "paying.",
+            "Unknown — whether activating L2 actually improves screening "
+            "accuracy here. Nothing has measured the L2-to-L3 correlation on "
+            "this geometry, and an uncorrelated rung is worse than none."],
+        affected=["design_engine/inventor/knowledge.py",
+                  "design_engine/inventor/candidate.py",
+                  "scripts/bootstrap_research.py"],
+        consequences=(
+            "Three of the thirteen principles are cross-paper syntheses that "
+            "appear in no single source, and are labelled as inference in the "
+            "note frontmatter rather than presented as sourced fact. One of "
+            "them — that goal-oriented adaptivity cannot terminate on a "
+            "singular goal functional — blocks the obvious fix for the mesh "
+            "convergence blocker, so it is worth knowing before that work "
+            "starts rather than after."),
+        open_questions=(
+            "Whether the L2-to-L3 rank correlation on this frame is strong "
+            "enough for L2 to be allowed to steer promotion order. Until it "
+            "is measured, L2 may screen but must not rank."),
+        related=["Multi Fidelity Evaluation",
+                 "The skip threshold must be derived from measured error",
+                 "Check what the engine already measures before adding",
+                 "A method with no refusal path does not belong in this engine",
+                 "Adaptivity cannot rescue a singular goal",
+                 "Screening models are optimistic in the unsafe direction"]),
 ]
 
 

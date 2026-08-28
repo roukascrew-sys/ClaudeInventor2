@@ -12,6 +12,17 @@ forking duplicates, so running this again after more work refreshes the graph
 instead of littering it.
 
     .venv\\Scripts\\python.exe scripts\\bootstrap_vault.py [--root PATH]
+
+RUN ORDER MATTERS: this script FIRST, then `bootstrap_research.py`.
+
+Two notes — `Multi Fidelity Evaluation` and
+`Screening models need automatic calibration` — are written by BOTH scripts.
+This one writes the base version so a vault-only run has no dangling links;
+`bootstrap_research.py` then rewrites them as supersets with the 2026-08-28
+research findings appended. Running this script LAST silently reverts those
+additions, because `Vault.write` replaces a note wholesale rather than merging.
+The Roadmap here also links forward to notes that only `bootstrap_research.py`
+creates, so a vault-only run reports those as broken until it is run.
 """
 
 import argparse
@@ -106,6 +117,12 @@ truth; this vault is reasoning truth — why the system works the way it does.
 - [[Roadmap]] — what is worth doing next, ranked by evidence
 - [[Open Questions]] — what we do not know
 
+## Research
+- [[Research Knowledge Graph]] — paper to concept to subsystem, and a
+  translation for names this vault does not use
+- [[Research Questions Answered]] — arrive with a question, start here
+- [[ClaudeInventor Research Synthesis]] · [[Research-Derived Improvements]]
+
 ## Architecture
 - [[System Architecture]] · [[Design Engine]] · [[Optimization Engine]]
 - [[Architecture Decisions]]
@@ -159,17 +176,141 @@ mechanism of the original failure is still unknown.
 Ranked by expected impact, from measured evidence rather than a wishlist.
 Full reasoning in the linked notes.
 
-1. **Verify mesh convergence** — the headline SF 3.844 was computed at one
-   mesh size and never checked. [[Mesh convergence is unverified]]
-2. **Use the L2 coarse-FEA rung** — screening jumps L1 to L3, which is why a
-   76% model error survived to the frontier. [[Multi Fidelity Evaluation]]
-3. **Make FEA parallelisable** — it is 97% of wall time and runs serial.
-   [[Solver runs cannot be parallelised]]
-4. **Automate model calibration** — currently a human reads FEA results and
-   edits a constant. [[Screening models need automatic calibration]]
-5. **Recover from solver timeouts** — [[Solver timeout wastes the full budget]]
-6. **Extend search to the system level** — only the frame is searched today.
-""", links=["Current State", "Open Questions"])
+Revised 2026-08-28 after a seven-paper research pass. The ranking changed less
+than the **structure** did: the top item is no longer a thing to attempt but a
+chain with a stated route, and several items turned out to be smaller than
+their old descriptions implied. Detail in
+[[Research-Derived Improvements]]; the reasoning is in
+[[ClaudeInventor Research Synthesis]].
+
+*Research supplied evidence and options, not mandates. Items below are labelled
+for what is actually known: **Established by source**, **Supported inference**,
+**Recommended design direction**, or **Not yet validated in ClaudeInventor**.
+No experimental percentage from a paper is repeated here as a promised result.*
+
+---
+
+## NOW
+
+*No prerequisites. Each is small, and each unblocks something else.*
+
+1. **Refuse refinement on a singular peak.** A hard precondition in code, not a
+   step to remember: if `classify_peak()` returns SINGULAR, refuse and return
+   UNKNOWN naming the edge. At a re-entrant corner peak stress is unbounded, so
+   a refinement loop never terminates while reporting steady progress.
+   *Supported inference* — the join between the adaptive-FEM literature and
+   this project's own singularity result appears in neither alone.
+   → [[Adaptivity cannot rescue a singular goal]],
+   [[Peak stress at a sharp re-entrant corner cannot converge]]
+
+2. **Back-fill the calibration table.** `calibrations` holds **0 rows**, so
+   `correction()` returns `None` regardless of who calls it — the producer has
+   never run either. Meanwhile 13 (predicted, measured) pairs sit in
+   `observations.reason` as prose. The engine measured its own screen error 13
+   times and stored it where no code can read it.
+   *Observed* — checked against `data/knowledge.sqlite` on 2026-08-28.
+   → [[Check what the engine already measures before adding]],
+   [[Screening models need automatic calibration]]
+
+3. **Perturb the sourced HAZ range.** The frame's verdict depends on where in
+   `rho_o,haz` in [0.375, 0.50] the truth lies, and it fails its own 3.0 gate
+   across that whole range. One value was chosen; the answer belongs to the
+   range. `robustness()` already exists — the blocker is that the factor is a
+   module constant in the design script, so no perturbation can reach it.
+   *Observed* for the range; *Recommended design direction* for the fix.
+   → [[Deterministic feasibility is not feasibility under uncertainty]],
+   [[Every safety factor used a strength the joints do not have]]
+
+## NEXT
+
+*Depends only on a NOW item, or is the route to the largest blocker.*
+
+4. **Submodel the junction** — the route to mesh convergence, which is still
+   the most important unanswered question here. Coarse global solve, then
+   re-solve a small region around the junction with displacements as boundary
+   conditions. No dual problem and no error estimator: a driver.
+   **Gated on item 1** — running this on a singular peak wastes the budget.
+   *Established by source* that local goals do not need global resolution;
+   *Not yet validated in ClaudeInventor*.
+   → [[Refine where the question is, not everywhere]],
+   [[Mesh convergence is unverified]]
+
+5. **Activate the L2 coarse-FEA rung.** Screening jumps L1 to L3 across six
+   orders of magnitude, which is how a 76% model error survived to the
+   frontier. `FeaStage.__init__` already accepts `fidelity` and `mesh_mm` — a
+   **configuration change, not new code**. Its value is not saved time; it is
+   that L2 is the rung where surrogate error becomes observable at a price
+   worth paying. Watch for [[Meshing is non-monotonic]].
+   → [[Multi Fidelity Evaluation]]
+
+6. **Make solver runs parallelisable.** Still 97% of wall time and strictly
+   serial. The fix is small and additive: `check_same_thread=False` plus an
+   explicit lock on log writes, and a counter for part-number allocation.
+   Unchanged by the research pass and unrelated to it.
+   → [[Solver runs cannot be parallelised]]
+
+7. **Consume the cost model.** `predict_solve()` fits solve time from 39 real
+   runs and feeds `affordable()`, which has no caller outside tests. Order
+   promotion by information per second instead of screened rank. Testable by
+   replaying a past run's candidate set — **no new solver time required**.
+   *Observed* that it is unconsumed; *Recommended design direction* for the fix.
+   → [[Simulation cost depends on the design]]
+
+## LATER
+
+*Blocked on a NEXT item, or larger than it looks.*
+
+8. **Wire the skip gate** `delta = c * eps_M`. Needs items 2 and 5 for the
+   error measurement, and needs mesh convergence first, because a correction
+   fitted to an unconverged reference launders discretisation error into the
+   screen permanently. → [[The skip threshold must be derived from measured error]],
+   [[Calibrate only against converged results]]
+
+9. **Measure whether the screen may rank.** Kendall's tau between screened and
+   measured values. **Not computable today** — the jetpack family has
+   effectively two distinct points with three exact ties, and tau on n = 2 is
+   meaningless. Becomes possible once item 5 populates the table.
+   → [[A weakly correlated cheap model is worse than none]],
+   [[One seed is an anecdote]]
+
+10. **Recover from solver timeouts** — [[Solver timeout wastes the full budget]]
+
+11. **Load-case layer, then selection by information value.** Once load cases
+    are enumerated they form exactly the enumerable pool active learning needs.
+    The source paper supplies its own limit and it binds here: *"If no error
+    can be tolerated, such as in a critical validation phase, all simulations
+    must be run."* Sparse sampling for the picture; exhaustive near limit
+    states. → [[Select simulations for information value, not predicted performance]]
+
+12. **Extend search to the system level** — only the frame is searched today.
+
+## RESEARCH
+
+*Options with evidence behind them. **Not commitments.** Listed so a future
+session knows they were considered and on what grounds, rather than
+rediscovering them.*
+
+- **AR1 / co-Kriging multi-fidelity surrogates.** Genuinely attractive;
+  currently unusable. Needs nested designs and converged high-fidelity points
+  to fit a discrepancy term. Gated on mesh convergence.
+- **Full goal-oriented adaptive FEM.** Proven optimal in total computational
+  cost, but assumes a contractive iterative solver. CalculiX here runs a
+  single-threaded direct solve, so the cost model does not describe this
+  engine. Submodelling (item 4) is the affordable subset.
+- **Multi-fidelity Bayesian optimisation.** *Not recommended wholesale.* It
+  assumes the surrogate is accurate enough to establish **feasibility** — the
+  exact thing this engine exists to decide. Acceptable for search, not for a
+  gate. Worth taking piecemeal: treating *where to sample* and *at what
+  fidelity* as one cost-priced decision.
+- **ML topology optimisation.** *Not recommended.* Most reviewed methods
+  cannot handle 3D at all, and none can decline to answer.
+  → [[A method with no refusal path does not belong in this engine]]
+- **Classical SIMP topology optimisation.** Open, and a different proposition:
+  it iterates against a real FEA and could be judged by the existing
+  limit-state machinery. Not evaluated in this pass.
+  → [[The engine decides, the optimiser proposes]]
+""", links=["Current State", "Open Questions", "Research-Derived Improvements",
+            "ClaudeInventor Research Synthesis"])
 
     v.write("00_Home", "Open Questions", type="open-question", confidence="unknown",
             body="""
@@ -477,7 +618,7 @@ nicety here; it is the only reason search is possible at all.
 **The L2 rung is defined but unused, and that is a real gap.** Screening jumps
 L1 → L3, which is how a 76% model error survived long enough to shape an
 entire Pareto frontier. A coarse 8-second rung would have exposed it after a
-handful of solves. Ranked #2 on [[Roadmap]].
+handful of solves. In the [[Roadmap]] NEXT section.
 """, links=["Design Engine", "Optimization Engine", "Roadmap",
             "Screening models are optimistic in the unsafe direction"])
 
@@ -987,7 +1128,9 @@ log writes, and a lock (or a monotonic counter) around part-number allocation.
 Both are small, additive and testable — but must not be attempted while the
 CAD kernel is blocked, because they cannot be verified.
 
-Ranked #3 on [[Roadmap]].
+In the [[Roadmap]] NEXT section, and unchanged by the 2026-08-28 research
+pass — this constraint is local to the engine, not something the literature
+has an opinion about.
 """, links=["Roadmap", "Design Engine", "Optimization Engine"])
 
     v.write("04_Optimization/Surrogates", "Screening models need automatic calibration",
@@ -1015,7 +1158,9 @@ on a T-junction beam must not silently be applied to a pressure vessel. The
 `problem` field exists for this and is currently set by the caller, which is a
 weak guarantee.
 
-Ranked #4 on [[Roadmap]].
+On the [[Roadmap]]: back-filling the pairs is NOW, wiring the gate onto them
+is LATER, because a gate calibrated against unconverged references is worse
+than no gate.
 """, links=["Roadmap", "Engineering Knowledge Base",
             "Screening models are optimistic in the unsafe direction"])
 
@@ -1269,7 +1414,9 @@ The refinement runs also hit a second, independent wall: 2.8 mm (504k nodes)
 crashed the solver at a 6.1 GB working set on a machine with 1.3 GB free.
 → [[Solver memory bounds mesh refinement]]
 
-Ranked #1 on [[Roadmap]].
+On the [[Roadmap]] this is still the most important unanswered question, but
+it is no longer an item to attempt directly: the route now runs through the
+singular-peak refusal (NOW) and then submodelling (NEXT).
 """, links=["Jetpack Frame Optimization Run", "Roadmap", "Jetpack Frame",
             "Peak stress at a sharp re-entrant corner cannot converge",
             "Solver memory bounds mesh refinement"])
@@ -1524,6 +1671,9 @@ def main() -> int:
             print(f"    {src} -> {target}")
     else:
         print("  broken links : none")
+    print("\n  NEXT: .venv\\Scripts\\python.exe scripts\\bootstrap_research.py")
+    print("  (it owns the research layer and rewrites two notes this script"
+          " also writes;\n   running THIS script last would revert them)")
     return 0
 
 
