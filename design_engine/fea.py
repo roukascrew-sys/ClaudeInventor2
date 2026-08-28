@@ -41,6 +41,7 @@ from .mesh import (MeshError, describe_axis_options, mesh_step,
 from .parts import PartStore, _check_reason
 from .geometry import build as build_solid
 from .singularity import classify_peak
+from .fatigue import SNCurve, stress_range_from_ratio
 
 
 class FeaError(RuntimeError):
@@ -49,6 +50,7 @@ class FeaError(RuntimeError):
 
 _CASE_KEYS = {"material", "mesh", "constraints", "loads", "limit_state"}
 _MATERIAL_KEYS = {"name", "E_MPa", "nu", "yield_MPa", "source",
+                  "fatigue",
                   "service_temp_C", "yield_derate_curve", "E_derate_curve",
                   "derate_source",
                   # Only a modal solve needs it (the mass matrix). A static
@@ -59,7 +61,8 @@ _MATERIAL_KEYS = {"name", "E_MPa", "nu", "yield_MPa", "source",
 _MESH_KEYS = {"max_size_mm", "min_size_mm"}
 _CONSTRAINT_KEYS = {"where", "dof"}
 _LOAD_KEYS = {"where", "force_total_N"}
-_LIMIT_KEYS = {"name", "required_SF", "excitation_hz", "harmonics"}
+_LIMIT_KEYS = {"name", "required_SF", "excitation_hz", "harmonics",
+               "required_cycles", "stress_ratio_R"}
 
 
 def _reject_extra(d: dict, allowed: set, ctx: str) -> None:
@@ -237,7 +240,8 @@ def validate_case(case: dict) -> None:
     ls = case["limit_state"]
     _reject_extra(ls, _LIMIT_KEYS, "case.limit_state")
     allowed_states = ("yield_von_mises", "elastic_buckling",
-                      "thermal_derated_yield", "resonance_separation")
+                      "thermal_derated_yield", "resonance_separation",
+                      "fatigue_life")
     if ls.get("name") not in allowed_states:
         raise FeaError(
             f"case.limit_state.name: must be one of {allowed_states}, got "
@@ -981,6 +985,143 @@ class ValidationTools:
                 "failure_id": None if passed else action_id,
                 "safety_factor": lowest, "buckling_factors": factors,
                 "scaling_ratio": ratio}
+
+    def fea_fatigue(self, geometry_id: str, case: dict, reason: str) -> dict:
+        """Fatigue life against the fatigue_life limit state.
+
+        Runs a static stress solve, then evaluates life on a SOURCED S-N curve.
+        The static run is logged in its own right and this action links to it,
+        so the stress the life was computed from is always recoverable.
+
+        WHY THIS MATTERS MORE THAN THE STATIC CHECK. Life goes as the stress
+        range to the power of the curve slope — around 3.4 for welded
+        aluminium — so a 20% error in peak stress is a factor of 1.8 in life.
+        Static strength tolerates a sloppy peak; fatigue does not.
+
+        Which is why a peak sitting on a geometric singularity is REFUSED here
+        rather than warned about. At a re-entrant corner the peak is unbounded,
+        so the computed life tends to zero as the mesh refines: the answer
+        would not be conservative, it would be meaningless.
+        """
+        ls = case.get("limit_state", {})
+        if ls.get("name") != "fatigue_life":
+            raise FeaError(
+                f"fea_fatigue requires limit_state 'fatigue_life', got "
+                f"{ls.get('name')!r}")
+        for key in ("required_cycles", "stress_ratio_R"):
+            if key not in ls:
+                raise FeaError(
+                    f"case.limit_state.{key}: required. A fatigue life is "
+                    f"meaningless without the number of cycles demanded and "
+                    f"the shape of the cycle (R = sigma_min/sigma_max); this "
+                    f"engine will not assume either")
+        fat = case["material"].get("fatigue")
+        if not isinstance(fat, dict):
+            raise FeaError(
+                "case.material.fatigue: required — an S-N curve with its "
+                "detail category, slope, endurance limit and source. Static "
+                "material data says nothing about life under cycling")
+
+        # Build the stress solve. The fatigue gate is applied here, not there,
+        # so the sub-run is asked only for a stress field.
+        static_case = json.loads(json.dumps(
+            {k: v for k, v in case.items() if k != "limit_state"}))
+        static_case["material"].pop("fatigue", None)
+        static_case["limit_state"] = {
+            "name": "thermal_derated_yield" if (
+                case["material"].get("service_temp_C") is not None
+                and case["material"].get("yield_derate_curve"))
+            else "yield_von_mises",
+            "required_SF": 1.0}
+
+        action_id = self.log.open_action(
+            "validation", "fea_fatigue", geometry_version=str(geometry_id),
+            reason=str(reason))
+        try:
+            _check_reason(reason)
+            curve = SNCurve(
+                name=fat.get("name", case["material"]["name"]),
+                detail_category_MPa=fat["detail_category_MPa"],
+                slope_m=fat["slope_m"],
+                source=fat.get("source", ""),
+                reference_cycles=fat.get("reference_cycles", 2e6),
+                endurance_limit_MPa=fat["endurance_limit_MPa"]
+                if "endurance_limit_MPa" in fat else ...,
+                valid_cycles=tuple(fat.get("valid_cycles", (1e4, 1e8))))
+
+            static = self.fea_static(
+                geometry_id, static_case,
+                reason=f"stress field for fatigue life: {reason}")
+            self.log._conn.execute(
+                "UPDATE actions SET linked_parent_id = ? WHERE id = ?",
+                (static["action_id"], action_id))
+            self.log._conn.commit()
+
+            sing = static.get("singularity") or {}
+            if sing.get("verdict") == "singular":
+                raise FeaError(
+                    f"singular_peak: the peak stress sits on a geometric "
+                    f"singularity, so a fatigue life computed from it is "
+                    f"meaningless rather than conservative — life goes as "
+                    f"range**-{curve.slope_m:g}, and an unbounded range drives "
+                    f"predicted life to zero as the mesh refines. "
+                    f"{sing.get('reason', '')}")
+
+            peak = float(static["max_von_mises_MPa"])
+            R = float(ls["stress_ratio_R"])
+            rng = stress_range_from_ratio(peak, R)
+            required_cycles = float(ls["required_cycles"])
+            allowable = curve.allowable_cycles(rng)
+            sf = (math.inf if allowable == math.inf
+                  else allowable / required_cycles)
+            required_sf = float(ls.get("required_SF", 1.0))
+
+            details = {
+                "limit_state": "fatigue_life",
+                "required_SF": required_sf,
+                "safety_factor": ("inf" if sf == math.inf else round(sf, 6)),
+                "peak_von_mises_MPa": round(peak, 6),
+                "stress_ratio_R": R,
+                "stress_range_MPa": round(rng, 6),
+                "required_cycles": required_cycles,
+                "allowable_cycles": ("inf" if allowable == math.inf
+                                     else round(allowable, 1)),
+                "allowable_range_at_required_life_MPa": round(
+                    curve.allowable_range(required_cycles), 6),
+                "curve": curve.to_dict(),
+                "static_action_id": static["action_id"],
+                "singularity": sing,
+                "material": case["material"],
+            }
+            passed = sf >= required_sf
+        except Exception as exc:
+            self.log.close_action(
+                action_id, "fail", failure_mode=f"{type(exc).__name__}: {exc}")
+            raise
+
+        if passed:
+            self.log.close_action(action_id, "pass", details=details)
+        else:
+            self.log.close_action(
+                action_id, "fail", details=details,
+                failure_mode=(
+                    f"fatigue_life: {details['allowable_cycles']} allowable "
+                    f"cycles at a {rng:.1f} MPa range against "
+                    f"{required_cycles:.4g} required (SF "
+                    f"{details['safety_factor']} < {required_sf}). The "
+                    f"structure survives "
+                    f"{curve.allowable_range(required_cycles):.1f} MPa at that "
+                    f"life"))
+        return {"result": "pass" if passed else "fail",
+                "action_id": action_id,
+                "failure_id": None if passed else action_id,
+                "safety_factor": sf,
+                "stress_range_MPa": rng,
+                "allowable_cycles": allowable,
+                "required_cycles": required_cycles,
+                "allowable_range_at_required_life_MPa":
+                    curve.allowable_range(required_cycles),
+                "static_action_id": static["action_id"]}
 
     def fea_modal(self, geometry_id: str, case: dict, reason: str,
                   n_modes: int = 10) -> dict:

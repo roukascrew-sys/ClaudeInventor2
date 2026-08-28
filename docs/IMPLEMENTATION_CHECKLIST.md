@@ -149,7 +149,47 @@ intended, and it means the veto is inert today.
 ## Track B · Real failure modes
 
 ### B1 — Fatigue as a named limit state
-**Status: TODO**
+**Status: DONE** — commit `PENDING-B1`.
+
+| What | File | Line @ `PENDING-B1` |
+|---|---|---|
+| `FatigueError` | `design_engine/fatigue.py` | 45 |
+| `SNCurve` — sourced, no defaulted endurance limit | `design_engine/fatigue.py` | 49 |
+| `allowable_cycles()` — refuses extrapolation both ways | `design_engine/fatigue.py` | 94 |
+| `allowable_range()` — the inverse, usually more useful | `design_engine/fatigue.py` | 125 |
+| `cycles_from_exposure()` | `design_engine/fatigue.py` | 144 |
+| `miner_damage()` — names its own limitation | `design_engine/fatigue.py` | 157 |
+| `stress_range_from_ratio()` | `design_engine/fatigue.py` | 193 |
+| `fea_fatigue()` | `design_engine/fea.py` | 989 |
+| `fatigue_life` accepted limit state | `design_engine/fea.py` | 244 |
+| `fatigue` accepted material key | `design_engine/fea.py` | 53 |
+| Tests (19) | `tests/test_fatigue.py` | whole file |
+
+**The fact the module is built around:** ferritic steels have an endurance
+limit; **aluminium does not.** Its S-N curve keeps descending, so there is no
+range at which an aluminium frame lasts forever — only one at which it lasts
+long enough. `endurance_limit_MPa` therefore has **no default** and must be
+stated, including as `None`. Defaulting it silently decides whether the part
+can survive indefinitely.
+
+Detail-category *values* are deliberately **not** embedded. The curve shape
+follows EN 1999-1-3 / EN 1993-1-9, but the category depends on joint geometry
+and a wrong one is worse than an absent one, so the caller supplies it with its
+source — the same rule already applied to `E`, `yield` and the derating curves.
+
+**Composes with A2:** a peak on a geometric singularity is **refused**, not
+scored. Life goes as range^−m (≈3.4 for welded aluminium), so an unbounded peak
+drives predicted life to zero as the mesh refines — meaningless, not
+conservative. Verified: a sharp T-junction is refused with the singularity's own
+reason attached.
+
+**Composes with B2:** `cycles_from_exposure(1633.3, 1) = 5,879,880`. That is
+why resonance is a structural problem and not a comfort one — an hour at the
+shaft frequency is 5.88 million cycles, and ten minutes is a million.
+
+**Not yet answered, and recorded as unknown:** the alternating stress amplitude
+at resonance depends on damping, which this project has never measured. The
+engine computes life *from* a range and refuses to invent one.
 
 ### B2 — Modal analysis and a resonance separation gate
 **Status: DONE** — commit `a630ade`. The roadmap's "if only one thing gets
