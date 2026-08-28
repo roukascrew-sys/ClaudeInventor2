@@ -323,7 +323,7 @@ density checks *between* `validate_case` and the solver-presence check. Calling
 sees on a machine with no solver. `test_validation_pipeline` pins the order.
 
 ### R2 — Declare facts, resolve the graph (Declared Couplings, Phase 2)
-**Status: DONE** — commit `PENDING-R2`. Additive; every existing stage is
+**Status: DONE** — commit `7587131`. Additive; every existing stage is
 untouched and 69 pre-existing inventor tests pass unchanged.
 
 | What | File |
