@@ -37,12 +37,12 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import signal
 import subprocess
 import tempfile
 from pathlib import Path
 
 from .log import ActionLog
+from .proc import kill_tree
 from .parts import PartStore, _check_reason
 
 WORKER = Path(__file__).parent / "chrono_worker.py"
@@ -139,35 +139,6 @@ def chrono_available(env: str = DEFAULT_ENV) -> tuple[bool, str]:
     if not py.is_file():
         return False, f"conda env {env!r} has no interpreter at {py}"
     return True, str(envdir)
-
-
-def kill_tree(proc: subprocess.Popen, grace: float = 10.0) -> None:
-    """Kill `proc` *and everything it spawned*, then reap within `grace`.
-
-    `Popen.kill()` on Windows is TerminateProcess on one handle: a grandchild
-    is untouched and keeps running. That is not hypothetical here — the whole
-    reason this function exists is that a worker which outlives its parent
-    also outlives the deadline it was given.
-    """
-    if proc.poll() is not None:
-        return
-    try:
-        if os.name == "nt":
-            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
-                           capture_output=True, timeout=grace)
-        else:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except (OSError, subprocess.SubprocessError):
-        pass
-    for _ in range(2):
-        try:
-            proc.wait(timeout=grace)
-            return
-        except subprocess.TimeoutExpired:
-            try:
-                proc.kill()
-            except OSError:
-                pass
 
 
 def run_worker(cmd: list[str], env: dict, timeout_s: float,

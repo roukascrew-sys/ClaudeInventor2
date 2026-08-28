@@ -37,6 +37,7 @@ from pathlib import Path
 import numpy as np
 
 from .log import ActionLog
+from .proc import REAP_GRACE_S, kill_tree, new_session_kwargs
 from .mesh import (MeshError, describe_axis_options, mesh_step,
                    select_nodes)
 from .parts import PartStore, _check_reason
@@ -693,20 +694,42 @@ def _run_solver(cmd, cwd, env, timeout_s: int) -> _SolverRun:
     limit. The learned cost model predicts TIME, so `affordable()` cheerfully
     returned `yes` for a solve that could not physically run. Time was never
     the binding constraint on that machine; memory was, and it was invisible.
+
+    The timeout path kills the TREE and bounds the reap. `Popen.kill()` on
+    Windows is `TerminateProcess` on one handle, and a post-kill
+    `communicate()` with NO timeout blocks until every process still holding
+    the inherited stdout/stderr pipe write handles has exited - so a single
+    surviving grandchild holds this function open indefinitely, deadline or
+    no deadline. That is measured, not theorised: the same shape cost the
+    Chrono bridge a ~1341 s overshoot on a 900 s deadline on 2026-08-28.
+
+    Today the CalculiX binaries spawn nothing - verified on the shipped
+    2.23.0 win-x64 build, whose import tables contain no process-creation
+    API at all (`tests/test_solver_timeout.py` pins that) - so this is
+    insurance, not a live bug fix. The insurance is worth its four lines
+    because the invariant belongs to the *binary*, not to this code: point
+    `ccx_path` at a .bat wrapper, or ship a solver that shells out to a
+    licence server, and the unbounded wait is back with nothing to catch it.
     """
     proc = subprocess.Popen(cmd, cwd=cwd, env=env, text=True,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            **new_session_kwargs())
     try:
         stdout, stderr = proc.communicate(timeout=timeout_s)
     except subprocess.TimeoutExpired:
         # Read the peak BEFORE killing: a timeout at 6 GB and a timeout at
         # 500 MB are different failures and want different remedies.
         peak = _peak_rss_mb(proc)
-        proc.kill()
-        proc.communicate()
+        kill_tree(proc)
+        try:
+            proc.communicate(timeout=REAP_GRACE_S)
+        except subprocess.TimeoutExpired:
+            # Something outlived the tree kill and still holds the pipes.
+            # Abandoning the reap loses the solver's output, which was
+            # already lost - the run timed out. Waiting for it loses the
+            # deadline too, which is the failure this guards against.
+            pass
         raise subprocess.TimeoutExpired(cmd, timeout_s) from None
-    finally:
-        pass
     return _SolverRun(proc.returncode, stdout or "", stderr or "",
                       _peak_rss_mb(proc))
 
