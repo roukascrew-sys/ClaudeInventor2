@@ -41,7 +41,7 @@ attempt can predict the wall instead of discovering it.
 ---
 
 ### A2 — Automatic detection of geometric stress singularities
-**Status: DONE** — commit `PENDING-A2`.
+**Status: DONE** — commit `26fcb74`.
 
 The gap this closes: the stress-outlier heuristic detects peaks pinned to a
 *constraint* patch and reads them as artifacts. It cannot see a **geometric**
@@ -50,7 +50,7 @@ surrounding field rather than decoupled from it. `P0047@v1` read 1.633 —
 comfortably "clean" — while its peak sat 1.28 mm off a 270° material corner
 where linear elasticity has no finite stress at all.
 
-| What | File | Line @ `PENDING-A2` |
+| What | File | Line @ `26fcb74` |
 |---|---|---|
 | `TANGENT_TOL_DEG` — blend vs edge threshold | `design_engine/singularity.py` | 52 |
 | `DEFAULT_RADIUS_ELEMENTS` — search radius | `design_engine/singularity.py` | 57 |
