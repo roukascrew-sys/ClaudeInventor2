@@ -1030,7 +1030,7 @@ Ranked #4 on [[Roadmap]].
     v.write("05_Failures/Engineering_Failures",
             "Every safety factor used a strength the joints do not have",
             type="failure", status="active", confidence="high",
-            extra={"severity": "high", "failure_kind": "modelling"}, body="""
+            extra={"severity": "critical", "failure_kind": "modelling"}, body="""
 **Symptom:** the jetpack frame is described everywhere as a *welded* weldment,
 and every safety factor ever computed for it — including the validated
 SF 4.633 — used the **parent-metal** allowable, 276 MPa for 6061-T6511 taken
@@ -1055,10 +1055,34 @@ from the truth.
 **Calculated:** at a 0.5 softening factor the filleted frame's SF 4.633 becomes
 2.317 — below its own 3.0 gate.
 
-**Unknown, and this is the honest limit:** the actual rho_o,haz for 6061-T6511
-MIG at this thickness has not been sourced. **2.317 is a sensitivity, not a
-result.** The design is not currently known to fail; it is known to be
-sensitive to a number nobody has looked up.
+**SOURCED 2026-08-28, and the answer is worse than the sensitivity suggested.**
+`rho_o,haz` multiplies the 0.2% **proof** strength, which is what this engine
+gates on — not `rho_u,haz` (ultimate), quoted as 0.61 in Eurocode 9's own
+worked example. Using the ultimate factor on a yield gate would overstate the
+joint by about 30%.
+
+| rho_o,haz | Source | Allowable | SF |
+|---|---|---|---|
+| 0.500 | EN 1999-1-1: 0.2% proof in HAZ is **half** the base material for EN AW-6082-T6; 6xxx-T6 "lose roughly half" | 125.6 MPa | **2.317** |
+| 0.475 | 6061-T6 MIG, 5356 filler — 19 ksi vs 40 ksi | 119.3 MPa | **2.201** |
+| 0.450 | 6061-T6 MIG, 4043 filler — 18 ksi vs 40 ksi | 113.0 MPa | **2.085** |
+| 0.375 | 6061-T6 as-welded HAZ — 15 ksi vs 40 ksi | 94.2 MPa | **1.738** |
+
+**The frame fails its own 3.0 gate under every sourced factor.** It would need
+`rho_o,haz >= 0.647` to pass, and **no source supports a value above 0.50** for
+6xxx-T6. AWS D1.2 is more severe still: it directs the designer to use
+6061-T4 or 6061-O properties in the HAZ.
+
+**A validity problem on top of that:** Eurocode 9's factors are stated for MIG
+welding of elements **up to 15 mm thick**, and require a larger reduction for
+TIG or greater thickness. The crossbeam is **15.875 mm** — just outside the
+stated range — so 0.50 may itself be optimistic.
+
+**Two ways out, both real:** post-weld artificial ageing restores the strength
+(EN 1999-1-1 says so explicitly, and full solution-treat-and-age returns 6061
+to 40 ksi), or move the welds away from the peak — Eurocode 9's own advice is
+to place welds where stresses are low, such as a beam's neutral axis. The
+current design does the opposite: the weld is exactly where the peak is.
 
 **Fix:** `design_engine/weld.py` adds heat-affected zones with sourced factors,
 applied in the static gate *after* thermal derating — the two are independent,

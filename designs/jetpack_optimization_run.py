@@ -141,6 +141,69 @@ KT_PAD_STEP = 1.5
 # number was converged. Kt values fitted to them inherit that. See FILLET_R.
 KT_ROOT_JUNCTION = 1.85
 
+# --------------------------------------------------------------- HAZ
+# Welding a 6xxx alloy in T6 destroys the temper locally. The frame is welded,
+# and until 2026-08-28 every safety factor it ever produced used the PARENT
+# proof strength (276 MPa) - a strength that does not exist at the joints, and
+# the peak stress is at a joint.
+#
+# rho_o,haz multiplies the 0.2% PROOF strength, which is what this engine gates
+# on. Do not confuse it with rho_u,haz (ultimate), quoted as 0.61 in Eurocode
+# 9's own worked example - using the ultimate factor on a yield gate would
+# overstate the joint by ~30%.
+#
+# SOURCED RANGE, least severe first. No source supports a value above 0.50 for
+# 6xxx-T6, and the frame needs 0.647 to reach its 3.0 gate.
+#   0.500  EN 1999-1-1 / Eurocode 9: "the 0,2% proof strength in HAZ is half
+#          the strength in the base material for EN-AW 6082-T6"; "6xxx alloys
+#          in T6 temper lose roughly half of their strength in the HAZ"
+#          (European Aluminium, Design of Aluminium Structures: Introduction
+#          to Eurocode 9 with Worked Examples)
+#   0.475  6061-T6 MIG with 5356 filler: 19 ksi vs 40 ksi parent
+#   0.450  6061-T6 MIG with 4043 filler: 18 ksi vs 40 ksi parent
+#   0.375  6061-T6 as-welded HAZ: 15 ksi vs 40 ksi parent
+#
+# 0.50 is used as the DESIGN value because it is the least severe defensible
+# one and is the code-based figure; the lower numbers are recorded so the
+# sensitivity is visible rather than buried. AWS D1.2 guidance is more severe
+# still - it directs the designer to use 6061-T4 or 6061-O properties in the
+# HAZ.
+#
+# VALIDITY, and it is not satisfied here without checking: Eurocode 9's factors
+# are stated for MIG welding of elements up to 15 mm thick. TIG, or thicker
+# material, requires a LARGER reduction. The crossbeam is 15.875 mm, so this
+# frame sits just outside the stated range and 0.50 may itself be optimistic.
+HAZ_FACTOR = 0.50
+HAZ_EXTENT_MM = 25.0        # b_haz, EN 1999-1-1 clause 6.1.6.3 worked example
+HAZ_SOURCE = (
+    "EN 1999-1-1 (Eurocode 9) s6.1.6 via European Aluminium, 'Design of "
+    "Aluminium Structures: Introduction to Eurocode 9 with Worked Examples': "
+    "0.2% proof strength in the HAZ is half the base material for EN AW-6082-T6, "
+    "and 6xxx alloys in T6 lose roughly half their strength in the HAZ. "
+    "b_haz = 25 mm per the clause 6.1.6.3 worked example. VALIDITY: stated for "
+    "MIG up to 15 mm thick; this frame's crossbeam is 15.875 mm, so the factor "
+    "is at or just outside the stated range. Independent 6061-T6 sources give "
+    "0.375-0.475 (as-welded 15 ksi, 4043 filler 18 ksi, 5356 filler 19 ksi "
+    "against 40 ksi parent), so 0.50 is the LEAST severe defensible value.")
+
+
+def haz_zones(v) -> list:
+    """The four spine/pad junction welds, as heat-affected zones.
+
+    The welds run along Y at the spine wall, at the bottom and top of the
+    doubler pad - the same four edges the fillet blends, because that is where
+    the pad is joined to the spine.
+    """
+    sx = float(v["spine_x"]) / 2.0
+    sy = float(v["spine_y"]) / 2.0
+    cb_h = float(v["cb_height"])
+    cb_z = SPINE_Z / 2.0 - cb_h / 2.0
+    lines = [[[sign * sx, -sy, z], [sign * sx, sy, z]]
+             for sign in (-1.0, 1.0) for z in (cb_z, cb_z + cb_h)]
+    return [{"name": "spine-pad-weld", "factor": HAZ_FACTOR,
+             "extent_mm": HAZ_EXTENT_MM, "source": HAZ_SOURCE, "lines": lines}]
+
+
 # Fillet radius at the spine/pad T-junction roots. 0 reproduces the original
 # sharp-cornered geometry, whose peak stress is singular and cannot converge.
 #

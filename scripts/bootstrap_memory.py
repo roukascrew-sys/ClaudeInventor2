@@ -683,6 +683,55 @@ LATE = [
                  "Validation Philosophy", "Screened is not validated"]),
 
     MemoryEvent(
+        "The HAZ factor is sourced, and the jetpack frame fails its own gate",
+        date="2026-08-28", type="Engineering", impact="Critical",
+        what_happened=(
+            "rho_o,haz for welded 6xxx-T6 was sourced. EN 1999-1-1 states the "
+            "0.2% proof strength in the HAZ is HALF the base material for "
+            "EN AW-6082-T6, and that 6xxx alloys in T6 lose roughly half their "
+            "strength when welded. Independent 6061-T6 figures are more severe: "
+            "0.475 with 5356 filler, 0.450 with 4043, 0.375 as-welded. Applying "
+            "any of them to the filleted frame's 54.207 MPa peak gives SF "
+            "between 2.32 and 1.74, against a required 3.0."),
+        why_it_matters=(
+            "This is no longer a sensitivity. The frame fails its own gate "
+            "under EVERY sourced factor, and would need rho_o,haz >= 0.647 to "
+            "pass — a value no source supports for 6xxx-T6. The validated "
+            "SF 4.633 was computed against a parent-metal strength that does "
+            "not exist at the joint where the peak actually is."),
+        decision=(
+            "Gate on rho_o,haz (0.2% PROOF), never rho_u,haz (ultimate, quoted "
+            "as 0.61 in Eurocode 9's own worked example). Using the ultimate "
+            "factor on a yield gate would overstate the joint by about 30%. "
+            "0.50 is adopted as the design value because it is the least severe "
+            "defensible one; the lower figures are recorded so the sensitivity "
+            "stays visible."),
+        evidence=[
+            "Observed — EN 1999-1-1 via European Aluminium's Eurocode 9 guide: "
+            "'the 0,2% proof strength in HAZ is half the strength in the base "
+            "material for EN-AW 6082-T6'",
+            "Observed — 6061-T6 as-welded HAZ yield 15 ksi against 40 ksi "
+            "parent; 18 ksi with 4043 filler, 19 ksi with 5356",
+            "Calculated — SF falls from 4.633 to between 2.317 and 1.738; "
+            "rho_o,haz of 0.647 would be needed to reach 3.0",
+            "Observed — Eurocode 9's factors are stated for MIG up to 15 mm "
+            "thick and the crossbeam is 15.875 mm, so 0.50 may be optimistic"],
+        affected=["designs/jetpack_optimization_run.py", "design_engine/weld.py"],
+        consequences=(
+            "The jetpack frame's headline result is withdrawn as a pass. Two "
+            "real remedies exist: post-weld artificial ageing restores the "
+            "strength, or the welds move away from the peak — Eurocode 9's own "
+            "advice is to place welds where stresses are low. The current "
+            "design does the opposite."),
+        open_questions=(
+            "Whether post-weld ageing is practical for this weldment, and what "
+            "the geometry would look like with the joints moved off the peak. "
+            "Neither has been attempted. The 15.875 mm thickness also sits "
+            "outside Eurocode 9's stated MIG validity range."),
+        related=["Every safety factor used a strength the joints do not have",
+                 "Jetpack Frame", "Aluminium has no endurance limit"]),
+
+    MemoryEvent(
         "Every jetpack safety factor used a strength the joints do not have",
         date="2026-08-28", type="Engineering", impact="Critical",
         what_happened=(
