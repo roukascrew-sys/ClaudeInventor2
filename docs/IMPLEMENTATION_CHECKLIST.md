@@ -256,7 +256,7 @@ against is, and a lightly damped aluminium weldment at resonance can see one to
 two orders of magnitude of amplification.
 
 ### B3 — Joints modelled as joints (HAZ knockdown)
-**Status: PARTIAL** — commit `PENDING-B3`. HAZ softening done; weld throat
+**Status: PARTIAL** — commit `b8ac804`. HAZ softening done; weld throat
 sizing and bolt preload remain TODO.
 
 | What | File |
