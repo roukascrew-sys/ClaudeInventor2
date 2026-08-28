@@ -22,8 +22,9 @@ import pytest
 
 from design_engine.geometry import build
 from design_engine.singularity import (DEFAULT_RADIUS_ELEMENTS, TANGENT_TOL_DEG,
-                                       _williams_exponent, classify_peak,
-                                       sharp_concave_edges)
+                                       RefinementRefused, _williams_exponent,
+                                       classify_peak, refinement_permitted,
+                                       require_refinable, sharp_concave_edges)
 
 _PARTS = Path(__file__).parent.parent / "data" / "parts"
 
@@ -205,3 +206,110 @@ def test_P0048_the_filleted_peak_is_clear_of_every_singular_edge():
     assert v["verdict"] == "clean"
     assert v["singular_edges"] > 0
     assert v["nearest_mm"] > DEFAULT_RADIUS_ELEMENTS * 3.2
+
+
+def _peak_on_a_singular_edge(spec=None):
+    """A point sitting exactly on a re-entrant edge of the tee.
+
+    Derived from the geometry rather than hard-coded: an invented coordinate
+    that happens to be clear of the edge makes a refusal test pass for the
+    wrong reason, or fail for one.
+    """
+    solid = _solid(spec or TEE)
+    edges = sharp_concave_edges(solid)
+    return solid, list(edges[0]["p0"]), edges
+
+# ------------------------------------------------------------- the hard gate
+# classify_peak REPORTS. These decide whether a refinement campaign may start,
+# which is a different question and the one that costs money to get wrong.
+def test_a_clean_peak_may_be_refined():
+    d = refinement_permitted({"verdict": "clean", "reason": "well clear"})
+    assert d["permitted"] is True
+
+
+def test_a_singular_peak_is_refused_and_says_why():
+    solid, peak, edges = _peak_on_a_singular_edge()
+    d = refinement_permitted(
+        classify_peak(solid, peak, mesh_size_mm=3.2, edges=edges))
+    assert d["permitted"] is False
+    assert d["verdict"] == "singular"
+    assert "re-entrant" in d["reason"]
+    assert "blend" in d["remedy"], "a refusal must name the way out"
+
+
+def test_an_UNKNOWN_verdict_is_refused_not_permitted():
+    """The case a naive gate gets wrong.
+
+    `if verdict == "singular": refuse` reads correctly and silently permits
+    `unknown` — an analysis that did not happen, treated as evidence the peak
+    can converge. That is the same mistake as reporting 'clean' for geometry
+    that could not be read, one layer up.
+    """
+    class Exploding:
+        def Faces(self):
+            raise RuntimeError("kernel unavailable")
+
+    v = classify_peak(Exploding(), [0, 0, 0], mesh_size_mm=3.2)
+    assert v["verdict"] == "unknown"
+    d = refinement_permitted(v)
+    assert d["permitted"] is False, "UNKNOWN is not a pass"
+    assert "not a pass" in d["remedy"]
+
+
+@pytest.mark.parametrize("junk", [None, {}, {"verdict": None},
+                                  {"verdict": "probably fine"}])
+def test_a_missing_or_unrecognised_classification_is_refused(junk):
+    """The gate defaults to REFUSED, never to permitted. A verdict added to
+    classify_peak later must be opted in deliberately."""
+    assert refinement_permitted(junk)["permitted"] is False
+
+
+def test_require_refinable_raises_on_a_singular_peak():
+    solid, peak, edges = _peak_on_a_singular_edge()
+    v = classify_peak(solid, peak, mesh_size_mm=3.2, edges=edges)
+    with pytest.raises(RefinementRefused, match="convergence study"):
+        require_refinable(v, context="convergence study")
+
+
+def test_require_refinable_returns_the_classification_when_permitted():
+    """So it can be used inline as a precondition rather than a separate step
+    a caller has to remember to check the result of."""
+    v = classify_peak(_solid(BOX), [0, 0, 0], mesh_size_mm=3.2)
+    assert require_refinable(v) is v
+
+
+def test_the_refusal_message_carries_the_geometry_not_just_a_verdict():
+    """A refusal that says only 'singular' sends the reader back to the solid.
+    This one has to name the angle and the exponent."""
+    solid, peak, edges = _peak_on_a_singular_edge()
+    v = classify_peak(solid, peak, mesh_size_mm=3.2, edges=edges)
+    with pytest.raises(RefinementRefused) as caught:
+        require_refinable(v)
+    msg = str(caught.value)
+    assert "270" in msg
+    assert "0.45" in msg, "the Williams exponent tells you how bad it is"
+
+
+# ------------------------------------------------- the gate on the real parts
+@pytest.mark.skipif(not (_PARTS / "P0047" / "v1" / "spec.json").is_file(),
+                    reason="P0047 not in this working copy")
+def test_P0047_would_now_be_refused_a_convergence_study():
+    """The whole point. A1 stalled trying to converge this peak, and the
+    2.8 mm attempt crashed the solver at a 6.1 GB working set. It could never
+    have converged: the peak is 1.28 mm from a 270-degree corner."""
+    solid = _solid(json.loads((_PARTS / "P0047" / "v1" / "spec.json").read_text()))
+    v = classify_peak(solid, [-23.505, 4.014, 199.6], mesh_size_mm=3.2)
+    with pytest.raises(RefinementRefused):
+        require_refinable(v, context="mesh convergence study")
+
+
+@pytest.mark.skipif(not (_PARTS / "P0048" / "v1" / "spec.json").is_file(),
+                    reason="P0048 not in this working copy")
+def test_P0048_the_filleted_peak_is_still_allowed_to_refine():
+    """The gate must not simply refuse everything. The filleted frame still
+    HAS sharp edges — the fillet blends the x-z profile only — but the peak is
+    clear of them, and that peak has a finite value to converge to."""
+    solid = _solid(json.loads((_PARTS / "P0048" / "v1" / "spec.json").read_text()))
+    v = classify_peak(solid, [29.513, -0.024, 199.225], mesh_size_mm=3.2)
+    assert refinement_permitted(v)["permitted"] is True
+    assert v["singular_edges"] > 0, "allowed despite the part having edges"

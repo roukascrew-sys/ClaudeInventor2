@@ -279,6 +279,92 @@ def classify_peak(solid, peak_xyz, mesh_size_mm: float,
     }
 
 
+class RefinementRefused(RuntimeError):
+    """A refinement campaign that could not converge, refused before it ran."""
+
+
+#: The only verdict that permits refinement. Written as a set of the ALLOWED
+#: values rather than a test against the refused ones, so a verdict added to
+#: `classify_peak` later defaults to REFUSED until someone decides otherwise.
+#: The opposite spelling — `if verdict == "singular": refuse` — silently
+#: permits `unknown`, which is the exact failure this module exists to prevent.
+_REFINABLE_VERDICTS = frozenset({"clean"})
+
+
+def refinement_permitted(classification: dict | None) -> dict:
+    """May a refinement campaign be started against this peak?
+
+    WHY THIS IS A GATE AND NOT ADVICE
+    At a sharp re-entrant corner the elastic stress is unbounded, so peak von
+    Mises has no limit to converge to. A refinement loop aimed at it does not
+    fail: every step genuinely reduces discretisation error and genuinely
+    raises the peak, and from inside the loop that is indistinguishable from
+    slow convergence. It reports steady progress forever.
+
+    That is expensive here specifically. A 2.8 mm solve on this frame already
+    reached a 6.1 GB working set and crashed CalculiX with 0xC0000005, so a
+    campaign spent on a peak that cannot converge does not merely waste time —
+    it consumes the whole available budget and returns a number that rose with
+    every hour of it.
+
+    THREE VERDICTS, TWO OF WHICH REFUSE
+    `unknown` refuses along with `singular`. An analysis that did not happen
+    tells us nothing about whether the goal is bounded, and spending hours on
+    that assumption is precisely the bet this engine does not take. Refusing
+    costs a geometry re-check; permitting costs the budget.
+
+    Returns the decision rather than raising, so a caller that wants to report
+    rather than abort can. Use `require_refinable()` for the hard gate.
+    """
+    verdict = (classification or {}).get("verdict")
+    if verdict in _REFINABLE_VERDICTS:
+        return {"permitted": True, "verdict": verdict,
+                "reason": (classification.get("reason")
+                           or "peak is clear of every sharp re-entrant edge")}
+
+    if verdict == "singular":
+        return {"permitted": False, "verdict": verdict,
+                "reason": classification.get("reason", "peak sits on a "
+                                             "geometric singularity"),
+                "remedy": ("blend the edge, or measure the stress away from "
+                           "it. Refining will only raise this peak")}
+
+    if verdict == "unknown":
+        return {"permitted": False, "verdict": "unknown",
+                "reason": (classification.get("reason")
+                           or "the geometry could not be analysed"),
+                "remedy": ("re-run the geometry check. UNKNOWN is not a pass: "
+                           "an analysis that did not happen is not evidence "
+                           "that the peak can converge")}
+
+    return {"permitted": False, "verdict": verdict,
+            "reason": (f"no usable singularity classification "
+                       f"(verdict={verdict!r}); refinement cannot be shown to "
+                       f"converge, so it is refused"),
+            "remedy": "call classify_peak() on the solid first"}
+
+
+def require_refinable(classification: dict | None, *,
+                      context: str = "mesh refinement") -> dict:
+    """The hard gate. Raise unless this peak can converge.
+
+    Implemented as code rather than left as a step to remember, for the same
+    reason the production sign-off token is: an instruction that lives only in
+    prose is unfalsifiable, and this one has already been skipped once — SF
+    3.844 was reported, passed every check in the engine, and was measured
+    1.28 mm from a 270-degree corner.
+
+    Returns the classification unchanged when permitted, so it can be used
+    inline as a precondition.
+    """
+    decision = refinement_permitted(classification)
+    if not decision["permitted"]:
+        raise RefinementRefused(
+            f"{context} refused — {decision['reason']} "
+            f"[{decision.get('remedy', '')}]".rstrip(" []"))
+    return classification
+
+
 def _edge_distance(pt, sing) -> float:
     """Distance from a point to a singular edge.
 
