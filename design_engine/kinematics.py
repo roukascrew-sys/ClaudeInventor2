@@ -12,6 +12,14 @@ named `chrono`, driven over a JSON job/result boundary
 (`chrono_worker.py`). If that env is absent the tool refuses with
 instructions — it never silently degrades to an approximation.
 
+**Launched directly, not through `conda run`.** The env's own interpreter is
+invoked with the environment `conda activate` would have set (activation_env).
+`conda run` made the worker a grandchild that `Popen.kill()` could not reach,
+which on 2026-08-28 let a hung worker hold a full-suite run ~22 minutes past
+its 900 s deadline; it also runs a `conda activate` shell round-trip that
+failed outright under load. The deadline is enforced by run_worker, which
+redirects to files rather than pipes and kills the whole process tree.
+
 **Units.** The engine is mm-based; Chrono is run in SI. Conversion happens
 here, at the boundary, so mm and kg can never meet inside the solve (which
 would yield milli-newtons and look plausible). Reactions return in newtons,
@@ -29,6 +37,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
 from pathlib import Path
@@ -54,6 +63,13 @@ class ChronoUnavailable(RuntimeError):
     """The chrono environment is missing — refuse rather than approximate."""
 
 
+def _tail(path: Path, n: int = 400) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")[-n:]
+    except OSError:
+        return ""
+
+
 def find_conda() -> Path | None:
     for cand in (Path.home() / "miniforge3" / "Scripts" / "conda.exe",
                  Path.home() / "miniconda3" / "Scripts" / "conda.exe",
@@ -64,14 +80,127 @@ def find_conda() -> Path | None:
     return Path(found) if found else None
 
 
+def find_env_dir(env: str = DEFAULT_ENV) -> Path | None:
+    conda = find_conda()
+    return None if conda is None else conda.parent.parent / "envs" / env
+
+
+def env_python(envdir: Path) -> Path:
+    """The interpreter inside a conda env, addressed directly."""
+    return (envdir / "python.exe" if os.name == "nt"
+            else envdir / "bin" / "python")
+
+
+# The directories `conda activate` prepends to PATH on Windows, in its order.
+# Not cosmetic: see activation_env().
+_WIN_ACTIVATION_DIRS = ("", "Library/mingw-w64/bin", "Library/usr/bin",
+                        "Library/bin", "Scripts", "bin")
+
+
+def activation_env(envdir: Path) -> dict:
+    """The environment `conda activate <env>` would produce, for a direct spawn.
+
+    The worker is launched as `<envdir>/python.exe` rather than through
+    `conda run` (see _solve), which means nothing performs the activation the
+    interpreter's native extensions rely on. On Windows PyChrono's
+    `_irrlicht.pyd` pulls in Irrlicht.dll / SDL.dll / jpeg8.dll from
+    `<envdir>/Library/bin`; without that directory on PATH the load fails
+    inside a modal Windows error box, and the process then blocks forever with
+    no CPU and no output. Measured on this machine, 2026-08-28:
+
+        <envdir>/python.exe -c "import pychrono"      hung  (>9 min, killed)
+        ... with the PATH below                       3.2 s ok
+        conda run -n chrono python -c "import pychrono"  7.5 s ok
+
+    PYTHONHOME/PYTHONPATH are stripped so the project's 3.12 pip venv cannot
+    leak into an interpreter that must not see CadQuery.
+    """
+    e = dict(os.environ)
+    if os.name == "nt":
+        dirs = [str(envdir / d) if d else str(envdir)
+                for d in _WIN_ACTIVATION_DIRS]
+    else:
+        dirs = [str(envdir / "bin")]
+    e["PATH"] = os.pathsep.join(dirs + [e.get("PATH", "")])
+    e["CONDA_PREFIX"] = str(envdir)
+    e.pop("PYTHONHOME", None)
+    e.pop("PYTHONPATH", None)
+    return e
+
+
 def chrono_available(env: str = DEFAULT_ENV) -> tuple[bool, str]:
     conda = find_conda()
     if conda is None:
         return False, "conda not found (expected Miniforge at ~/miniforge3)"
-    envdir = conda.parent.parent / "envs" / env
+    envdir = find_env_dir(env)
     if not envdir.is_dir():
         return False, f"conda env {env!r} not found at {envdir}"
+    py = env_python(envdir)
+    if not py.is_file():
+        return False, f"conda env {env!r} has no interpreter at {py}"
     return True, str(envdir)
+
+
+def kill_tree(proc: subprocess.Popen, grace: float = 10.0) -> None:
+    """Kill `proc` *and everything it spawned*, then reap within `grace`.
+
+    `Popen.kill()` on Windows is TerminateProcess on one handle: a grandchild
+    is untouched and keeps running. That is not hypothetical here — the whole
+    reason this function exists is that a worker which outlives its parent
+    also outlives the deadline it was given.
+    """
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=grace)
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    for _ in range(2):
+        try:
+            proc.wait(timeout=grace)
+            return
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+
+def run_worker(cmd: list[str], env: dict, timeout_s: float,
+               out_path: Path, err_path: Path) -> int:
+    """Run `cmd` to completion or kill it at `timeout_s`. Returns the exit code.
+
+    Two deliberate departures from `subprocess.run(..., timeout=...)`, both of
+    which were needed to make the deadline actually bind:
+
+    1. **stdout/stderr go to files, not pipes.** `subprocess.run`'s Windows
+       timeout path calls `communicate()` a second time after `kill()` *with
+       no timeout* (CPython Lib/subprocess.py, `run()`), and that call blocks
+       until every process holding the inherited pipe write handles exits.
+       A surviving worker therefore holds the parent past its deadline for as
+       long as it likes. Files have no reader threads and nothing to block on.
+
+    2. **The whole process tree is killed**, not just the direct child.
+
+    Raises subprocess.TimeoutExpired once the tree is down, so the caller sees
+    a deadline, not a hang.
+    """
+    with open(out_path, "wb") as so, open(err_path, "wb") as se:
+        kw = ({"creationflags": subprocess.CREATE_NO_WINDOW}
+              if os.name == "nt" else {"start_new_session": True})
+        proc = subprocess.Popen(cmd, stdout=so, stderr=se, env=env, **kw)
+        try:
+            return proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            kill_tree(proc)
+            raise
+        except BaseException:
+            kill_tree(proc)
+            raise
 
 
 def _num(d, key, ctx, *, lo=None):
@@ -262,18 +391,33 @@ class KinematicsTools:
                 f"cannot be installed in this pip venv. Create it with: "
                 f"conda create -n {self.env} python=3.12 -y && conda install "
                 f"-n {self.env} projectchrono::pychrono -c conda-forge -y")
-        conda = find_conda()
+        envdir = find_env_dir(self.env)
+        py = env_python(envdir)
         with tempfile.TemporaryDirectory() as td:
-            jf, of = Path(td) / "job.json", Path(td) / "out.json"
+            td = Path(td)
+            jf, of = td / "job.json", td / "out.json"
+            oo, oe = td / "worker.out", td / "worker.err"
             jf.write_text(json.dumps(job), encoding="utf-8")
-            proc = subprocess.run(
-                [str(conda), "run", "-n", self.env, "--no-capture-output",
-                 "python", str(WORKER), str(jf), str(of)],
-                capture_output=True, text=True, timeout=self.timeout_s)
+            # The env's interpreter directly, not `conda run`. `conda run`
+            # interposes a process, so the worker becomes a *grandchild* that
+            # Popen.kill() cannot reach; on 2026-08-28 that let a hung worker
+            # hold the suite ~22 minutes past a 900 s deadline. It also runs a
+            # `conda activate` shell round-trip that failed outright under
+            # load ("No output from 'conda activate'", exit 5), and costs
+            # ~4.3 s per call that the direct spawn does not.
+            try:
+                rc = run_worker(
+                    [str(py), str(WORKER), str(jf), str(of)],
+                    activation_env(envdir), self.timeout_s, oo, oe)
+            except subprocess.TimeoutExpired:
+                raise KinematicsError(
+                    f"chrono_timeout: the worker exceeded {self.timeout_s}s "
+                    f"and was killed with its whole process tree. stderr "
+                    f"tail: {_tail(oe)!r}") from None
             if not of.is_file():
                 raise KinematicsError(
-                    f"chrono_worker produced no result (exit {proc.returncode}); "
-                    f"stderr tail: {proc.stderr[-400:]!r}")
+                    f"chrono_worker produced no result (exit {rc}); "
+                    f"stderr tail: {_tail(oe)!r}")
             result = json.loads(of.read_text(encoding="utf-8"))
         if not result.get("ok"):
             raise KinematicsError(f"chrono_solve_failed: {result.get('error')}")
