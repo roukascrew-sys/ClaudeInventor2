@@ -43,13 +43,20 @@ from .parts import PartStore, _check_reason
 from .geometry import build as build_solid
 from .singularity import classify_peak
 from .fatigue import SNCurve, stress_range_from_ratio
+from . import weld as _weld
 
 
 class FeaError(RuntimeError):
     pass
 
 
-_CASE_KEYS = {"material", "mesh", "constraints", "loads", "limit_state"}
+_CASE_KEYS = {"material", "mesh", "constraints", "loads", "limit_state",
+              "weld"}
+# `weld` is OPTIONAL: a machined or bonded part has no heat-affected zone, and
+# requiring an empty declaration from every case would be noise. _CASE_KEYS is
+# the ALLOWED set; this is the REQUIRED one, and they were the same set until
+# HAZ arrived.
+_REQUIRED_CASE_KEYS = _CASE_KEYS - {"weld"}
 _MATERIAL_KEYS = {"name", "E_MPa", "nu", "yield_MPa", "source",
                   "fatigue",
                   "service_temp_C", "yield_derate_curve", "E_derate_curve",
@@ -165,7 +172,7 @@ def validate_case(case: dict) -> None:
     if not isinstance(case, dict):
         raise FeaError("case must be a dict")
     _reject_extra(case, _CASE_KEYS, "case")
-    missing = _CASE_KEYS - set(case)
+    missing = _REQUIRED_CASE_KEYS - set(case)
     if missing:
         raise FeaError(f"case: missing required sections {sorted(missing)}")
 
@@ -1419,16 +1426,30 @@ class ValidationTools:
             allowable = (eff["yield_MPa_effective"]
                          if ls_name == "thermal_derated_yield"
                          else mat["yield_MPa"])
+
+            # HEAT-AFFECTED ZONE. Welding a 6xxx aluminium alloy destroys the
+            # T6 temper locally, and the softened zone is a different material
+            # with its own reduced proof strength. Applied AFTER thermal
+            # derating because the two are independent: a hot weld is softened
+            # by both, and taking only the worse of them would overstate the
+            # strength of a structure that is simultaneously welded and hot.
+            welds = _weld.from_case(case.get("weld"))
+            haz = welds.allowable_at(peak_xyz, allowable)
+            allowable = haz["allowable_MPa"]
+
             sf = math.inf if max_vm == 0 else allowable / max_vm
             required = case["limit_state"]["required_SF"]
 
             png_rel = f"validation/{run_dir.name}/von_mises.png"
             _allow_note = (
-                f"derated yield {allowable:.1f} MPa "
+                f"derated yield {eff['yield_MPa_effective']:.1f} MPa "
                 f"(k={eff['k_yield']:.3f} @ {eff['service_temp_C']} C, "
                 f"room {mat['yield_MPa']} MPa)"
                 if ls_name == "thermal_derated_yield"
                 else f"yield {mat['yield_MPa']} MPa")
+            if haz["in_haz"]:
+                _allow_note += (f", HAZ x{haz['factor']:g} -> "
+                                f"{allowable:.1f} MPa")
             _diagnostic_png(
                 self.root / png_rel, m, vm,
                 f"{geometry_id} — {ls_name}: SF={sf:.3f} "
@@ -1442,6 +1463,8 @@ class ValidationTools:
                 "safety_factor": round(sf, 6) if sf != math.inf else "inf",
                 "allowable_MPa": round(allowable, 6),
                 "thermal_derating": eff,
+                "weld_haz": haz,
+                "welds": welds.to_dict(),
                 "max_von_mises_MPa": round(max_vm, 6),
                 "median_von_mises_MPa": round(median_vm, 6),
                 "p99_9_von_mises_MPa": round(p999, 6),

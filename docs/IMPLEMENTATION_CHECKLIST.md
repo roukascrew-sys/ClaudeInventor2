@@ -255,8 +255,45 @@ number is not wrong as arithmetic, but the load amplitude it was computed
 against is, and a lightly damped aluminium weldment at resonance can see one to
 two orders of magnitude of amplification.
 
-### B3 — Joints modelled as joints (weld throat, HAZ knockdown, bolt preload)
-**Status: TODO**
+### B3 — Joints modelled as joints (HAZ knockdown)
+**Status: PARTIAL** — commit `PENDING-B3`. HAZ softening done; weld throat
+sizing and bolt preload remain TODO.
+
+| What | File |
+|---|---|
+| `HeatAffectedZone` — sourced factor, extent, weld lines | `design_engine/weld.py` |
+| `WeldMap.allowable_at()` — worst softening governs | `design_engine/weld.py` |
+| `from_case()` — the optional `case.weld` block | `design_engine/weld.py` |
+| HAZ applied in the static gate, after thermal derating | `design_engine/fea.py` |
+| Tests (22) | `tests/test_weld.py` |
+
+**The gap this closes:** the jetpack frame is described throughout as a
+*welded* weldment, and every safety factor computed for it used the
+**parent-metal** allowable — 276 MPa off a supplier product page. Welding a
+6xxx alloy destroys the T6 temper locally, so that is a strength which does not
+exist at the joints.
+
+**The finding, with its epistemic labels:**
+- *Observed* — **both** recorded peaks (sharp `P0047` and filleted `P0048`) sit
+  within 25 mm of the four spine/pad junction weld lines. Both safety factors
+  were computed against a strength not present there.
+- *Calculated* — at a 0.5 softening factor, the filleted frame's SF 4.633 would
+  become 2.317, **below its own 3.0 gate**.
+- **Unknown** — the actual ρ<sub>o,haz</sub> for 6061-T6511 MIG at this
+  thickness. **Not sourced, so 2.317 is a sensitivity, not a result.**
+
+**Values are deliberately not embedded**, as with the S-N detail categories:
+softening depends on alloy, temper, process, joint type and thickness, and a
+wrong factor is worse than an absent one.
+
+**Refusals:** unsourced factor; factor of exactly 1.0 (asserts welding is free,
+which is untrue of 6xxx — a joint with no HAZ should declare no zone); zero
+extent; zero weld lines (the engine cannot guess where welds are); zero-length
+line. Overlapping zones take the **worst** softening, not the first declared,
+so the answer cannot depend on list order.
+
+**Applied after thermal derating, not instead of it** — the two are
+independent, and a structure that is both welded and hot is softened by both.
 
 ### B4 — Load cases and combinations
 **Status: TODO**
