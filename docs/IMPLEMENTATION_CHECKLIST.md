@@ -263,6 +263,69 @@ two orders of magnitude of amplification.
 
 ---
 
+## Refactors
+
+### R1 — Split the validator god-class (Declared Couplings, Phase 1)
+**Status: DONE** — commit `PENDING-R1`. Pure refactor; one intentional
+behaviour change, stated below.
+
+`ValidationTools` carried four near-identical pipelines. Each analysis now
+supplies only what is specific to it — its deck fragment, its parser, its gate —
+and walks a shared road for everything else.
+
+| What | File | Line @ `PENDING-R1` |
+|---|---|---|
+| `_SolveInputs` — named, not a 5-tuple | `design_engine/fea.py` | — |
+| `_SolveInputs.provenance()` — the fields every analysis logs | `design_engine/fea.py` | — |
+| `_action()` — open/close contract as a context manager | `design_engine/fea.py` | — |
+| `_prepare()` — validate → solver check → mesh → restraint | `design_engine/fea.py` | — |
+| `_face_loads()` | `design_engine/fea.py` | — |
+| `_solve()` — invoke, time, and name both failure paths | `design_engine/fea.py` | — |
+| Acceptance tests (11) | `tests/test_validation_pipeline.py` | whole file |
+
+**Duplication removed** — every shared call site collapsed to one:
+
+| Call site | Before | After |
+|---|---|---|
+| `mesh_step(part…` | 3 | 1 |
+| `check_rigid_body_modes(` | 4 | 2 |
+| `self._solver_command(` | 3 | 1 |
+| `self.log.open_action(` | 4 | **1** |
+| `ccx_stdout.txt` write | 3 | 1 |
+
+The four `fea_*` methods went from **637 to 542 lines**. The class itself is
+only 12 lines shorter, because ~100 lines of shared machinery replaced ~110 of
+copies — the win is that a fifth analysis now costs a deck fragment, a parser
+and a gate rather than another ~150-line near-duplicate.
+
+**Proof of no behaviour change.** A baseline was captured *before* touching
+anything and compared after:
+
+| | Static | Buckling | Modal |
+|---|---|---|---|
+| result | **identical** | **identical** | **identical** |
+| checked | deck SHA, SF, nodes, max von Mises | SF + all 3 factors | SF + all 4 frequencies |
+
+The static **deck hash is unchanged** (`1576da1aaea98b1d74b3`), which is the
+strongest available evidence: if the solver's input file is byte-identical,
+CalculiX cannot behave differently. 300 tests pass.
+
+**The one intentional change:** `_run_buckle` used a raw `subprocess.run` and
+therefore recorded **no memory measurement at all**, unlike every other
+analysis — a gap left by A4, which only wired `_run_solver` into the static
+path. Routing it through the shared `_solve` closes it: buckling now logs
+`peak_rss_mb` (36.7 MB measured on the baseline case). Additive, and it makes
+the four analyses consistent.
+
+**Ordering preserved deliberately.** `fea_modal` runs its own limit-state and
+density checks *between* `validate_case` and the solver-presence check. Calling
+`_prepare` naively would have reordered those, changing which error a caller
+sees on a machine with no solver. `test_validation_pipeline` pins the order.
+
+**Phase 2 (declare facts, resolve the graph) is not implemented.**
+
+---
+
 ## Track C · Physical correlation
 
 ### C1 — Statistical allowables and honest knockdowns

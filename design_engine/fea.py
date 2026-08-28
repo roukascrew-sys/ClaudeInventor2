@@ -31,6 +31,7 @@ import re
 import os
 import subprocess
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -765,6 +766,43 @@ def parse_eigenfrequencies(dat_path: Path) -> list[float]:
     return freqs
 
 
+class _SolveInputs:
+    """What the shared front half of every solve produces.
+
+    Named rather than returned as a tuple because four call sites unpacking
+    five values in the same order is exactly how a refactor silently swaps two
+    of them.
+    """
+
+    __slots__ = ("part", "run_dir", "mesh", "constraint_sets", "rbm")
+
+    def __init__(self, part, run_dir, mesh, constraint_sets, rbm):
+        self.part = part
+        self.run_dir = run_dir
+        self.mesh = mesh
+        self.constraint_sets = constraint_sets
+        self.rbm = rbm
+
+    @property
+    def nodes(self) -> int:
+        return int(len(self.mesh["node_tags"]))
+
+    @property
+    def elements(self) -> int:
+        return int(len(self.mesh["connectivity"]))
+
+    def provenance(self) -> dict:
+        """The fields every analysis logs identically.
+
+        Centralised so a new limit state cannot quietly omit one — the
+        knowledge base reads these columns, and a missing `nodes` on one
+        analysis is a silent hole in every model fitted from history.
+        """
+        return {"nodes": self.nodes, "elements": self.elements,
+                "constraint_rank": self.rbm["constraint_rank"],
+                "run_dir": str(self.run_dir)}
+
+
 class ValidationTools:
     def __init__(self, root: str | Path, log: ActionLog, parts: PartStore,
                  ccx_path: str | Path, threads: int | None = 1,
@@ -815,27 +853,110 @@ class ValidationTools:
         run.mkdir()
         return run
 
-    def _run_buckle(self, m, case, constraint_sets, load_sets, run_dir,
-                    n_modes: int):
-        """One *BUCKLE solve; returns (factors, threads, binary_name)."""
-        _write_inp(run_dir / "job.inp", m, case, constraint_sets, load_sets,
-                   analysis="buckle", n_modes=n_modes)
-        # force_single: ccx_MT returns wrong eigenvalues ~4 times in 5 on an
-        # identical job (measured). Never multithread a buckling solve.
-        binary, env, threads = self._solver_command(force_single=True)
+    # ------------------------------------------------------ shared pipeline
+    # Every analysis walks the same road: open an action, check the request,
+    # mesh, check the restraint, write a deck, solve, parse, gate, close the
+    # action. Only the middle three differ. What follows is the road; each
+    # fea_* method supplies its own deck fragment, parser and gate.
+
+    @contextmanager
+    def _action(self, name: str, geometry_id: str, reason: str):
+        """Open a FRACAS action, and guarantee it is closed on the way out.
+
+        The non-linear gate contract requires the failure record to be written
+        BEFORE control returns to the caller, so the next attempt can reference
+        it. Only the EXCEPTION path is handled here; the pass/fail-with-details
+        close stays with the analysis, because only the analysis knows what its
+        details are and whether it passed.
+        """
+        action_id = self.log.open_action(
+            "validation", name, geometry_version=str(geometry_id),
+            reason=str(reason))
         try:
-            proc = subprocess.run(
-                [str(binary), "-i", "job"], cwd=run_dir, env=env,
-                capture_output=True, text=True, timeout=self.solve_timeout_s)
+            yield action_id
+        except Exception as exc:
+            self.log.close_action(
+                action_id, "fail", failure_mode=f"{type(exc).__name__}: {exc}")
+            raise
+
+    def _prepare(self, geometry_id: str, case: dict) -> _SolveInputs:
+        """Validate the request, then mesh and check the restraint.
+
+        Order is load-bearing and is pinned by test_validation_pipeline:
+        the reason and the case are checked before the solver is looked for,
+        and the solver is looked for before anything expensive is meshed. A
+        malformed case must read as malformed even on a machine with no solver
+        installed.
+        """
+        validate_case(case)
+        if not self.ccx_path.is_file():
+            raise FeaError(f"ccx solver not found at {self.ccx_path}")
+        part = self.parts.get_part(geometry_id)
+        run_dir = self._next_run_dir()
+        m = mesh_step(part["step_file_path"], case["mesh"]["max_size_mm"],
+                      case["mesh"].get("min_size_mm"))
+        constraint_sets = [select_nodes(m, c["where"])
+                           for c in case["constraints"]]
+        rbm = check_rigid_body_modes(m, constraint_sets, case["constraints"])
+        return _SolveInputs(part, run_dir, m, constraint_sets, rbm)
+
+    def _face_loads(self, m: dict, case: dict) -> list:
+        return [_consistent_face_loads(
+                    m, select_nodes(m, ld["where"]), ld["force_total_N"],
+                    f"case.loads[{i}]", ld["where"])
+                for i, ld in enumerate(case["loads"])]
+
+    def _solve(self, run_dir: Path, n_nodes: int, *, force_single: bool = False,
+               what: str = "", require_finished: bool = True):
+        """Run CalculiX on the deck in `run_dir`. Returns (run, binary, threads,
+        seconds).
+
+        Both failure paths name what the caller needs to act on: a timeout says
+        how to make the job smaller, and a crash names the peak memory, because
+        an access violation at 6 GB and one at 500 MB want different remedies.
+        """
+        binary, env, threads = self._solver_command(force_single=force_single)
+        t0 = time.time()
+        try:
+            proc = _run_solver([str(binary), "-i", "job"], run_dir, env,
+                               self.solve_timeout_s)
         except subprocess.TimeoutExpired:
             raise FeaError(
                 f"solver_timeout: {binary.name} exceeded {self.solve_timeout_s}s "
-                f"on a buckling solve of {len(m['node_tags'])} nodes")
-        if proc.returncode != 0:
+                f"on {'a ' + what + ' solve of ' if what else ''}{n_nodes} nodes "
+                f"using {threads} thread(s). Direct-solve cost grows steeply "
+                f"with node count - coarsen case.mesh.max_size_mm (subject to "
+                f"the Jacobian gate on the thinnest feature), or raise "
+                f"ValidationTools(solve_timeout_s=...).") from None
+        seconds = time.time() - t0
+        bad = proc.returncode != 0 or (require_finished
+                                       and "Job finished" not in proc.stdout)
+        if bad:
             (run_dir / "ccx_stdout.txt").write_text(proc.stdout, encoding="utf-8")
-            raise FeaError(f"solver_error: {binary.name} exit {proc.returncode}; "
+            mem = (f" peak memory {proc.peak_rss_mb:.0f} MB;"
+                   if proc.peak_rss_mb else "")
+            raise FeaError(f"solver_error: {binary.name} exit "
+                           f"{proc.returncode};{mem} "
                            f"tail: {proc.stdout[-400:]!r}")
-        return parse_buckling_factors(run_dir / "job.dat"), threads, binary.name
+        return proc, binary, threads, seconds
+
+    def _run_buckle(self, m, case, constraint_sets, load_sets, run_dir,
+                    n_modes: int):
+        """One *BUCKLE solve; returns (factors, threads, binary_name, peak_mb).
+
+        force_single: ccx_MT returns wrong eigenvalues ~4 times in 5 on an
+        identical job (measured). Never multithread a buckling solve.
+
+        require_finished=False: a *BUCKLE step does not print the "Job
+        finished" banner that a *STATIC step does.
+        """
+        _write_inp(run_dir / "job.inp", m, case, constraint_sets, load_sets,
+                   analysis="buckle", n_modes=n_modes)
+        proc, binary, threads, _seconds = self._solve(
+            run_dir, len(m["node_tags"]), force_single=True, what="buckling",
+            require_finished=False)
+        return (parse_buckling_factors(run_dir / "job.dat"), threads,
+                binary.name, proc.peak_rss_mb)
 
     def fea_buckling(self, geometry_id: str, case: dict, reason: str,
                      n_modes: int = 3) -> dict:
@@ -853,26 +974,16 @@ class ValidationTools:
         because it tests the SOLUTION rather than the input it catches other
         corruption modes too.
         """
-        action_id = self.log.open_action(
-            "validation", "fea_buckling", geometry_version=str(geometry_id),
-            reason=str(reason))
-        try:
+        with self._action("fea_buckling", geometry_id, reason) as action_id:
             _check_reason(reason)
             validate_case(case)
             if case["limit_state"]["name"] != "elastic_buckling":
                 raise FeaError(
                     f"fea_buckling requires limit_state 'elastic_buckling', got "
                     f"{case['limit_state']['name']!r}")
-            if not self.ccx_path.is_file():
-                raise FeaError(f"ccx solver not found at {self.ccx_path}")
-            part = self.parts.get_part(geometry_id)
-            run_dir = self._next_run_dir()
-
-            m = mesh_step(part["step_file_path"], case["mesh"]["max_size_mm"],
-                          case["mesh"].get("min_size_mm"))
-            constraint_sets = [select_nodes(m, c["where"])
-                               for c in case["constraints"]]
-            rbm = check_rigid_body_modes(m, constraint_sets, case["constraints"])
+            si = self._prepare(geometry_id, case)
+            m, run_dir = si.mesh, si.run_dir
+            constraint_sets, rbm = si.constraint_sets, si.rbm
 
             def loads_scaled(k):
                 return [_consistent_face_loads(
@@ -898,7 +1009,7 @@ class ValidationTools:
             for attempt in range(1, self.buckle_max_attempts + 1):
                 base_dir = run_dir / f"ref{attempt}"
                 base_dir.mkdir()
-                f1, threads, binary = self._run_buckle(
+                f1, threads, binary, peak_mb = self._run_buckle(
                     m, case, constraint_sets, loads_scaled(1.0), base_dir,
                     n_modes)
                 check_dir = run_dir / f"scaled{attempt}"
@@ -909,7 +1020,7 @@ class ValidationTools:
                 # where the linearised eigenvalue solve degrades - measured
                 # directly (a case whose 1x factor was correct at 0.6656 gave
                 # a meaningless 0.983 at 2x, every attempt).
-                f2, _, _ = self._run_buckle(
+                f2, _, _, _ = self._run_buckle(
                     m, case, constraint_sets, loads_scaled(0.5), check_dir,
                     n_modes)
 
@@ -957,19 +1068,16 @@ class ValidationTools:
                                   "ratio": round(ratio, 6),
                                   "required_ratio": 2.0,
                                   "attempts": attempts},
-                "constraint_rank": rbm["constraint_rank"],
-                "nodes": int(len(m["node_tags"])),
-                "elements": int(len(m["connectivity"])),
+                **si.provenance(),
                 "solver_binary": binary, "solver_threads": threads,
                 "solve_seconds": round(solve_s, 2),
-                "run_dir": str(run_dir),
+                # Buckling previously ran through a raw subprocess.run and so
+                # carried no memory measurement at all, unlike every other
+                # analysis. Routing it through the shared solve closes that.
+                "peak_rss_mb": peak_mb,
                 "artifacts": [],
             }
             passed = lowest >= required
-        except Exception as exc:
-            self.log.close_action(
-                action_id, "fail", failure_mode=f"{type(exc).__name__}: {exc}")
-            raise
 
         if passed:
             self.log.close_action(action_id, "pass", details=details)
@@ -1034,10 +1142,7 @@ class ValidationTools:
             else "yield_von_mises",
             "required_SF": 1.0}
 
-        action_id = self.log.open_action(
-            "validation", "fea_fatigue", geometry_version=str(geometry_id),
-            reason=str(reason))
-        try:
+        with self._action("fea_fatigue", geometry_id, reason) as action_id:
             _check_reason(reason)
             curve = SNCurve(
                 name=fat.get("name", case["material"]["name"]),
@@ -1094,10 +1199,6 @@ class ValidationTools:
                 "material": case["material"],
             }
             passed = sf >= required_sf
-        except Exception as exc:
-            self.log.close_action(
-                action_id, "fail", failure_mode=f"{type(exc).__name__}: {exc}")
-            raise
 
         if passed:
             self.log.close_action(action_id, "pass", details=details)
@@ -1147,10 +1248,7 @@ class ValidationTools:
         just as dangerous as one at 1x. `case.limit_state.harmonics` says how
         many to check.
         """
-        action_id = self.log.open_action(
-            "validation", "fea_modal", geometry_version=str(geometry_id),
-            reason=str(reason))
-        try:
+        with self._action("fea_modal", geometry_id, reason) as action_id:
             _check_reason(reason)
             validate_case(case)
             ls = case["limit_state"]
@@ -1175,38 +1273,19 @@ class ValidationTools:
                     "no mass matrix without density — this engine will not "
                     "assume one.")
             _num(case["material"], "density_kg_m3", "case.material", lo=0)
-            if not self.ccx_path.is_file():
-                raise FeaError(f"ccx solver not found at {self.ccx_path}")
 
-            part = self.parts.get_part(geometry_id)
-            run_dir = self._next_run_dir()
-            m = mesh_step(part["step_file_path"], case["mesh"]["max_size_mm"],
-                          case["mesh"].get("min_size_mm"))
-            constraint_sets = [select_nodes(m, c["where"])
-                               for c in case["constraints"]]
-            rbm = check_rigid_body_modes(m, constraint_sets, case["constraints"])
+            si = self._prepare(geometry_id, case)
+            m, run_dir = si.mesh, si.run_dir
 
-            _write_inp(run_dir / "job.inp", m, case, constraint_sets, [],
+            _write_inp(run_dir / "job.inp", m, case, si.constraint_sets, [],
                        analysis="frequency", n_modes=n_modes)
-            binary, env, threads = self._solver_command(force_single=True)
-            t0 = time.time()
-            try:
-                proc = _run_solver([str(binary), "-i", "job"], run_dir, env,
-                                   self.solve_timeout_s)
-            except subprocess.TimeoutExpired:
-                raise FeaError(
-                    f"solver_timeout: {binary.name} exceeded "
-                    f"{self.solve_timeout_s}s on a modal solve of "
-                    f"{len(m['node_tags'])} nodes")
-            solve_s = time.time() - t0
-            if proc.returncode != 0:
-                (run_dir / "ccx_stdout.txt").write_text(proc.stdout,
-                                                        encoding="utf-8")
-                mem = (f" peak memory {proc.peak_rss_mb:.0f} MB;"
-                       if proc.peak_rss_mb else "")
-                raise FeaError(f"solver_error: {binary.name} exit "
-                               f"{proc.returncode};{mem} "
-                               f"tail: {proc.stdout[-400:]!r}")
+            # force_single: an eigenvalue solve is never multithreaded here,
+            # for the same reason buckling is not. See ccx_MT.
+            # require_finished=False: a *FREQUENCY step does not print the
+            # "Job finished" banner a *STATIC step does.
+            proc, binary, threads, solve_s = self._solve(
+                run_dir, si.nodes, force_single=True, what="modal",
+                require_finished=False)
 
             freqs = parse_eigenfrequencies(run_dir / "job.dat")
             checked = [exc_hz * k for k in range(1, harmonics + 1)]
@@ -1235,20 +1314,13 @@ class ValidationTools:
                 "clashes": clashes,
                 "material": case["material"],
                 "thermal_derating": effective_material(case["material"]),
-                "constraint_rank": rbm["constraint_rank"],
-                "nodes": int(len(m["node_tags"])),
-                "elements": int(len(m["connectivity"])),
+                **si.provenance(),
                 "solver_binary": binary.name, "solver_threads": threads,
                 "solve_seconds": round(solve_s, 2),
                 "peak_rss_mb": proc.peak_rss_mb,
-                "run_dir": str(run_dir),
                 "artifacts": [],
             }
             passed = not clashes
-        except Exception as exc:
-            self.log.close_action(
-                action_id, "fail", failure_mode=f"{type(exc).__name__}: {exc}")
-            raise
 
         if passed:
             self.log.close_action(action_id, "pass", details=details)
@@ -1272,54 +1344,15 @@ class ValidationTools:
                 "clashes": clashes}
 
     def fea_static(self, geometry_id: str, case: dict, reason: str) -> dict:
-        action_id = self.log.open_action(
-            "validation", "fea_static", geometry_version=str(geometry_id),
-            reason=str(reason))
-        try:
+        with self._action("fea_static", geometry_id, reason) as action_id:
             _check_reason(reason)
-            validate_case(case)
-            if not self.ccx_path.is_file():
-                raise FeaError(f"ccx solver not found at {self.ccx_path}")
-            part = self.parts.get_part(geometry_id)
-            run_dir = self._next_run_dir()
-
-            m = mesh_step(part["step_file_path"], case["mesh"]["max_size_mm"],
-                          case["mesh"].get("min_size_mm"))
-            constraint_sets = [select_nodes(m, c["where"]) for c in case["constraints"]]
-            rbm = check_rigid_body_modes(m, constraint_sets, case["constraints"])
-            load_sets = [
-                _consistent_face_loads(
-                    m, select_nodes(m, ld["where"]), ld["force_total_N"],
-                    f"case.loads[{i}]", ld["where"])
-                for i, ld in enumerate(case["loads"])]
+            si = self._prepare(geometry_id, case)
+            m, run_dir, part = si.mesh, si.run_dir, si.part
+            constraint_sets, rbm = si.constraint_sets, si.rbm
+            load_sets = self._face_loads(m, case)
             _write_inp(run_dir / "job.inp", m, case, constraint_sets, load_sets)
-
-            binary, env, threads_used = self._solver_command()
-            solve_t0 = time.time()
-            try:
-                proc = _run_solver(
-                    [str(binary), "-i", "job"], run_dir, env,
-                    self.solve_timeout_s)
-            except subprocess.TimeoutExpired:
-                raise FeaError(
-                    f"solver_timeout: {binary.name} exceeded "
-                    f"{self.solve_timeout_s}s on {len(m['node_tags'])} nodes "
-                    f"using {threads_used} thread(s). Direct-solve cost grows "
-                    f"steeply with node count - coarsen case.mesh.max_size_mm "
-                    f"(subject to the Jacobian gate on the thinnest feature), "
-                    f"or raise ValidationTools(solve_timeout_s=...).")
-            solve_s = time.time() - solve_t0
-            if proc.returncode != 0 or "Job finished" not in proc.stdout:
-                (run_dir / "ccx_stdout.txt").write_text(proc.stdout, encoding="utf-8")
-                # Name the memory cost in the failure itself. An access
-                # violation at a 6 GB working set and one at 500 MB are
-                # different failures wanting different remedies, and without
-                # this the log could not tell them apart.
-                mem = (f" peak memory {proc.peak_rss_mb:.0f} MB;"
-                       if proc.peak_rss_mb else "")
-                raise FeaError(
-                    f"solver_error: {binary.name} exit {proc.returncode};{mem} "
-                    f"tail: {proc.stdout[-400:]!r}")
+            proc, binary, threads_used, solve_s = self._solve(
+                run_dir, si.nodes)
 
             blocks = _parse_frd(run_dir / "job.frd")
             stress = blocks.get("STRESS")
@@ -1418,12 +1451,9 @@ class ValidationTools:
                 "max_von_mises_node": int(max_node),
                 "max_von_mises_at_mm": [round(float(v), 3) for v in coords[int(max_node)]],
                 "max_displacement_mm": round(max_disp, 9),
-                "nodes": int(len(m["node_tags"])),
+                **si.provenance(),
                 "result_records": {"disp": len(disp), "stress": len(stress)},
                 "equilibrium": equilibrium,
-                "elements": int(len(m["connectivity"])),
-                "run_dir": str(run_dir),
-                "constraint_rank": rbm["constraint_rank"],
                 "solver_binary": binary.name,
                 "solver_threads": threads_used,
                 "solve_seconds": round(solve_s, 2),
@@ -1435,10 +1465,6 @@ class ValidationTools:
                 "artifacts": [png_rel],
             }
             passed = sf >= required
-        except Exception as exc:
-            self.log.close_action(
-                action_id, "fail", failure_mode=f"{type(exc).__name__}: {exc}")
-            raise
         if passed:
             self.log.close_action(action_id, "pass", details=details)
         else:
