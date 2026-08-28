@@ -683,6 +683,53 @@ LATE = [
                  "Validation Philosophy", "Screened is not validated"]),
 
     MemoryEvent(
+        "Fatigue is modelled, and aluminium's missing endurance limit is why",
+        date="2026-08-28", type="Engineering", impact="Critical",
+        what_happened=(
+            "`design_engine/fatigue.py` adds a `fatigue_life` limit state "
+            "evaluated on a sourced S-N curve, with Palmgren-Miner damage over "
+            "a spectrum. It is built around one fact: ferritic steels have a "
+            "true endurance limit and aluminium alloys do not, so there is no "
+            "stress range at which a 6061 frame lasts forever - only one at "
+            "which it lasts long enough."),
+        why_it_matters=(
+            "Fatigue at 98,000 rpm is on the vault's list of what actually "
+            "kills jetpack pilots, and B2 turned it from theoretical to "
+            "immediate: a mode sits 0.37% from the shaft frequency, and at "
+            "1633.3 Hz the frame accumulates 5,879,880 cycles per hour. Ten "
+            "minutes of running is a million cycles. A check that assumed an "
+            "endurance limit would pass a part guaranteed to crack."),
+        decision=(
+            "`endurance_limit_MPa` has NO default and must be stated "
+            "explicitly, including as None. Detail-category VALUES are not "
+            "embedded either - the curve shape follows EN 1999-1-3 and "
+            "EN 1993-1-9, but the category depends on joint geometry and a "
+            "wrong one is worse than an absent one, so the caller supplies it "
+            "with its source."),
+        evidence=[
+            "Observed — 19 fatigue tests pass; 289 in the suite, up from 254",
+            "Calculated — cycles_from_exposure(1633.3, 1) = 5,879,880",
+            "Observed — a sharp T-junction is REFUSED rather than scored, "
+            "because life goes as range**-3.4 and an unbounded peak drives "
+            "predicted life to zero as the mesh refines",
+            "Unknown — the alternating amplitude at resonance, which depends "
+            "on damping this project has never measured"],
+        affected=["design_engine/fatigue.py", "design_engine/fea.py"],
+        consequences=(
+            "The engine can now ask the fatigue question. It cannot yet answer "
+            "it for the jetpack, because the stress range at resonance is "
+            "unknown - and it refuses to invent one rather than producing a "
+            "confident number."),
+        open_questions=(
+            "Damping is unmeasured, so the amplification at resonance is "
+            "Unknown. Detail categories for the actual welded joints have not "
+            "been selected. Whether Miner's linear rule is adequate for this "
+            "spectrum is untested."),
+        related=["Aluminium has no endurance limit",
+                 "The jetpack frame resonates with its own engines",
+                 "Jetpack Frame", "Refuse rather than invent"]),
+
+    MemoryEvent(
         "Geometric singularities are now detected, and the fillet is a 2D fix",
         date="2026-08-27", type="Engineering", impact="Critical",
         what_happened=(

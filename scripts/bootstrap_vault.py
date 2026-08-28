@@ -566,12 +566,30 @@ lowers every frequency AND the spacing, changing which modes clash rather than
 whether any do. SF 4.633 was computed assuming no mode was nearby.
 → [[The jetpack frame resonates with its own engines]]
 
-**NOT covered:** propulsion, fuel systems and fire, fatigue at 98,000 rpm,
-exhaust plume mapping, attitude control, and any physical qualification.
-Those are what actually kill jetpack pilots.
+**What kills jetpack pilots, and where each item now stands.** This list was
+written as a flat "not covered". Two of them have moved, so it is worth keeping
+the distinction between *the engine can now ask the question* and *the question
+is answered*.
+
+| Killer | Status |
+|---|---|
+| Fatigue at 98,000 rpm | **Machinery exists** — `fatigue_life` limit state on a sourced S-N curve, [[Aluminium has no endurance limit]]. The amplitude at resonance is still **Unknown**: it depends on damping, never measured here. |
+| Resonance | **Asked and failed.** Four modes inside the band, nearest 0.37%. → [[The jetpack frame resonates with its own engines]] |
+| Physical qualification | Still none. No result from this engine has ever been compared against a measurement. |
+| Propulsion | Out of scope — not a structural limit state. |
+| Fuel systems and fire | Out of scope, and the most likely actual killer. |
+| Exhaust plume mapping | Out of scope. Thermal derating uses the frame temperature as an *input*; nothing here predicts it. |
+| Attitude control | Out of scope — a controls problem, not a structures one. |
+
+The four "out of scope" rows are not a gap this engine should quietly grow into.
+A structural validator that starts opining on fuel-system fire risk would be
+inventing authority it has not earned. They are recorded so the boundary stays
+visible rather than being mistaken for coverage.
 """, links=["Jetpack Frame Optimization Run", "6061-T6 Thermal Derating",
             "Fire design data is not service data",
-            "Mesh convergence is unverified"])
+            "Mesh convergence is unverified",
+            "The jetpack frame resonates with its own engines",
+            "Aluminium has no endurance limit"])
 
     v.write("02_Designs/Approved", "Extension Ladder", type="design",
             status="validated", confidence="high", body="""
@@ -1008,6 +1026,45 @@ Ranked #4 on [[Roadmap]].
 - [[Fire design data is not service data]]
 - [[Refuse rather than invent]]
 """)
+
+    v.write("03_Engineering/Materials", "Aluminium has no endurance limit",
+            type="material", status="active", confidence="high", body="""
+**Ferritic steels have a true endurance limit. Aluminium alloys do not.**
+
+Below some stress range a steel component survives indefinitely. An aluminium
+one does not: its S-N curve keeps descending, so there is **no stress range at
+which an aluminium frame lasts forever** — only a range at which it lasts long
+enough. A fatigue check that assumes an endurance limit will pass a part that
+is guaranteed to crack.
+
+This is why `SNCurve.endurance_limit_MPa` has **no default** and must be stated
+explicitly, including as `None`. Defaulting it either way silently decides the
+question the check exists to ask.
+
+## Why it matters here specifically
+
+The jetpack frame is 6061-T6511, and
+[[The jetpack frame resonates with its own engines]].
+At the 1633.3 Hz shaft frequency it accumulates **5,879,880 cycles
+per hour** — ten minutes of running is a million cycles. There is no "safe"
+range to fall back on, so life is finite and the only question is how long.
+
+## What the engine does and does not know
+
+- **Does:** compute allowable cycles from a sourced curve, invert it to give
+  the allowable range at a required life, sum Palmgren-Miner damage over a
+  spectrum, and refuse to extrapolate past the curve's data.
+- **Does not:** know the alternating amplitude at resonance. That depends on
+  damping, which this project has never measured. **Unknown**, and recorded as
+  Unknown rather than assumed.
+
+Detail-category values are deliberately not embedded in the engine. The curve
+SHAPE follows EN 1999-1-3 (aluminium) and EN 1993-1-9 (steel); the category
+depends on joint geometry, and a wrong one is worse than an absent one. Same
+rule as [[Refuse rather than invent]].
+""", links=["The jetpack frame resonates with its own engines",
+            "6061-T6 Thermal Derating", "Refuse rather than invent",
+            "Jetpack Frame"])
 
     v.write("11_Lessons", "Read the vault before deciding, not after",
             type="lesson", confidence="high", body="""
