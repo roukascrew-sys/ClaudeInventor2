@@ -1027,6 +1027,52 @@ Ranked #4 on [[Roadmap]].
 - [[Refuse rather than invent]]
 """)
 
+    v.write("05_Failures/Engineering_Failures",
+            "Every safety factor used a strength the joints do not have",
+            type="failure", status="active", confidence="high",
+            extra={"severity": "high", "failure_kind": "modelling"}, body="""
+**Symptom:** the jetpack frame is described everywhere as a *welded* weldment,
+and every safety factor ever computed for it — including the validated
+SF 4.633 — used the **parent-metal** allowable, 276 MPa for 6061-T6511 taken
+from a supplier product page.
+
+**Why that is not conservative:** welding a 6xxx aluminium alloy destroys the
+T6 temper locally. The heat-affected zone reverts toward a substantially softer
+condition and design codes treat it as a different material with its own
+reduced proof strength. Aluminium differs sharply from steel here, where a
+welded joint recovers most of its strength.
+
+    EN 1999-1-1 (Eurocode 9, Part 1-1) section 6.1.6 gives the softening
+    factors rho_o,haz and the extent b_haz over which they apply.
+
+**The part that makes it bite — Observed:** *both* recorded peaks sit inside
+the HAZ. The four spine/pad junction welds run along Y at |x| = 22.225,
+z = 199.6 and 250.4; the sharp `P0047` peak and the filleted `P0048` peak are
+each within 25 mm of them. The peak stress is at the joint, which is exactly
+where the material is softest and where the parent-metal number is furthest
+from the truth.
+
+**Calculated:** at a 0.5 softening factor the filleted frame's SF 4.633 becomes
+2.317 — below its own 3.0 gate.
+
+**Unknown, and this is the honest limit:** the actual rho_o,haz for 6061-T6511
+MIG at this thickness has not been sourced. **2.317 is a sensitivity, not a
+result.** The design is not currently known to fail; it is known to be
+sensitive to a number nobody has looked up.
+
+**Fix:** `design_engine/weld.py` adds heat-affected zones with sourced factors,
+applied in the static gate *after* thermal derating — the two are independent,
+and a structure that is both welded and hot is softened by both. Values are not
+embedded, for the same reason S-N detail categories are not: softening depends
+on alloy, temper, process, joint type and thickness, and a wrong factor is
+worse than an absent one.
+
+**Lesson:** "welded" in a design description is not a modelling decision until
+something in the model acts on it. The word had been in this project's notes
+since the frame was designed, and nothing in the engine had ever read it.
+""", links=["Jetpack Frame", "Aluminium has no endurance limit",
+            "Refuse rather than invent", "Fire design data is not service data"])
+
     v.write("03_Engineering/Materials", "Aluminium has no endurance limit",
             type="material", status="active", confidence="high", body="""
 **Ferritic steels have a true endurance limit. Aluminium alloys do not.**

@@ -683,6 +683,52 @@ LATE = [
                  "Validation Philosophy", "Screened is not validated"]),
 
     MemoryEvent(
+        "Every jetpack safety factor used a strength the joints do not have",
+        date="2026-08-28", type="Engineering", impact="Critical",
+        what_happened=(
+            "`design_engine/weld.py` adds heat-affected zones with sourced "
+            "softening factors, applied in the static gate after thermal "
+            "derating. Applying it to the frame showed that BOTH recorded "
+            "peaks - the sharp P0047 and the filleted P0048 - sit within 25 mm "
+            "of the four spine/pad junction weld lines."),
+        why_it_matters=(
+            "The frame is described throughout as a welded weldment and every "
+            "safety factor ever computed for it, including the validated "
+            "SF 4.633, used the parent-metal allowable of 276 MPa. Welding a "
+            "6xxx alloy destroys the T6 temper locally, so that is a strength "
+            "which does not exist at the joints - and the peak stress is AT a "
+            "joint. Aluminium differs sharply from steel here, where a welded "
+            "joint recovers most of its strength."),
+        decision=(
+            "Softening values are not embedded, for the same reason S-N detail "
+            "categories are not: they depend on alloy, temper, process, joint "
+            "type and thickness, and a wrong factor is worse than an absent "
+            "one. The engine also cannot guess where the welds are - a spec "
+            "that unions two boxes says nothing about whether the junction is "
+            "welded or machined - so weld lines are explicit geometry."),
+        evidence=[
+            "Observed — both peaks fall within 25 mm of the declared weld lines",
+            "Calculated — at a 0.5 softening factor SF 4.633 becomes 2.317, "
+            "below the design's own 3.0 gate",
+            "Unknown — the actual rho_o,haz for 6061-T6511 MIG at this "
+            "thickness is not sourced, so 2.317 is a SENSITIVITY, not a result",
+            "Observed — 345 tests pass, 22 of them new"],
+        affected=["design_engine/weld.py", "design_engine/fea.py",
+                  "designs/jetpack_optimization_run.py"],
+        consequences=(
+            "Applied after thermal derating rather than instead of it: the two "
+            "are independent and a structure that is both welded and hot is "
+            "softened by both. Overlapping zones take the worst softening, not "
+            "the first declared, so the answer cannot depend on list order."),
+        open_questions=(
+            "The 6061-T6511 MIG softening factor and HAZ extent have not been "
+            "sourced, so the frame is not currently known to fail - it is known "
+            "to be sensitive to a number nobody has looked up. Weld throat "
+            "sizing and bolted-joint preload are still unmodelled."),
+        related=["Every safety factor used a strength the joints do not have",
+                 "Jetpack Frame", "Aluminium has no endurance limit"]),
+
+    MemoryEvent(
         "Couplings between validators are declared, so staleness is computed",
         date="2026-08-28", type="Architecture", impact="High",
         what_happened=(
