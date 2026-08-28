@@ -632,6 +632,58 @@ LATE = [
                  "Mesh convergence is unverified"]),
 
     MemoryEvent(
+        "Geometric singularities are now detected, and the fillet is a 2D fix",
+        date="2026-08-27", type="Engineering", impact="Critical",
+        what_happened=(
+            "`design_engine/singularity.py` classifies whether a peak stress "
+            "sits on a sharp re-entrant corner, working on the CAD solid "
+            "rather than the mesh, and `fea_static` now reports the verdict. "
+            "Applying it to the existing parts showed the fillet added earlier "
+            "took P0047 -> P0048 from 12 sharp re-entrant edges to 8, NOT to "
+            "zero: the 15.71 mm remainders are exactly pi*10/2, the fillet "
+            "arc, where the blend runs out against the side walls at "
+            "y = +/-9.525."),
+        why_it_matters=(
+            "The engine had no way to tell a converged stress from an "
+            "unbounded one, which is how SF 3.844 was reported and passed by "
+            "every check. More importantly the new finding qualifies the fix: "
+            "the fillet is a 2D blend of a 3D corner. The current peak is "
+            "9.51 mm clear of the remaining edges so SF 4.633 does not sit on "
+            "one, but that is luck rather than design, and a different load "
+            "case or a finer mesh could put it back on a singularity."),
+        decision=(
+            "Detect on the CAD solid, never the mesh: a concave fillet's "
+            "facets are each slightly re-entrant (~198 degrees at r=10, "
+            "h=3.2), so no mesh-based threshold can separate a real corner "
+            "from a tessellated smooth one. Classify, never gate - a singular "
+            "peak is meaningless rather than conservative, so the honest "
+            "response is to say so, not to substitute an invented number."),
+        evidence=[
+            "Observed — P0047@v1 SINGULAR at 1.28 mm, 12 sharp edges",
+            "Observed — P0048@v1 CLEAN at 9.51 mm, 8 sharp edges remaining",
+            "Observed — end-to-end CalculiX solve on a T-junction: outlier "
+            "ratio 1.044, the cleanest possible reading, while the new check "
+            "reports SINGULAR at 1.46 mm",
+            "Calculated — `_williams_exponent` recovers 0.4555 at 270 degrees "
+            "by bisection, matching the published L-shaped-domain eigenvalue",
+            "Observed — 254 tests pass, 15 of them new"],
+        affected=["design_engine/singularity.py", "design_engine/fea.py",
+                  "designs/jetpack_optimization_run.py"],
+        consequences=(
+            "Two wrong implementations are documented in the module so they "
+            "are not retried: a boundary-triangle dihedral test, and a "
+            "face-centroid direction that fails on any face with a hole in it "
+            "- which silently lost the exact edge the module was written to "
+            "catch, because the pad's underside has the spine through it."),
+        open_questions=(
+            "Whether the remaining 8 edges on P0048 need filleting too, which "
+            "would require blending in the y direction as well. Unknown "
+            "whether any realistic load case moves the peak onto one."),
+        related=["Peak stress at a sharp re-entrant corner cannot converge",
+                 "The outlier ratio does not detect geometric singularities",
+                 "Jetpack Frame", "Mesh convergence is unverified"]),
+
+    MemoryEvent(
         "Solver memory is now measured, so affordability can stop guessing",
         date="2026-08-27", type="Performance", impact="High",
         what_happened=(
