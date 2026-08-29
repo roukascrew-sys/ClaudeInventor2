@@ -1141,6 +1141,132 @@ pass — this constraint is local to the engine, not something the literature
 has an opinion about.
 """, links=["Roadmap", "Design Engine", "Optimization Engine"])
 
+    v.write("05_Failures/Bugs",
+            "A conda run grandchild outlived its 900 s deadline",
+            type="failure", status="resolved", confidence="high",
+            extra={"severity": "high", "failure_kind": "bug"},
+            tags=["claudeinventor", "kinematics", "chrono", "windows"],
+            body="""
+**Symptom:** two tests in `tests/test_kinematics.py` hung intermittently
+during a full `pytest tests/ -q`, while passing when the file was run alone.
+Total suite runtime went from ~2 min to 38m49s. One failure reported a worker
+killed *past* its 900 s deadline; the other was `conda run` returning exit 5
+with `ERROR: No output from 'conda activate ...'`.
+
+## Root cause: two independent defects, both about process lifetime
+
+**1. The worker was a grandchild, so the kill never reached it.**
+`_solve` ran `conda run -n chrono --no-capture-output python chrono_worker.py`
+under `subprocess.run(capture_output=True, timeout=900)`. `conda run`
+interposes a process: the handle Python holds is conda's, not the worker's.
+`Popen.kill()` on Windows is `TerminateProcess` on that one handle, so the
+worker survived. Worse, CPython's `subprocess.run` Windows timeout path
+(`Lib/subprocess.py`, `run()`) calls `communicate()` a **second time after
+`kill()` with no timeout**, and that call blocks until *every* process holding
+the inherited stdout/stderr pipe write handles has exited. The surviving
+worker therefore held the parent for as long as it liked.
+
+Reproduced deterministically with no Chrono involved: a parent that spawns a
+25 s grandchild, run under `subprocess.run(timeout=3)`, surfaced its
+`TimeoutExpired` at **25.3 s** - a 22.3 s overshoot on a 3 s deadline, i.e.
+exactly the grandchild's lifetime. Scale that to a worker that never exits and
+the deadline is decorative.
+
+**2. `import pychrono` can block forever, which is what the worker was doing.**
+On Windows PyChrono's `_irrlicht.pyd` loads `Irrlicht.dll` / `SDL.dll` /
+`jpeg8.dll` from `<env>/Library/bin`. Without conda's activation PATH the load
+fails into a **modal Windows error box** in a process with no interactive
+user. Measured: the process sat with an "Error" window,
+`comctl32`/`uxtheme`/`uiautomationcore` loaded, **0.33 s of CPU over 9m28s**,
+no output, and never exited. `SetErrorMode(SEM_FAILCRITICALERRORS)` does *not*
+suppress it: it is an application message box, not the system critical-error
+handler.
+
+## Fix
+
+`design_engine/kinematics.py` launches `<envdir>/python.exe` **directly**, with
+the environment `conda activate` would have set (`activation_env()`), and
+enforces the deadline in `run_worker()`:
+
+- direct spawn, so the worker is the direct child and the kill reaches it;
+- stdout/stderr go to **files, not pipes**, so there are no reader threads and
+  nothing a survivor can hold open: the post-kill reap cannot block;
+- `kill_tree()` kills the whole tree (`taskkill /T /F`, `killpg` on POSIX) and
+  reaps within a bounded grace.
+
+Removing `conda run` also removes the `conda activate` shell round-trip that
+produced failure (2) in the symptom above, and is faster.
+
+## Measured, 2026-08-28
+
+| launch | `import pychrono` |
+| --- | --- |
+| `<envdir>/python.exe`, inherited env | hung, >9 min, killed by hand |
+| `<envdir>/python.exe` + activation PATH | 3.2 s |
+| `conda run -n chrono ... python` | 7.5 s |
+
+## The same pattern in the CalculiX runner
+
+`fea._run_solver` had the identical `kill()`-then-unbounded-`communicate()`
+shape. It is now fixed too, and the two fixes are deliberately *not* the same:
+
+- `design_engine/proc.py` is the shared home for `kill_tree`; `kinematics.py`
+  imports it rather than keeping a copy.
+- **`killpg` fires only when the child is in a process group of its own.**
+  `run_worker` always passes `start_new_session=True`, but the solver's
+  `Popen` did not, and signalling a shared group would have killed the caller
+  - a test runner included. That guard is what makes the helper safe for any
+  caller but the one it was written for.
+- `_run_solver` **keeps its pipes**, because the solver's stdout is parsed and
+  written to `ccx_stdout.txt`. The file-redirection route is unavailable
+  there, so it uses a bounded `communicate(timeout=REAP_GRACE_S)`: the
+  exposure is **capped at 10 s rather than removed**. Both routes are written
+  into `proc.py`'s docstring so the next reader sees the tradeoff.
+
+`ccx.exe` and `ccx_MT.exe` contain no process-creation API anywhere in their
+bytes, so the tree kill there is insurance rather than a live bug fix. That
+was checked by **byte scan, not import-table parse**, on purpose:
+`GetProcAddress` *is* imported, so absence from the import table would not
+have ruled out dynamic resolution. `tests/test_solver_timeout.py` pins it, so
+a future ccx build that gains the ability to spawn breaks the test loudly
+instead of the guard failing quietly.
+
+## The venv launcher is itself a grandchild case
+
+`.venv/Scripts/python.exe` does not `exec`; it `CreateProcess`-es the
+interpreter named in `pyvenv.cfg` and waits. Measured: `Popen.pid` 31008 vs an
+inner pid of 23348. Two consequences:
+
+- Every `sys.executable` spawn in this repo's tests is already a grandchild
+  case, so `tests/test_chrono_bridge.py`'s fixture is four levels deep
+  (`run_worker` -> stub -> worker -> stub -> grandchild), and the pid it
+  asserts dead is the one the deepest process wrote for itself. The tree kill
+  is pinned across four levels, not the two it was designed for.
+- `_peak_rss_mb` reads the **direct** child, so behind any wrapper it reports
+  a small, plausible, wrong number rather than an error: 4.1 MB measured
+  against a script that allocates 256 MB, 266.1 MB via the real interpreter.
+
+The chrono env's interpreter is **not** a stub - pid matches, no `pyvenv.cfg`,
+because conda envs ship a real interpreter. So the claim that the direct spawn
+makes the worker the direct child is measured, not inferred.
+
+## Honest limits
+
+The overshoot is reproduced and explained. The **negative** figure in the
+original report ("timed out after -1341.516 seconds") is *not* reproducible
+from `subprocess.run(timeout=900)` as written: `_communicate` caps its first
+pass at the deadline, so `_remaining_time` cannot reach -1341 there, and the
+reproduction above yields a positive "timed out after 3 seconds". The sign is
+unexplained. It is also now unreachable, because the failure names the
+configured timeout as a constant rather than a computed remainder.
+
+What the modal box actually says is also unknown: it is unresponsive to UI
+Automation, `WM_GETTEXT` and `PrintWindow`, and nothing reaches the Windows
+Application log.
+""", links=["Solver timeout wastes the full budget",
+            "Solver runs cannot be parallelised",
+            "Design Engine"])
+
     v.write("04_Optimization/Surrogates", "Screening models need automatic calibration",
             type="open-question", status="active", confidence="high", body="""
 The correction that took the jetpack screening model from 76–96% error down to
