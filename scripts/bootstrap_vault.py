@@ -142,7 +142,7 @@ truth; this vault is reasoning truth — why the system works the way it does.
 """, tags=["claudeinventor", "index"])
 
     v.write("00_Home", "Current State", type="index", confidence="high", body="""
-Verified against the repository at commit `9f8943e`, 2026-08-27.
+Verified against the repository at commit `603ba37`, 2026-08-29.
 
 ## What exists and works
 - **Deterministic engineering engine** (`design_engine/`): geometry, meshing,
@@ -157,7 +157,15 @@ Verified against the repository at commit `9f8943e`, 2026-08-27.
 - **Project memory** (`design_engine/memory.py`): the chronological half of
   this vault — validated, append-only, supersedes rather than deletes.
   [[Project Memory]]
-- **189 tests passing**, 2026-08-27.
+- **Sourced uncertainty** (`design_engine/uncertainty.py`): `SourcedValue`
+  demands a citation and `SourcedRange` refuses a nominal that no source
+  supports, so a parameter cannot be quietly evaluated at a midpoint, a
+  rounded figure, or the average of disagreeing references.
+- **Enforced subprocess deadlines** (`design_engine/proc.py`): a solver or
+  worker that overruns is killed with its whole process tree. The deadline
+  used to be advisory - see
+  [[A conda run grandchild outlived its 900 s deadline]].
+- **422 tests passing**, 4 skipped, 2026-08-29.
 
 ## Nothing is blocked
 The CAD kernel imports and the full suite runs. An earlier entry here reported
@@ -166,10 +174,26 @@ wrong** — Smart App Control is still enforcing and CadQuery imports anyway. Se
 [[The CAD kernel blockage was misattributed to Smart App Control]]. The
 mechanism of the original failure is still unknown.
 
-## Best validated results
+## Refused rather than approximated
+- **Submodel interpolation.** The region and the cut are computed and valid,
+  but CalculiX 2.23 `*SUBMODEL` costs ~88-182 ms per driven node and scales
+  superlinearly, and the real geometry did not complete within 900 s.
+  `fea_submodel` refuses with `submodel_interpolation_unaffordable` rather
+  than walking a ladder that will not finish. Coarsening cuts the driven set
+  and is worth trying; the residual is recorded as Unknown, so it is not
+  known to work.
+
+## Best results, and the gate they do not clear
 - Jetpack frame, searched: **3.901 kg at FEA SF 3.844** (`P0047@v1`)
 - Jetpack frame, hand-built: **5.530 kg at FEA SF 5.274** (`P0031@v2`)
-- Both clear the 3.0 gate. See [[Jetpack Frame Optimization Run]].
+- **Those safety factors are against base-material strength, and the frame is
+  welded.** Applying any sourced 6xxx-T6 HAZ factor to the filleted frame's
+  54.207 MPa peak gives **SF 2.32 down to 1.74** against a required 3.0.
+  Passing would need `rho_o,haz >= 0.647`; no source supports a value above
+  0.50. **The frame fails its own gate**, and did so before this page last
+  claimed otherwise. See
+  [[Every safety factor used a strength the joints do not have]] and
+  [[Jetpack Frame Optimization Run]].
 """, links=["Home", "Project Memory", "Roadmap", "Open Questions"])
 
     v.write("00_Home", "Roadmap", type="index", body="""
