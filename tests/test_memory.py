@@ -236,3 +236,60 @@ def test_file_is_utf8_regardless_of_console_encoding(pm):
     raw = pm.path.read_bytes()
     assert "—".encode("utf-8") in raw
     assert pm.path.read_text(encoding="utf-8").count("—") > 0
+
+
+# ------------------------------------------ event citations vs note citations
+def test_event_citations_render_as_heading_links_into_this_document(pm):
+    """A cited EVENT is a heading here, not a note sitting beside it.
+
+    Regression for a field with no defined referent. `related` rendered every
+    entry as `[[Title]]`, so an event citation resolved only when a note
+    happened to share the event's title — and then resolved to the NOTE.
+    Three of the four citations in the real document were in that case and one
+    dangled; the difference was a filename collision, not intent.
+    """
+    pm.append(_event("The earlier event", date="2026-08-01"))
+    pm.append(_event("The later event", related_events=["The earlier event"]))
+    text = pm.path.read_text(encoding="utf-8")
+    assert ("[[Project Memory#2026-08-01 \u2014 The earlier event"
+            "|The earlier event]]") in text
+    # and NOT the bare form, which would point at a note of that name if one
+    # ever appeared, and at nothing until then
+    assert "- [[The earlier event]]" not in text
+
+
+def test_a_heading_link_into_the_memory_does_not_read_as_dangling(pm):
+    r"""The link target is `Project Memory`, which exists; the `#` is an anchor.
+
+    Both link checkers stop at `#` (`\[\[([^\]|#]+)`), so this form keeps the
+    broken-link gate meaningful instead of silencing it. That matters more
+    than it looks: bootstrap_research.py returns 1 while any link dangles, so
+    one bad citation kills every `&&` chained after it.
+    """
+    # the document header itself links [[Current State]]; give it a target so
+    # this test measures the citation and nothing else
+    (pm.root / "00_Home").mkdir(parents=True, exist_ok=True)
+    (pm.root / "00_Home" / "Current State.md").write_text("x", encoding="utf-8")
+    pm.append(_event("Cited event", date="2026-08-02"))
+    pm.append(_event("Citing event", related_events=["Cited event"]))
+    assert pm.dangling_links() == []
+
+
+def test_citing_an_event_that_does_not_exist_is_refused(pm):
+    """Refuse rather than emit a link to nothing — as append() already does
+    for a duplicate title."""
+    with pytest.raises(mem.UnknownEvent):
+        pm.append(_event("Cites a ghost", related_events=["No such event"]))
+
+
+def test_rendering_event_citations_without_a_resolver_is_refused():
+    """A MemoryEvent cannot know another event's date, so it must not guess."""
+    ev = _event("Standalone", related_events=["Something"])
+    with pytest.raises(mem.MemoryError_):
+        ev.render()
+
+
+def test_note_citations_are_untouched_by_the_split(pm):
+    """`related` still means vault notes and still renders bare."""
+    pm.append(_event("Note citer", related=["Current State"]))
+    assert "- [[Current State]]" in pm.path.read_text(encoding="utf-8")

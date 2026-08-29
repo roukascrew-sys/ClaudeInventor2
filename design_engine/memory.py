@@ -39,7 +39,7 @@ from __future__ import annotations
 import datetime
 import re
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 MEMORY_NOTE = "Project Memory"
 MEMORY_FOLDER = "00_Home"
@@ -94,6 +94,23 @@ class MemoryEvent:
     Validation happens here rather than at write time so a malformed event can
     never reach the file. A half-written entry in a memory document is worse
     than no entry, because it still reads as authoritative.
+
+    **Two kinds of citation, because they are two kinds of thing.**
+    `related` names VAULT NOTES and renders `[[Title]]`. `related_events`
+    names OTHER EVENTS in this document and renders a heading link into it,
+    `[[Project Memory#<date> - <title>|<title>]]`, the same form supersede()
+    already uses.
+
+    The split exists because the single field that preceded it had no defined
+    referent, and the failure was invisible. An event title that happened to
+    match a note title resolved - to the NOTE, whichever the author meant -
+    while one that did not simply dangled. Three of the four citations in this
+    document were in the first case and one in the second, and the difference
+    was luck, not intent: nothing recorded which was meant, so the intent is
+    unrecoverable rather than provably wrong. The dangling one also returned a
+    non-zero exit from bootstrap_research.py, silently killing any `&&` after
+    it. A field whose meaning is decided by a filename collision is not a
+    field; it is a coin toss that fails a build script when it lands wrong.
     """
 
     def __init__(self, title: str, *, type: str, impact: str,
@@ -101,6 +118,7 @@ class MemoryEvent:
                  decision: str = "", evidence: Sequence[str] = (),
                  affected: Sequence[str] = (), consequences: str = "",
                  open_questions: str = "", related: Sequence[str] = (),
+                 related_events: Sequence[str] = (),
                  date: str | None = None):
         if type not in TYPES:
             raise MemoryError_(
@@ -134,11 +152,19 @@ class MemoryEvent:
         self.consequences = consequences.strip() or UNKNOWN
         self.open_questions = open_questions.strip() or UNKNOWN
         self.related = list(related)
+        self.related_events = list(related_events)
 
     # ------------------------------------------------------------- rendering
-    def render(self) -> str:
+    def render(self, date_of: "Callable[[str], str] | None" = None) -> str:
         """Markdown for one event. `##` headings so Obsidian's outline pane
-        indexes each event and `[[Project Memory#<heading>]]` can target it."""
+        indexes each event and `[[Project Memory#<heading>]]` can target it.
+
+        `date_of` resolves a cited event's title to its date, which the heading
+        link needs and this object cannot know. ProjectMemory supplies it. An
+        event citation therefore REFUSES when the cited event does not exist,
+        rather than emitting a link that points at nothing - the same reason
+        append() refuses a duplicate title.
+        """
         out = [f"## {self.date} — {self.title}", "",
                f"**Type:** {self.type} · **Impact:** {self.impact}", ""]
 
@@ -162,7 +188,15 @@ class MemoryEvent:
              else UNKNOWN)
         para("Consequences", self.consequences)
         para("Open questions", self.open_questions)
-        bullets("Related", [f"[[{r}]]" for r in self.related])
+        cites = [f"[[{r}]]" for r in self.related]
+        if self.related_events and date_of is None:
+            raise MemoryError_(
+                f"{self.title!r} cites events {self.related_events} but no "
+                f"resolver was supplied; render through ProjectMemory so the "
+                f"cited event's date can be looked up")
+        for r in self.related_events:
+            cites.append(f"[[{MEMORY_NOTE}#{date_of(r)} \u2014 {r}|{r}]]")
+        bullets("Related", cites)
         return "\n".join(out).rstrip() + "\n"
 
 
@@ -274,7 +308,8 @@ class ProjectMemory:
         existing = self._events_region()
         # Newest first: a session with limited context should reach the most
         # recent state before the archaeology, and be able to stop reading.
-        region = event.render() + ("\n" + existing.lstrip("\n") if existing else "")
+        region = (event.render(self._date_of)
+                  + ("\n" + existing.lstrip("\n") if existing else ""))
         return self._write(region)
 
     def amend(self, title: str, note: str, *, label: str = "Observed") -> Path:
