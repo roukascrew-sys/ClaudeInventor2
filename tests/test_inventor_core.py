@@ -259,3 +259,76 @@ def test_objective_vector_is_none_when_incomplete():
     assert c.result.objective_vector(objs) is None
     c.result.metrics["cost_usd"] = 5.0
     assert c.result.objective_vector(objs) == [1.0, 5.0]
+
+
+# ------------------------------------------- the case must reach the key
+def test_changing_the_fea_case_changes_the_cache_key():
+    """The 2026-08-29 silent-staleness bug.
+
+    CODE_DIGEST hashes geometry.py, mesh.py and fea.py. It does NOT hash the
+    design script, and that is where the FEA case is built - loads,
+    constraints, material, weld map. `config_digest` recorded only the case
+    builder's NAME, which is stable however the case changes.
+
+    So adding a `weld` block to the jetpack case changed neither key, a
+    promotion run reported "3 solved in 0.1s", and the safety factors it
+    returned had been computed against a material state the case no longer
+    described.
+    """
+    from design_engine.inventor.adapters import FeaStage
+    from design_engine.inventor.evaluate import EvaluationCache, EvalContext
+
+    base = {"material": {"name": "m"}, "mesh": {"max_size_mm": 5.0},
+            "constraints": [], "loads": [],
+            "limit_state": {"name": "yield_von_mises", "required_SF": 3.0}}
+
+    def without_weld(cand, ctx):
+        return dict(base)
+
+    def with_weld(cand, ctx):
+        c = dict(base)
+        c["weld"] = [{"name": "z", "factor": 0.5, "extent_mm": 25.0,
+                      "source": "test", "lines": [[[0, 0, 0], [1, 0, 0]]]}]
+        return c
+
+    space = DesignSpace(name="s", variables=[
+        DesignVariable("a", VarType.CONTINUOUS, lo=0.0, hi=2.0)])
+    ctx = EvalContext(space, RequirementSet(
+        name="r", objectives=[Objective("mass", "mass_kg", Sense.MIN)]))
+    cand = Candidate(values={"a": 1.0})
+
+    # Same builder NAME on purpose: that is what the old key recorded, so a
+    # test using differently-named functions would pass without the fix.
+    without_weld.__name__ = with_weld.__name__ = "build_case"
+
+    k_plain = EvaluationCache.key(
+        cand, FeaStage(without_weld), ctx,
+        input_digest=FeaStage(without_weld).input_digest(cand, ctx))
+    k_weld = EvaluationCache.key(
+        cand, FeaStage(with_weld), ctx,
+        input_digest=FeaStage(with_weld).input_digest(cand, ctx))
+
+    assert k_plain != k_weld, (
+        "a case carrying a weld map must not share a cache key with one that "
+        "does not - that returns a safety factor against the wrong allowable")
+
+
+def test_an_identical_case_still_hits_the_cache():
+    """The fix must not defeat caching, which is what makes search possible."""
+    from design_engine.inventor.adapters import FeaStage
+    from design_engine.inventor.evaluate import EvaluationCache, EvalContext
+
+    def build_case(cand, ctx):
+        return {"material": {"name": "m"}, "mesh": {"max_size_mm": 5.0},
+                "constraints": [], "loads": [],
+                "limit_state": {"name": "yield_von_mises", "required_SF": 3.0}}
+
+    space = DesignSpace(name="s", variables=[
+        DesignVariable("a", VarType.CONTINUOUS, lo=0.0, hi=2.0)])
+    ctx = EvalContext(space, RequirementSet(
+        name="r", objectives=[Objective("mass", "mass_kg", Sense.MIN)]))
+    cand = Candidate(values={"a": 1.0})
+    stage = FeaStage(build_case)
+    d = stage.input_digest(cand, ctx)
+    assert (EvaluationCache.key(cand, stage, ctx, input_digest=d)
+            == EvaluationCache.key(cand, stage, ctx, input_digest=d))

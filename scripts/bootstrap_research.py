@@ -629,7 +629,40 @@ Two constraints on the eventual implementation, both from this pass:
 - **The scoping problem is the correlation problem.** {ARX3}'s correlation gate
   is the same guarantee the weak `problem` field is trying to give: a
   correction may only apply where the two fidelities have been shown to track
-  each other. See [[A weakly correlated cheap model is worse than none]].""",
+  each other. See [[A weakly correlated cheap model is worse than none]].
+
+## What the 2026-08-29 back-fill found
+
+The pairs were moved out of prose and into `calibrations`, and the answer is
+not the one the plan assumed.
+
+**15 pairs were recoverable, 12 after collapsing duplicates, and NO problem
+family reaches three distinct pairs.** `correction()` still returns `None` for
+every one of them. That is not a plumbing failure - it is the honest state of
+the evidence. This project has never solved enough **distinct** designs within
+one problem family to calibrate its screen, and the conclusion is robust to
+how the families are cut: the largest is n=2 under any defensible grouping.
+
+So the missing consumer was never the only blocker. Even wired, there is
+nothing for it to consume yet, and **more solving does not fix it unless the
+solves are of DIFFERENT designs in the SAME family**. Three near-identical
+candidates from one search generation are one sample, not three - P0024, P0025
+and P0026 all carried predicted 42.1 against measured 62.36, the same numbers
+to four figures.
+
+Two things the data says in passing, both worth knowing before anyone builds a
+single "screening correction":
+
+- The two buckling pairs disagree by **3.97x** (ratios 0.102 and 0.405).
+- The screen errs in **opposite directions** for the two metrics -
+  under-predicting stress, which is unsafe, while under-predicting buckling
+  safety factor, which is conservative. One correction factor cannot serve
+  both.
+
+Populating the table also made a latent hazard live, now closed: an
+**unscoped** `correction()` call that would average across different problems
+is refused rather than answered. Pooling a ladder channel with a jetpack frame
+gives a factor with more observations behind it and less meaning.""",
         links=["Roadmap", "Engineering Knowledge Base",
                "Screening models are optimistic in the unsafe direction",
                "The skip threshold must be derived from measured error",

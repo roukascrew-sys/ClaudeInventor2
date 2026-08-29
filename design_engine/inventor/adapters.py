@@ -166,6 +166,13 @@ class GeometryStage:
                             f"spec: {exc}",
                     fidelity=self.fidelity, trustworthy=False)])
 
+        # SIDE EFFECT, and it has to survive the cache. Later stages read
+        # `cand.spec` - FeaStage cannot materialise a part without it - but a
+        # cache HIT reconstructs only the StageResult, so the spec would be
+        # lost and the next stage would fail with "candidate has no spec".
+        # It stayed hidden while FeaStage was cached under the same conditions
+        # as this stage; the moment one missed and the other hit, it surfaced.
+        # Carrying the spec in the result is what makes the stage replayable.
         cand.spec = spec
         cand.spec_digest = props["spec_digest"]
         size = props["bbox_mm"]["size"]
@@ -181,7 +188,8 @@ class GeometryStage:
             metrics["mass_kg"] = props["mass_kg_estimate"]
         return StageResult(self.name, self.fidelity, Status.VALID,
                            metrics=metrics,
-                           provenance={"spec_digest": props["spec_digest"]})
+                           provenance={"spec_digest": props["spec_digest"],
+                                       "spec": spec})
 
 
 class CostStage:
@@ -263,6 +271,21 @@ class FeaStage:
         return digest_of([self.analysis, self.mesh_mm, int(self.fidelity),
                           self.n_modes, self.mesh_ladder,
                           getattr(self.case_builder, "__name__", "case")])
+
+    def input_digest(self, cand: Candidate, ctx: EvalContext) -> str:
+        """Digest of the CASE this stage would actually solve.
+
+        The case is the solver's real input: material, mesh, constraints,
+        loads, weld map, limit state. `config_digest` can only see the case
+        builder's NAME, which is stable however the case changes - so editing
+        the builder used to leave the cache key untouched and return a result
+        computed from a case that no longer exists.
+
+        Building it twice per candidate is the cost. It is arithmetic on a
+        dict against a CalculiX solve, and a stale safety factor is the thing
+        this project refuses hardest.
+        """
+        return digest_of(self.case_builder(cand, ctx))
 
     # -- materialisation ------------------------------------------------
     def materialize(self, cand: Candidate, ctx: EvalContext) -> str:

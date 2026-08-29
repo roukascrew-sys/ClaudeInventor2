@@ -61,6 +61,16 @@ def _code_digest() -> str:
             h.update(Path(mod.__file__).read_bytes())
         except OSError:                       # pragma: no cover - defensive
             h.update(b"unreadable")
+    # adapters.py too. It defines the STAGES - what they put in a result, what
+    # side effects they leave on the candidate, how a case reaches the solver -
+    # and it is hashed by path rather than through an import because adapters
+    # imports this module. Added 2026-08-29 after a stage started carrying its
+    # spec in its result and every cached payload predating that change was
+    # still served, leaving later stages with no spec to work from.
+    try:
+        h.update((Path(__file__).parent / "adapters.py").read_bytes())
+    except OSError:                           # pragma: no cover - defensive
+        h.update(b"unreadable")
     return h.hexdigest()[:12]
 
 
@@ -125,7 +135,7 @@ class EvaluationCache:
 
     @staticmethod
     def key(cand: Candidate, stage: Stage, ctx: EvalContext,
-            fact_digest: str = "") -> str:
+            fact_digest: str = "", input_digest: str = "") -> str:
         payload = {
             "values": {k: (round(v, 9) if isinstance(v, float) else v)
                        for k, v in sorted(cand.values.items())},
@@ -135,6 +145,19 @@ class EvaluationCache:
             "base_spec": _geom_mod.spec_digest(ctx.base_spec) if ctx.base_spec else None,
             "code": CODE_DIGEST,
         }
+        # The stage's ACTUAL inputs, where it can produce them. CODE_DIGEST
+        # covers geometry.py, mesh.py and fea.py; it does not cover the design
+        # script, and that is where the FEA case is built - the loads, the
+        # constraints, the material and the weld map. `config_digest` recorded
+        # the case builder's NAME, which never changes however the case does.
+        #
+        # Measured 2026-08-29: adding a `weld` block to the jetpack case
+        # changed neither key, so a promotion run reported "3 solved in 0.1s"
+        # and returned safety factors computed against a material state the
+        # case no longer described. See "Silent promotion failure" - same
+        # symptom, different cause.
+        if input_digest:
+            payload["stage_input"] = input_digest
         # Staleness between stages, computed rather than remembered. Only added
         # when the stage actually consumes something, so a stage that declares
         # nothing keeps the exact key it had before coupling existed and its
@@ -272,11 +295,32 @@ class Evaluator:
                 # up contradicting one that already ran.
                 result.absorb(_unmet_dependency(stage, missing))
                 continue
+            # Ask the stage what it will actually feed the solver. A stage
+            # that cannot say returns "" and keeps exactly the key it had.
+            try:
+                stage_input = stage.input_digest(cand, self.ctx)
+            except AttributeError:
+                stage_input = ""
+            except Exception:       # noqa: BLE001 - a digest must never break
+                stage_input = ""    # a solve; an empty one just means no gain
             key = EvaluationCache.key(cand, stage, self.ctx,
-                                      fact_digest=store.digest_of(consumes))
+                                      fact_digest=store.digest_of(consumes),
+                                      input_digest=stage_input)
             payload = self.cache.get(key)
             if payload is not None:
                 sr = _stage_from_payload(payload)
+                # Replay the stage's side effects. A cache hit reconstructs the
+                # RESULT; it does not re-run the stage, so anything the stage
+                # wrote onto the candidate is otherwise lost. GeometryStage
+                # sets cand.spec, and FeaStage cannot materialise a part
+                # without it - so a cached geometry followed by an uncached
+                # solve failed with "candidate has no spec". Measured
+                # 2026-08-29, once a cache-key fix made exactly that pairing
+                # possible for the first time.
+                prov = sr.provenance or {}
+                if prov.get("spec") is not None and cand.spec is None:
+                    cand.spec = prov["spec"]
+                    cand.spec_digest = prov.get("spec_digest")
             else:
                 t0 = time.perf_counter()
                 try:

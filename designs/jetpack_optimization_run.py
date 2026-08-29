@@ -221,8 +221,24 @@ def haz_zones(v) -> list:
     cb_z = SPINE_Z / 2.0 - cb_h / 2.0
     lines = [[[sign * sx, -sy, z], [sign * sx, sy, z]]
              for sign in (-1.0, 1.0) for z in (cb_z, cb_z + cb_h)]
-    return [{"name": "spine-pad-weld", "factor": HAZ_FACTOR,
-             "extent_mm": HAZ_EXTENT_MM, "source": HAZ_SOURCE, "lines": lines}]
+    # MATERIAL-CONDITIONAL, and it has to be. HAZ_FACTOR is a 6xxx-T6
+    # aluminium number and its own source says so. Applying it to 1018 steel
+    # would penalise a material this factor was never measured on - the exact
+    # unsourced transfer the engine refuses everywhere else. Caught 2026-08-29
+    # when wiring the weld map in unconditionally made a steel frame carry an
+    # aluminium softening factor.
+    #
+    # Steel gets NO zone rather than a guessed one. weld.py's own reasoning:
+    # a welded steel joint recovers most of its strength, while a welded 6xxx
+    # joint does not. That is an ASSUMPTION here, not a sourced factor - it is
+    # not "steel welds are free", it is "this project has no sourced steel HAZ
+    # factor and will not invent one". If a steel weldment ever becomes the
+    # recommended design, this is the first thing to source.
+    if str(v["material"]).startswith("6061"):
+        return [{"name": "spine-pad-weld", "factor": HAZ_FACTOR,
+                 "extent_mm": HAZ_EXTENT_MM, "source": HAZ_SOURCE,
+                 "lines": lines}]
+    return []
 
 
 # Fillet radius at the spine/pad T-junction roots. 0 reproduces the original
@@ -458,6 +474,17 @@ def build_case(cand, ctx) -> dict:
              "dof": [1, 2, 3]},
         ],
         "loads": loads,
+        # The frame is WELDED, and until 2026-08-29 this case did not say so.
+        # haz_zones() was written on 2026-08-28 when the finding was recorded,
+        # and was never called - so every safety factor this search has ever
+        # produced, including the 4.633 that reads as a comfortable pass, was
+        # measured against the PARENT proof strength of 276 MPa. That strength
+        # does not exist at the joints, and the peak stress is at a joint.
+        #
+        # The machinery existing and the case not using it is the same failure
+        # this project keeps finding one layer down: measured, built, and not
+        # consumed.
+        "weld": haz_zones(v),
         "limit_state": {"name": "thermal_derated_yield",
                         "required_SF": REQUIRED_SF},
     }
