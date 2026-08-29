@@ -42,9 +42,13 @@ MAX_OVERSHOOT_S = 30.0
 #: CreateProcess-es the interpreter named in pyvenv.cfg and waits. Popen
 #: therefore holds the stub, whose peak working set is 4.1 MB no matter
 #: what the interpreter does (266.1 MB for the same script run directly).
-#: Harmless for the lifetime tests below — it makes them MORE faithful,
-#: since a grandchild is exactly what they are about — but fatal to a
-#: memory assertion, which must measure the process doing the work.
+#: Fatal to a memory assertion, which must measure the process doing the
+#: work. An ASSET to the lifetime tests below, which keep sys.executable
+#: deliberately: the stub makes the hung_solver fixture four levels deep,
+#:     _run_solver -> stub -> solver.py -> stub -> grandchild.py
+#: and the pid asserted dead is the one the DEEPEST process wrote for
+#: itself. So `taskkill /T /F` is pinned across four levels, not the two
+#: the fixture was written to produce.
 BASE_PYTHON = getattr(sys, "_base_executable", None) or sys.executable
 
 
