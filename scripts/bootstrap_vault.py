@@ -187,11 +187,15 @@ mechanism of the original failure is still unknown.
 - Jetpack frame, searched: **3.901 kg at FEA SF 3.844** (`P0047@v1`)
 - Jetpack frame, hand-built: **5.530 kg at FEA SF 5.274** (`P0031@v2`)
 - **Those safety factors are against base-material strength, and the frame is
-  welded.** Applying any sourced 6xxx-T6 HAZ factor to the filleted frame's
-  54.207 MPa peak gives **SF 2.32 down to 1.74** against a required 3.0.
-  Passing would need `rho_o,haz >= 0.647`; no source supports a value above
-  0.50. **The frame fails its own gate**, and did so before this page last
-  claimed otherwise. See
+  welded.** Base SF is 4.633 against a 251.16 MPa derated allowable
+  (276 MPa parent, k=0.91 at 150 C). Applying any sourced 6xxx-T6 HAZ factor
+  to the filleted frame's 54.207 MPa peak gives **SF 2.32 down to 1.74**
+  against a required 3.0. Passing would need `rho_o,haz >= 0.6475`; no source
+  supports above 0.50, and **0.50 is a ceiling rather than an estimate** -
+  Eurocode 9 states it for MIG up to 15 mm and this crossbeam is 15.875 mm, so
+  the least severe defensible value may itself be optimistic. **The frame
+  fails its own gate** by 22.8% on the most generous number anyone can cite,
+  and did so before this page last claimed otherwise. See
   [[Every safety factor used a strength the joints do not have]] and
   [[Jetpack Frame Optimization Run]].
 """, links=["Home", "Project Memory", "Roadmap", "Open Questions"])
