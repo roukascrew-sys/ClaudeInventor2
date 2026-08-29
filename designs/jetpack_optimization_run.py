@@ -61,6 +61,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from design_engine import DesignEngine
 from design_engine.fea import derate_factor
 from design_engine.geometry import GeometryError, SpecError
+from design_engine.uncertainty import (SourcedRange, SourcedValue,
+                                       required_value, verdict_across)
 from design_engine.inventor import (AnalyticStage, CallableStage, Candidate,
                                     Constraint, DesignSpace, DesignVariable,
                                     EvalContext, EvaluationCache, Evaluator,
@@ -173,18 +175,37 @@ KT_ROOT_JUNCTION = 1.85
 # are stated for MIG welding of elements up to 15 mm thick. TIG, or thicker
 # material, requires a LARGER reduction. The crossbeam is 15.875 mm, so this
 # frame sits just outside the stated range and 0.50 may itself be optimistic.
-HAZ_FACTOR = 0.50
+# The four values above, as a range the engine can actually evaluate across
+# rather than a comment beside a chosen constant. rho_o,haz is something this
+# design DISCOVERS, not something it CHOOSES, so it is deliberately not a
+# design variable: an optimiser given control of it would "improve" the frame
+# by selecting a softening factor the physical world never agreed to.
+HAZ_RANGE = SourcedRange(
+    "rho_o,haz",
+    [SourcedValue(0.500,
+                  "EN 1999-1-1 (Eurocode 9) s6.1.6 via European Aluminium, "
+                  "'Design of Aluminium Structures: Introduction to Eurocode 9 "
+                  "with Worked Examples': the 0.2% proof strength in the HAZ is "
+                  "half the base material for EN AW-6082-T6, and 6xxx alloys in "
+                  "T6 lose roughly half their strength in the HAZ. VALIDITY: "
+                  "stated for MIG up to 15 mm thick; this frame's crossbeam is "
+                  "15.875 mm, so the factor is at or just outside the stated "
+                  "range and may itself be optimistic",
+                  "Eurocode 9"),
+     SourcedValue(0.475, "6061-T6 MIG with 5356 filler: 19 ksi vs 40 ksi parent",
+                  "5356 filler"),
+     SourcedValue(0.450, "6061-T6 MIG with 4043 filler: 18 ksi vs 40 ksi parent",
+                  "4043 filler"),
+     SourcedValue(0.375, "6061-T6 as-welded HAZ: 15 ksi vs 40 ksi parent",
+                  "as-welded")],
+    nominal=0.500)
+
+#: The design value: the LEAST severe defensible one, and the code-based
+#: figure. Kept as the nominal so existing results stay comparable - but the
+#: gate is now decided by HAZ_RANGE, not by this number alone.
+HAZ_FACTOR = HAZ_RANGE.nominal.value
 HAZ_EXTENT_MM = 25.0        # b_haz, EN 1999-1-1 clause 6.1.6.3 worked example
-HAZ_SOURCE = (
-    "EN 1999-1-1 (Eurocode 9) s6.1.6 via European Aluminium, 'Design of "
-    "Aluminium Structures: Introduction to Eurocode 9 with Worked Examples': "
-    "0.2% proof strength in the HAZ is half the base material for EN AW-6082-T6, "
-    "and 6xxx alloys in T6 lose roughly half their strength in the HAZ. "
-    "b_haz = 25 mm per the clause 6.1.6.3 worked example. VALIDITY: stated for "
-    "MIG up to 15 mm thick; this frame's crossbeam is 15.875 mm, so the factor "
-    "is at or just outside the stated range. Independent 6061-T6 sources give "
-    "0.375-0.475 (as-welded 15 ksi, 4043 filler 18 ksi, 5356 filler 19 ksi "
-    "against 40 ksi parent), so 0.50 is the LEAST severe defensible value.")
+HAZ_SOURCE = HAZ_RANGE.nominal.source
 
 
 def haz_zones(v) -> list:
@@ -574,6 +595,50 @@ def selftest(space) -> int:
     return 0 if ok > 0 else 1
 
 
+def haz_verdict(sf_at_parent: float = 4.633, required_sf: float = REQUIRED_SF,
+                emit: bool = True) -> dict:
+    """What the frame's gate does across every sourced value of rho_o,haz.
+
+    `sf_at_parent` is the measured safety factor computed against the PARENT
+    proof strength, i.e. before any HAZ softening. The filleted frame's
+    recorded figure is 4.633.
+
+    Linearity is exact here rather than assumed: the softening factor scales
+    the ALLOWABLE, and the stress field does not depend on it, so
+    SF(rho) = SF_parent * rho. It reproduces both recorded points -
+    4.633 * 0.500 = 2.317 and 4.633 * 0.375 = 1.738 - which is the check that
+    the assumption holds for this case. It would NOT hold for a parameter that
+    moves stiffness, load path or geometry.
+    """
+    out = verdict_across(
+        HAZ_RANGE,
+        lambda rho: (sf_at_parent * rho >= required_sf,
+                     {"allowable_MPa": round(276.0 * rho, 1),
+                      "sf": round(sf_at_parent * rho, 3)}))
+    need = required_value(sf_at_parent * HAZ_RANGE.nominal.value,
+                          HAZ_RANGE.nominal.value, required_sf)
+    out["required_value"] = need
+    out["exceeds_every_source"] = need["required"] > HAZ_RANGE.least_severe.value
+
+    if emit:
+        print(f"\nHAZ sensitivity - {HAZ_RANGE.name} across every sourced "
+              f"value, gate SF {required_sf}")
+        print(f"  {'rho':>6}  {'sf':>7}  {'verdict':<8} source")
+        for r in out["evaluated"]:
+            print(f"  {r['value']:>6.3f}  {r['sf']:>7.3f}  "
+                  f"{'pass' if r['passed'] else 'FAIL':<8} {r['label']}")
+        print(f"\n  verdict: {out['verdict'].upper()}")
+        print(f"  {out['reason']}")
+        print(f"\n  needs rho >= {need['required']:.4f} to pass; the most "
+              f"generous source gives {HAZ_RANGE.least_severe.value:g} "
+              f"({HAZ_RANGE.least_severe.label}).")
+        if out["exceeds_every_source"]:
+            print("  NO SOURCED VALUE IS SUFFICIENT. This is not a marginal "
+                  "call between references -\n  the frame needs a joint "
+                  "strength that no reference supports.")
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
@@ -581,7 +646,14 @@ def main() -> int:
     ap.add_argument("--generations", type=int, default=12)
     ap.add_argument("--promote", type=int, default=3)
     ap.add_argument("--no-fea", action="store_true")
+    ap.add_argument("--haz", action="store_true",
+                    help="report the gate across every sourced "
+                         "rho_o,haz value and exit (no solver)")
     args = ap.parse_args()
+
+    if args.haz:
+        v = haz_verdict()
+        return 0 if v["verdict"] == "pass" else 1
 
     space = make_space()
     if args.selftest:
