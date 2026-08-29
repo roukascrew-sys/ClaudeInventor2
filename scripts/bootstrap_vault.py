@@ -617,6 +617,98 @@ exposure. It does not cover creep or thermal cycling.
 """, links=["Carbon Steel Thermal Derating", "Jetpack Frame",
             "Fire design data is not service data"])
 
+    v.write("03_Engineering/Materials",
+            "Welded cold-finished steel loses its cold work",
+            type="material", status="active", confidence="medium",
+            body="""**Welding softens cold-finished carbon steel, and it does so
+for a completely different reason than it softens aluminium.** Getting the
+mechanism wrong is how this project briefly concluded steel was exempt.
+
+## The two mechanisms are not the same
+
+| | 6061-T6 aluminium | 1018 cold-finished steel |
+|---|---|---|
+| Where the strength comes from | precipitation hardening (T6 temper) | **cold drawing** |
+| What the weld destroys | the temper | **the cold work** |
+| Recovers on cooling? | no | no |
+| Factor | 0.375 – 0.500 | **0.593 – 0.645** |
+
+"A welded steel joint recovers most of its strength" is a true statement about
+**hot-rolled structural steel**, which has no cold work to lose. It is the
+reason Eurocode 3 and AISC carry no HAZ knockdown for ordinary structural
+sections, and it is why the claim sounds authoritative. It simply does not
+apply to a cold-finished bar.
+
+## The number
+
+1018 cold-finished yields **372 MPa** (OnlineMetals pid 4790, ASTM A108,
+54 ksi). Hot-rolled 1018 of identical chemistry yields **240 MPa**. The weld
+anneals the drawn structure locally, so the joint reverts toward the
+hot-rolled condition, and the whole difference between those two numbers is
+what the heat-affected zone gives back.
+
+```
+rho = hot-rolled yield / cold-finished yield
+
+  0.645   240 MPa / 372 MPa      MakeItFrom, SAE-AISI 1018 hot worked
+  0.593   220.6 MPa / 372 MPa    the widely quoted 32 ksi hot-rolled figure
+```
+
+Two sources that disagree, so it is a range rather than a value — see
+[[Deterministic feasibility is not feasibility under uncertainty]].
+
+**Mechanism, established:** recrystallisation of cold-worked material begins
+above roughly 200 °C and full annealing above roughly 300 °C. A weld thermal
+cycle passes both comfortably.
+
+## What is NOT established, and must not be quoted as if it were
+
+**The code basis is adjacent, not direct.** EN 1993-1-3:2006 §3.2.2(7)–(8)
+says the yield increase from cold forming shall not be used for members
+heat-treated after forming above 580 °C, and that annealing may reduce the
+yield **below** the basic value. That establishes the principle. It does not
+establish this application: the clause's stated condition is heat treatment
+for **more than one hour**, and a weld exceeds 580 °C locally for *seconds*.
+Reading a weld HAZ under that clause is inference from the principle.
+
+**b_haz for steel is assumed, not sourced.** The 25 mm currently used is
+carried over from EN 1999-1-1, which is an aluminium figure. It is not
+obviously conservative either: the softened zone for cold-worked material is
+bounded by the ~300 °C annealing isotherm, which lies **outside** the
+classical austenitised HAZ, so the truly softened region may be *wider* than
+the metallurgical one.
+
+## What it changed
+
+Re-solving the searched frames with the factor applied:
+
+| frame | before | after | verdict |
+|---|---|---|---|
+| 17.57 kg steel | SF 16.915 | **10.910** | PASS |
+| 10.98 kg steel | SF 6.492 | **4.187** | PASS |
+| 3.905 kg aluminium | SF 2.312 | 2.312 | INVALID |
+
+Steel still passes, and the verdict is **stable across the whole sourced
+range** — 3.850 at the severe end against a 3.0 gate — so this is a genuine
+pass rather than an UNKNOWN. But the margin on the recommended frame falls by
+a third, and that third was previously being reported as real.
+
+## The lesson
+
+The first version of `haz_zones()` returned an empty list for steel. That is
+an implicit factor of **1.0** — and `weld.py` refuses an explicit 1.0 outright,
+on the grounds that it asserts welding costs no strength. **Returning "no
+zone" evaded a refusal the engine would have made if the same claim had been
+written as a number.** A refusal is only as good as the paths that reach it.
+
+→ [[Every safety factor used a strength the joints do not have]] is the same
+finding one material earlier.""",
+            links=["Every safety factor used a strength the joints do not have",
+                   "Carbon Steel Thermal Derating",
+                   "Deterministic feasibility is not feasibility under uncertainty",
+                   "Refuse rather than invent", "UNKNOWN is not a pass",
+                   "Jetpack Frame", "Roadmap"])
+
     v.write("03_Engineering/Materials", "Carbon Steel Thermal Derating",
             type="material", confidence="high", body="""
 Source: **EN 1993-1-2:2005 Table 3.1**, extracted from the standard text.
