@@ -340,21 +340,25 @@ def test_a_region_swallowing_the_whole_part_is_refused(solved):
             standoff_source=STANDOFF_SRC, centre=(0.0, 0.0, 60.0))
 
 
-def test_the_solve_is_refused_because_calculix_submodel_hangs(solved):
+def test_the_solve_is_refused_because_calculix_submodel_is_unaffordable(solved):
     """The finding that stopped this feature, pinned so it cannot be
     forgotten or silently re-enabled.
 
-    ccx 2.23 win-x64 spins in createtet interpolating onto the driven nodes,
-    re-emitting "element N is extremely flat / the element is deleted" for the
-    same element indefinitely - past 240 s on a 2093-node submodel and past
-    90 s on a deliberately tiny 2070-node one. Only the timeout ends it.
+    ccx 2.23 win-x64 *SUBMODEL interpolation costs 88-182 ms per driven node
+    and scales superlinearly (measured: 272 driven -> 23.8 s, 1082 driven ->
+    197.1 s on one fixed C3D10 submodel mesh). On the real geometry it did not
+    complete within a 900 s timeout at all.
+
+    An earlier reading of this as an infinite createtet loop was wrong - the
+    probe cases terminate. The operational conclusion is unchanged and the
+    mechanism is not fully explained, which is why this test pins the REFUSAL
+    rather than a claimed cause.
 
     Everything before the solve is validated and runs: the gate, the region,
-    the cut, the driven set, the boundary-condition conflict check. Refusing
-    fast is better than a 15-minute timeout per rung.
+    the cut, the driven set, the boundary-condition conflict check.
     """
     eng, gid, res = solved
-    with pytest.raises(FeaError, match="submodel_interpolation_unavailable"):
+    with pytest.raises(FeaError, match="submodel_interpolation_unaffordable"):
         eng.validation.fea_submodel(
             gid, _case(), res, reason="the solver cannot interpolate yet",
             feature_mm=4.0, standoff_elements=3.0,

@@ -231,14 +231,15 @@ No experimental percentage from a paper is repeated here as a promised result.*
    conditions. No dual problem and no error estimator: a driver.
    **Gated on item 1** — running this on a singular peak wastes the budget.
    **BLOCKED as of 2026-08-28**, and not for a reason the research pass
-   anticipated: CalculiX 2.23 `*SUBMODEL` hangs on this project's C3D10
-   meshes, spinning in `createtet` even on a deliberately tiny case. The
+   anticipated: CalculiX 2.23 `*SUBMODEL` interpolation costs 88-182 ms per
+   driven node and scales superlinearly; on the real geometry it did not
+   finish inside a 900 s timeout. The
    region, cut and driven-node machinery are built and tested; only the
    interpolation is missing. Either write it here or find a ccx
    configuration that does not spin.
    *Established by source* that local goals do not need global resolution;
    *Observed* that this solver will not do it.
-   → [[CalculiX submodel interpolation hangs]],
+   → [[CalculiX submodel interpolation is unaffordable]],
    [[Refine where the question is, not everywhere]],
    [[Mesh convergence is unverified]]
 
@@ -1553,75 +1554,127 @@ It has never meant *physically real*. A heuristic's name is not its scope.
             "Peak stress at a sharp re-entrant corner cannot converge",
             "Refuse rather than invent"])
 
+    # The belief that changed. Kept, marked and linked forward rather than
+    # deleted: the vault's job is to show how the project changed its mind,
+    # and "we thought it was an infinite loop, it was superlinear cost" is
+    # exactly the kind of correction a future session needs to see.
     v.write("05_Failures/Simulation_Failures",
             "CalculiX submodel interpolation hangs", type="failure",
+            status="superseded", confidence="low",
+            body="""**This diagnosis was wrong, and is kept only to show the
+correction.**
+
+The original reading, on 2026-08-28, was that ccx 2.23 spins forever in
+`createtet` while interpolating onto a submodel's driven nodes, because it
+re-emits `element N is extremely flat / the element is deleted` for the same
+element and nothing follows.
+
+Equivalent cases do in fact terminate. Those warnings are noise. What is
+really happening is superlinear cost in the number of driven nodes, measured
+at 88-182 ms per node — see
+[[CalculiX submodel interpolation is unaffordable]] for the numbers, what was
+ruled out, and what remains unexplained.
+
+The operational conclusion did not change: `fea_submodel` refuses before the
+solve either way. Only the stated cause did.""",
+            links=["CalculiX submodel interpolation is unaffordable"])
+
+    v.write("05_Failures/Simulation_Failures",
+            "CalculiX submodel interpolation is unaffordable", type="failure",
             status="active", confidence="high",
-            body="""**Symptom:** a submodel solve never returns. `ccx.exe` runs
-until `solve_timeout_s` kills it — 900 s in the test suite, and still running
-at 240 s when driven by hand.
+            body="""**Symptom:** a submodel solve does not return within any
+practical budget. On the real geometry `ccx.exe` ran past a 900 s solver
+timeout and was still going after roughly two hours of wall time.
 
 **Conditions:** CalculiX 2.23 win-x64, `*SUBMODEL, TYPE=NODE` reading
-displacements from a global run's `job.frd`, with this project's standard
-C3D10 (quadratic tetrahedron) meshes.
+displacements from a global run's `job.frd`, C3D10 meshes.
 
-**Root cause:** not slowness. ccx's interpolation calls `createtet` on the
-GLOBAL mesh to locate each driven node, and it spins — re-emitting
+## What it actually is
+
+**Not an infinite loop.** The first reading of this was that ccx spun forever
+in `createtet`, because it re-emits
 
 ```
 *WARNING in createtet: element 1391 is extremely flat
          the element is deleted
 ```
 
-for the **same element**, indefinitely. Nothing after that point is reached.
+for the same element and nothing follows. That reading was **wrong**, and the
+correction is the useful part of this note: those warnings are noise, and
+equivalent cases do terminate.
 
-**Evidence it is not a size problem.** A deliberately tiny case — a
-20x20x40 bar, 2133 global nodes, 1148 elements, 2070 submodel nodes — hangs
-past 90 s just as a 2093-node submodel of a longer bar hangs past 240 s. A
-5337-equation static solve is otherwise sub-second work here.
+**It is superlinear cost.** Holding one C3D10 submodel mesh fixed and varying
+only which nodes are driven:
 
-**Two things that are NOT the cause**, both tested:
+| driven nodes | wall time | cost per node |
+|---|---|---|
+| 272 (corners only) | 23.8 s | 88 ms |
+| 1082 (incl. midside) | 197.1 s | 182 ms |
 
-- *Path length.* An absolute `INPUT=` path produced a different and clean
-  failure: `ERROR in readfrd: The input file "...sub_repro/da" could not be
-  opened` — CalculiX truncates the card at **132 characters**, the classic
-  fixed-width limit. Worth knowing separately, but short and relative paths
-  hang rather than error.
-- *A missing mesh in the results file.* The global `.frd` carries both blocks:
-  `2C` with 2682 nodes and `3C` with 1391 elements.
+Cost per node roughly doubles as the count quadruples. Even the best measured
+figure — 88 ms per driven node — makes a real junction submodel with a few
+thousand driven nodes cost minutes per rung before solving anything.
 
-**What this costs.** It invalidates the design assumption committed in
-`0c252c3` — that the solver would do the interpolation and this project would
-never own that arithmetic. Everything else in
-`design_engine/submodel.py` is unaffected and validated: region sizing, the
-cut, driven-node classification, the boundary-condition conflict check, the
-convergence verdict. Only the interpolation is missing.
+## What is ruled out
 
-**Fix applied:** `fea_submodel` now refuses **fast**, before the solve, with
-`submodel_interpolation_unavailable`, and reports the region it computed so a
-retry does not start over. `allow_hanging_solver=True` exists only to
-re-measure the solver. A 15-minute timeout per rung is not an acceptable way
-to discover this.
+- **Global element type is irrelevant.** A C3D4 global and a C3D10 global
+  behave identically. This refuted the working hypothesis, which was that the
+  quadratic global mesh caused it because `createtet` runs on the global mesh.
+- **Not path length**, though a real constraint turned up on the way: an
+  absolute `INPUT=` path fails cleanly because CalculiX truncates the card at
+  **132 characters**, the classic fixed-width limit.
+- **Not a results file missing its mesh.** The global `.frd` carries `2C` with
+  2682 nodes and `3C` with 1391 elements.
+- **Corner-only driving is not a fix.** It is about 8x faster, and it leaves
+  midside nodes on the cut boundary unconstrained, which lets the boundary
+  bulge. Faster and wrong.
+
+## What is NOT established
+
+Why the real case is so much worse than the probe. The 120 mm bar at 6 mm
+global with **314 driven nodes** did not finish in 900 s, while 1082 driven
+nodes on the probe finished in 197 s. **Driven count does not explain it**, and
+no other difference has been isolated. Memory pressure is a suspicion, not a
+finding — this machine already has a recorded 6.1 GB ceiling.
+
+## Fix applied
+
+`fea_submodel` refuses before the solve with
+`submodel_interpolation_unaffordable`, and reports the region it computed so a
+retry does not start over. Shipping it as written would have burned a 900 s
+timeout per rung and reported nothing, which is
+[[Solver timeout wastes the full budget]] again. `allow_hanging_solver=True`
+exists only to re-measure.
+
+Everything before the solve is unaffected and validated: the singular-peak
+gate, region sizing, the cut, driven-node classification, the
+boundary-condition conflict check, the convergence verdict.
 
 **Regression test:**
-`tests/test_submodel.py::test_the_solve_is_refused_because_calculix_submodel_hangs`,
-plus a test that the cheap refusals still fire *before* this one — a region
-containing a load is wrong regardless of whether the solver could interpolate.
+`tests/test_submodel.py::test_the_solve_is_refused_because_calculix_submodel_is_unaffordable`.
+It pins the **refusal**, deliberately not a claimed mechanism, because the
+mechanism is not fully explained.
 
-**Not yet established:** whether a LINEAR (C3D4) global mesh avoids it, or
-whether `TYPE=SURFACE` behaves differently. Both are untested. The `createtet`
-warnings point at the quadratic tets, which makes the C3D4 question the first
-one worth asking.
+## The open choice
 
-**The open choice.** Either write the interpolation here — locate the global
-C3D10 containing each driven node and evaluate its shape functions, which is
-standard finite-element arithmetic rather than novel numerics — or find the
-ccx configuration that does not spin. Until one of those,
-[[Mesh convergence is unverified]] stays blocked by way of this.""",
+Write the interpolation here — locate the global C3D10 containing each driven
+node and evaluate its shape functions, which is standard finite-element
+arithmetic rather than novel numerics — or find a ccx configuration that is
+affordable. Until one of those, [[Mesh convergence is unverified]] stays
+blocked by way of this, on top of the memory ceiling that blocked it already.
+
+## The lesson worth keeping
+
+A keyword being **present** in a binary is not evidence it **works**. Scanning
+`ccx.exe` for `*SUBMODEL` found 21 occurrences, and that check felt rigorous
+enough to design around. It was not. See [[Screened is not validated]] — the
+same shape of error, one layer down.""",
             links=["Mesh convergence is unverified", "Stress Singularity",
                    "Refine where the question is, not everywhere",
                    "Solver timeout wastes the full budget",
                    "Solver memory bounds mesh refinement",
                    "Goal-Oriented Adaptive FEM with Optimal Complexity",
+                   "Screened is not validated",
                    "Refuse rather than invent", "Roadmap"])
 
     v.write("05_Failures/Simulation_Failures", "Solver memory bounds mesh refinement",
@@ -1728,6 +1781,10 @@ numbers that the solver later contradicted. The retraction is recorded in
 [[Screened is not validated]]. Anyone continuing here should assume screening
 numbers are optimistic until a solver says otherwise.
 """, links=["Current State", "Jetpack Frame Optimization Run", "Roadmap"])
+
+
+    v.supersede("CalculiX submodel interpolation hangs",
+                "CalculiX submodel interpolation is unaffordable")
 
 
 def main() -> int:

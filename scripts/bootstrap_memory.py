@@ -1209,7 +1209,7 @@ LATE = [
             "Does a C3D4 global mesh avoid the createtet spin? That is the "
             "cheapest experiment and would decide whether this is a ccx "
             "limitation or a mesh-type incompatibility."),
-        related=["CalculiX submodel interpolation hangs",
+        related=["CalculiX submodel interpolation is unaffordable",
                  "Mesh convergence is unverified",
                  "Solver timeout wastes the full budget",
                  "Refuse rather than invent", "Roadmap"]),

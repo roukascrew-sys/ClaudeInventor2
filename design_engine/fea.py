@@ -1645,32 +1645,46 @@ class ValidationTools:
                                        steps=ladder_steps,
                                        factor=ladder_factor)
 
-            # MEASURED 2026-08-28: ccx 2.23 win-x64 HANGS on *SUBMODEL with
-            # this project's C3D10 meshes. Its interpolation calls createtet
-            # on the global mesh and spins, re-emitting "element N is
-            # extremely flat / the element is deleted" for the same element
-            # indefinitely - observed past 240 s on a 2093-node submodel and
-            # past 90 s on a deliberately tiny 2070-node one, so it is not
-            # slowness. Only the timeout ends it.
+            # MEASURED 2026-08-28. ccx 2.23 win-x64 *SUBMODEL interpolation is
+            # PROHIBITIVELY SLOW, and superlinear in the number of driven
+            # nodes. Holding one C3D10 submodel mesh fixed and varying only
+            # the driven set:
+            #
+            #     272 driven   ->   23.8 s   ( 88 ms per driven node)
+            #    1082 driven   ->  197.1 s   (182 ms per driven node)
+            #
+            # An earlier reading of this as an infinite loop in createtet was
+            # WRONG: both of those terminate. What is true is that on the real
+            # geometry (120 mm bar, 6 mm global, 314 driven) it did not finish
+            # inside a 900 s solver timeout and was still running after ~2 h
+            # wall, so there it is non-terminating for any practical budget.
+            # Why that case is so much worse than 1082 driven nodes on the
+            # probe is NOT established - driven count does not explain it.
+            #
+            # Two things ruled out: the global element type is irrelevant
+            # (C3D4 and C3D10 globals behave identically), and driving only
+            # corner nodes is ~8x faster but is NOT a fix - unconstrained
+            # midside nodes on a cut boundary let it bulge.
             #
             # Everything above this line is validated and cheap: the gate, the
             # region, the cut, the driven-node classification, the boundary-
-            # condition conflict check. Only the interpolation is missing, and
-            # the honest options are to write it here (locate the global
+            # condition conflict check. Only the interpolation is unusable,
+            # and the honest options are to write it here (locate the global
             # C3D10 containing each driven node and evaluate its shape
-            # functions) or to find a ccx configuration that does not spin.
+            # functions) or to find a ccx configuration that is affordable.
             #
             # Refusing fast, rather than letting a caller discover this as a
             # 15-minute timeout per rung.
             if not allow_hanging_solver:
                 raise FeaError(
-                    f"submodel_interpolation_unavailable: CalculiX 2.23 "
-                    f"*SUBMODEL hangs on this project's C3D10 meshes "
-                    f"(measured 2026-08-28; it spins in createtet on the "
-                    f"global mesh). The region {region.to_dict()['bounds_mm']} "
-                    f"and the cut are computed and valid - only the "
-                    f"interpolation is unavailable, so the solve would not "
-                    f"terminate. Pass allow_hanging_solver=True only to "
+                    f"submodel_interpolation_unaffordable: CalculiX 2.23 "
+                    f"*SUBMODEL interpolation costs ~88-182 ms per driven "
+                    f"node and scales superlinearly (measured 2026-08-28); on "
+                    f"the real geometry it did not complete within 900 s. "
+                    f"The region {region.to_dict()['bounds_mm']} and the cut "
+                    f"are computed and valid - only the interpolation is "
+                    f"unusable, so the {len(ladder)}-rung ladder would not "
+                    f"finish. Pass allow_hanging_solver=True only to "
                     f"re-measure the solver's behaviour")
             peaks, rungs = [], []
             binary = threads = None
