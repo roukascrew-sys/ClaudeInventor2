@@ -977,9 +977,12 @@ class ValidationTools:
         want different remedies — and so do two timeouts at those sizes. Near
         the memory ceiling a timeout is a machine that is paging, and coarsening
         the mesh is the fix. At a few hundred MB it is not, and coarsening may
-        not help at all: a71901f measured ccx SPINNING forever in createtet on a
-        *SUBMODEL deck at trivial memory, which no smaller mesh would have
-        cured. Without the number the two are indistinguishable in the log.
+        not help at all: *SUBMODEL interpolation costs ~88-182 ms per driven
+        node and scales superlinearly (a71901f, as corrected by 3bc7450 - it
+        terminates, it is not the infinite loop that commit first recorded), so
+        such a deck burns the whole budget at trivial memory where no coarser
+        mesh would have cured it. Without the number the two are
+        indistinguishable in the log.
         """
         binary, env, threads = self._solver_command(force_single=force_single)
         t0 = time.time()
