@@ -976,13 +976,17 @@ class ValidationTools:
         the peak memory, because an access violation at 6 GB and one at 500 MB
         want different remedies — and so do two timeouts at those sizes. Near
         the memory ceiling a timeout is a machine that is paging, and coarsening
-        the mesh is the fix. At a few hundred MB it is not, and coarsening may
-        not help at all: *SUBMODEL interpolation costs ~88-182 ms per driven
-        node and scales superlinearly (a71901f, as corrected by 3bc7450 - it
-        terminates, it is not the infinite loop that commit first recorded), so
-        such a deck burns the whole budget at trivial memory where no coarser
-        mesh would have cured it. Without the number the two are
-        indistinguishable in the log.
+        the mesh is the fix. At a few hundred MB it is not, and the remedy may
+        not be known at all. A *SUBMODEL deck spends its budget in
+        interpolation, ~88-182 ms per driven node and superlinear
+        (a71901f as corrected by 3bc7450 - it terminates; it is not the infinite
+        loop that commit first recorded), and the real 314-driven-node case
+        still exceeded 900 s and was running at ~2 h, which that rate does not
+        explain. Coarsening does cut the driven set - `driven_nodes` counts
+        submodel nodes on the cut planes - so it is worth trying there; but
+        3bc7450 records the residual as Unknown, and a remedy that is worth
+        trying is not the same as one that is known to work. Without the number
+        the log cannot even separate that case from the paging one.
         """
         binary, env, threads = self._solver_command(force_single=force_single)
         t0 = time.time()
