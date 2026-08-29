@@ -111,6 +111,10 @@ def _num(v):
     return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
 
+class KnowledgeError(ValueError):
+    """A question the recorded history cannot honestly answer."""
+
+
 class CorrectionEstimate:
     """A model-correction factor plus the evidence behind it."""
 
@@ -289,6 +293,23 @@ class KnowledgeBase:
                + (" AND problem=?" if problem else ""))
         args = [metric] + ([problem] if problem else [])
         rows = self._conn.execute(sql, args).fetchall()
+
+        # An UNSCOPED call that would average across different problems is
+        # refused, not answered. A correction learned on a ladder channel says
+        # nothing about a jetpack frame, and pooling them produces a number
+        # with more observations behind it and less meaning - the failure mode
+        # is that it looks MORE trustworthy for being wrong about more things.
+        # `problem` was the guard against this and it was optional; with the
+        # table populated, optional is not enough.
+        if problem is None:
+            families = {r["problem"] for r in rows}
+            if len(families) > 1:
+                raise KnowledgeError(
+                    f"correction({metric!r}) is unscoped and the evidence "
+                    f"spans {len(families)} problems "
+                    f"({sorted(families)[:4]}{'...' if len(families) > 4 else ''}). "
+                    f"Pooling them would average unrelated physics into one "
+                    f"factor. Pass problem= to say which one you mean")
         ratios, evidence = [], []
         for r in rows:
             if r["ratio"] and r["ratio"] > 0:

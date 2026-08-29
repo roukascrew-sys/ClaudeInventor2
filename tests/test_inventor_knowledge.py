@@ -353,3 +353,50 @@ def test_no_memory_model_falls_back_to_the_time_verdict(kb):
     out = kb.affordable(400_000, 6000)
     assert out["verdict"] == "yes"
     assert out["memory"] is None
+
+
+# ------------------------------------------------- unscoped correction guard
+def _cal(kb, problem, metric, predicted, measured, cid):
+    kb._conn.execute(
+        "INSERT INTO calibrations (recorded_at, problem, metric,"
+        " low_fidelity, high_fidelity, predicted, measured, ratio,"
+        " candidate_id, geometry_id, context_json)"
+        " VALUES (0,?,?,0,3,?,?,?,?,?,'{}')",
+        (problem, metric, predicted, measured, predicted / measured, cid, cid))
+    kb._conn.commit()
+
+
+def test_an_unscoped_correction_spanning_problems_is_refused(tmp_path):
+    """Pooling a ladder channel with a jetpack frame produces a factor with
+    MORE observations behind it and LESS meaning - it looks more trustworthy
+    for being wrong about more things. `problem` was the guard against that
+    and it was optional; once the table is populated, optional is not enough.
+    """
+    kb = kbm.KnowledgeBase(tmp_path / "k.sqlite")
+    _cal(kb, "ladder channel", "max_von_mises_MPa", 192.0, 330.8, "P0012")
+    _cal(kb, "ladder channel", "max_von_mises_MPa", 132.6, 138.44, "P0015")
+    _cal(kb, "jetpack frame", "max_von_mises_MPa", 74.4, 116.34, "P0023")
+    _cal(kb, "jetpack frame", "max_von_mises_MPa", 42.1, 62.36, "P0024")
+
+    with pytest.raises(kbm.KnowledgeError, match="unscoped"):
+        kb.correction("max_von_mises_MPa")
+
+
+def test_an_unscoped_correction_is_fine_when_only_one_problem_has_evidence(tmp_path):
+    """The guard must not fire when there is nothing to confuse."""
+    kb = kbm.KnowledgeBase(tmp_path / "k.sqlite")
+    for i, (p, m) in enumerate([(100.0, 110.0), (200.0, 218.0), (50.0, 56.0)]):
+        _cal(kb, "one problem", "max_von_mises_MPa", p, m, f"C{i}")
+    est = kb.correction("max_von_mises_MPa")
+    assert est is not None and est.n == 3
+
+
+def test_a_scoped_correction_still_answers_when_other_problems_exist(tmp_path):
+    """Naming the problem is the whole remedy, so it must work."""
+    kb = kbm.KnowledgeBase(tmp_path / "k.sqlite")
+    for i, (p, m) in enumerate([(100.0, 110.0), (200.0, 218.0), (50.0, 56.0)]):
+        _cal(kb, "mine", "max_von_mises_MPa", p, m, f"C{i}")
+    _cal(kb, "someone else's", "max_von_mises_MPa", 1.0, 9.0, "X0")
+    est = kb.correction("max_von_mises_MPa", problem="mine")
+    assert est is not None and est.n == 3
+    assert 0.9 < est.factor < 0.95
