@@ -204,6 +204,55 @@ HAZ_RANGE = SourcedRange(
 #: figure. Kept as the nominal so existing results stay comparable - but the
 #: gate is now decided by HAZ_RANGE, not by this number alone.
 HAZ_FACTOR = HAZ_RANGE.nominal.value
+
+# ---------------------------------------------------------------- steel HAZ
+# Sourced 2026-08-29, after the first pass wrongly gave steel NO heat-affected
+# zone on the reasoning that "a welded steel joint recovers most of its
+# strength". That is true of HOT-ROLLED structural steel, which has no cold
+# work to lose. It is NOT true of this frame's material.
+#
+# 1018 COLD-FINISHED gets its 372 MPa yield from cold drawing, not from
+# composition. Hot-rolled 1018 of the same chemistry yields 240 MPa. Welding
+# anneals the drawn structure locally, so the joint reverts toward the
+# hot-rolled condition and the cold-work advantage - the entire difference
+# between 240 and 372 - is what the HAZ gives back.
+#
+# MECHANISM, established: recrystallisation of cold-worked material begins
+# above roughly 200 C and full annealing occurs above roughly 300 C, both of
+# which a weld thermal cycle passes comfortably.
+#
+# CODE BASIS, adjacent rather than direct, and it must be read that way:
+# EN 1993-1-3:2006 s3.2.2(7)-(8) says the yield increase from cold forming
+# shall not be used for members heat-treated after forming above 580 C, and
+# that annealing may reduce the yield BELOW the basic value. That establishes
+# the principle. It does NOT establish this application: the clause's stated
+# condition is heat treatment for more than one hour, and a weld cycle exceeds
+# 580 C locally for seconds. Treating a weld HAZ under that clause is
+# INFERENCE from the principle, not a citation of the rule.
+STEEL_HAZ_RANGE = SourcedRange(
+    "rho_haz,1018CF",
+    [SourcedValue(0.645,
+                  "hot-rolled 1018 yield 240 MPa (MakeItFrom, SAE-AISI 1018 "
+                  "hot worked) against this frame's cold-finished 372 MPa "
+                  "(OnlineMetals pid 4790, ASTM A108, 54 ksi). The HAZ "
+                  "reverts toward the non-cold-worked condition, so the "
+                  "factor is the ratio of the two",
+                  "hot-rolled 240 MPa"),
+     SourcedValue(0.593,
+                  "hot-rolled 1018 yield 32 ksi = 220.6 MPa (widely quoted "
+                  "supplier figure) against the same 372 MPa cold-finished "
+                  "value. The more severe of two hot-rolled figures that "
+                  "disagree",
+                  "hot-rolled 32 ksi")],
+    nominal=0.645)
+
+#: b_haz for steel is NOT sourced. EN 1999-1-1's 25 mm is an aluminium figure
+#: and does not transfer. Worse, the softened zone for cold-worked material is
+#: bounded by the ~300 C annealing isotherm, which lies OUTSIDE the classical
+#: austenitised HAZ - so reusing 25 mm is not self-evidently conservative
+#: either. Stated as an assumption so it cannot be mistaken for a source.
+STEEL_HAZ_EXTENT_MM = 25.0
+STEEL_HAZ_EXTENT_IS_ASSUMED = True
 HAZ_EXTENT_MM = 25.0        # b_haz, EN 1999-1-1 clause 6.1.6.3 worked example
 HAZ_SOURCE = HAZ_RANGE.nominal.source
 
@@ -228,17 +277,22 @@ def haz_zones(v) -> list:
     # when wiring the weld map in unconditionally made a steel frame carry an
     # aluminium softening factor.
     #
-    # Steel gets NO zone rather than a guessed one. weld.py's own reasoning:
-    # a welded steel joint recovers most of its strength, while a welded 6xxx
-    # joint does not. That is an ASSUMPTION here, not a sourced factor - it is
-    # not "steel welds are free", it is "this project has no sourced steel HAZ
-    # factor and will not invent one". If a steel weldment ever becomes the
-    # recommended design, this is the first thing to source.
+    # Steel is NOT exempt, and the first version of this function wrongly said
+    # it was. "A welded steel joint recovers most of its strength" is true of
+    # HOT-ROLLED structural steel, which has no cold work to lose. This frame's
+    # 1018 is COLD-FINISHED: its 372 MPa yield comes from drawing, and the weld
+    # anneals that away locally. See STEEL_HAZ_RANGE.
     if str(v["material"]).startswith("6061"):
         return [{"name": "spine-pad-weld", "factor": HAZ_FACTOR,
                  "extent_mm": HAZ_EXTENT_MM, "source": HAZ_SOURCE,
                  "lines": lines}]
-    return []
+    return [{"name": "spine-pad-weld", "factor": STEEL_HAZ_RANGE.nominal.value,
+             "extent_mm": STEEL_HAZ_EXTENT_MM,
+             "source": (STEEL_HAZ_RANGE.nominal.source
+                        + ". EXTENT IS ASSUMED, not sourced: 25 mm is carried "
+                          "over from the aluminium case and no steel b_haz "
+                          "has been found"),
+             "lines": lines}]
 
 
 # Fillet radius at the spine/pad T-junction roots. 0 reproduces the original
@@ -622,6 +676,38 @@ def selftest(space) -> int:
     return 0 if ok > 0 else 1
 
 
+def steel_haz_verdict(sf_no_haz: float = 6.492,
+                      required_sf: float = REQUIRED_SF,
+                      emit: bool = True) -> dict:
+    """What the gate does across every sourced value of the STEEL HAZ factor.
+
+    `sf_no_haz` is the safety factor measured with no weld softening applied.
+    The recorded figure for the 10.98 kg steel frame (c2ba8d11d5143) is 6.492.
+
+    Same linearity argument as the aluminium case: the factor scales the
+    allowable and does not move the stress field.
+    """
+    out = verdict_across(
+        STEEL_HAZ_RANGE,
+        lambda rho: (sf_no_haz * rho >= required_sf,
+                     {"sf": round(sf_no_haz * rho, 3)}))
+    if emit:
+        print("")
+        print(f"STEEL HAZ sensitivity - {STEEL_HAZ_RANGE.name}, gate SF "
+              f"{required_sf}")
+        for r in out["evaluated"]:
+            print(f"  {r['value']:>6.3f}  {r['sf']:>7.3f}  "
+                  f"{'pass' if r['passed'] else 'FAIL':<6} {r['label']}")
+        print(f"  verdict: {out['verdict'].upper()}")
+        print("  NOTE: b_haz for steel is ASSUMED - 25 mm carried over from "
+              "the aluminium case.")
+        print("  The Eurocode basis is INFERENCE from a clause written for "
+              "hour-long heat")
+        print("  treatment, not for a weld cycle. Both caveats are carried in "
+              "the source text.")
+    return out
+
+
 def haz_verdict(sf_at_parent: float = 4.633, required_sf: float = REQUIRED_SF,
                 emit: bool = True) -> dict:
     """What the frame's gate does across every sourced value of rho_o,haz.
@@ -680,7 +766,8 @@ def main() -> int:
 
     if args.haz:
         v = haz_verdict()
-        return 0 if v["verdict"] == "pass" else 1
+        sv = steel_haz_verdict()
+        return 0 if v["verdict"] == "pass" and sv["verdict"] == "pass" else 1
 
     space = make_space()
     if args.selftest:
