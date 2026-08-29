@@ -246,13 +246,51 @@ STEEL_HAZ_RANGE = SourcedRange(
                   "hot-rolled 32 ksi")],
     nominal=0.645)
 
-#: b_haz for steel is NOT sourced. EN 1999-1-1's 25 mm is an aluminium figure
-#: and does not transfer. Worse, the softened zone for cold-worked material is
-#: bounded by the ~300 C annealing isotherm, which lies OUTSIDE the classical
-#: austenitised HAZ - so reusing 25 mm is not self-evidently conservative
-#: either. Stated as an assumption so it cannot be mistaken for a source.
-STEEL_HAZ_EXTENT_MM = 25.0
-STEEL_HAZ_EXTENT_IS_ASSUMED = True
+# b_haz for steel, sourced 2026-08-29. The first pass carried over 25 mm from
+# the aluminium case and flagged it as an assumption. It was too small, and the
+# reason is instructive.
+#
+# THE CLASSICAL HAZ IS THE WRONG MEASURE. The metallurgical HAZ of a steel weld
+# extends roughly 2-5 mm from the fusion line, bounded by austenitisation near
+# 723 C. Cold work is not destroyed at 723 C - recrystallisation begins around
+# 200 C and annealing completes around 300 C - so the SOFTENED zone lies well
+# OUTSIDE the zone a metallurgist would call the HAZ. Sizing b_haz from the
+# classical HAZ would understate it by roughly an order of magnitude.
+#
+# THE SOURCED FIGURE comes from the cold-worked stainless literature, which is
+# the only body of design guidance addressing this exact mechanism: for design
+# purposes, unless partial softening is justified by testing, FULL SOFTENING
+# TO 50 MM IN ANY DIRECTION FROM THE WELD should be assumed for cold-worked
+# stainless steel. The same work reports the measured softened width in the
+# middle of the material as roughly the plate thickness - about 16 mm for this
+# frame's 15.875 mm crossbeam - so 50 mm is the conservative design envelope
+# rather than the typical measurement.
+#
+# TRANSFER TO CARBON STEEL IS INFERENCE. The mechanism is identical (loss of
+# cold work by annealing) but the material is not. Austenitic stainless has
+# roughly a third the thermal conductivity of carbon steel, which concentrates
+# the weld heat and generally gives stainless a NARROWER heat-affected zone at
+# equal heat input. That argues the carbon-steel softened zone could be WIDER
+# than 50 mm, not narrower - so 50 mm is adopted as the better-sourced and
+# more conservative of the two available figures, NOT as a demonstrated bound.
+STEEL_HAZ_EXTENT_MM = 50.0
+STEEL_HAZ_EXTENT_SOURCE = (
+    "cold-worked stainless design rule: full softening assumed to 50 mm in "
+    "any direction from the weld unless partial softening is justified by "
+    "testing (Design Manual for Structural Stainless Steel / EN 1993-1-4 "
+    "background; softening of cold-worked stainless, J. Constr. Steel Res. "
+    "2023). TRANSFERRED to cold-finished carbon steel by mechanism, not by "
+    "citation - stainless conducts heat about 3x less well, which if anything "
+    "makes the carbon-steel zone wider. The classical 2-5 mm metallurgical "
+    "HAZ is deliberately NOT used: it is bounded by austenitisation near "
+    "723 C, while cold work anneals out from about 300 C")
+
+#: How far the recorded steel peaks actually sit from a weld line. Both are
+#: well inside any plausible b_haz, so the extent is currently NON-BINDING:
+#: every value above ~7.3 mm gives the same verdict for these frames. It
+#: starts to matter only if a design moves the peak away from the joint, and
+#: then a too-small extent would wrongly exempt it.
+STEEL_PEAK_DISTANCES_MM = {"P0057@v1": 6.2199, "P0058@v1": 7.2389}
 HAZ_EXTENT_MM = 25.0        # b_haz, EN 1999-1-1 clause 6.1.6.3 worked example
 HAZ_SOURCE = HAZ_RANGE.nominal.source
 
@@ -288,10 +326,8 @@ def haz_zones(v) -> list:
                  "lines": lines}]
     return [{"name": "spine-pad-weld", "factor": STEEL_HAZ_RANGE.nominal.value,
              "extent_mm": STEEL_HAZ_EXTENT_MM,
-             "source": (STEEL_HAZ_RANGE.nominal.source
-                        + ". EXTENT IS ASSUMED, not sourced: 25 mm is carried "
-                          "over from the aluminium case and no steel b_haz "
-                          "has been found"),
+             "source": (STEEL_HAZ_RANGE.nominal.source + ". EXTENT: "
+                        + STEEL_HAZ_EXTENT_SOURCE),
              "lines": lines}]
 
 
@@ -699,12 +735,19 @@ def steel_haz_verdict(sf_no_haz: float = 6.492,
             print(f"  {r['value']:>6.3f}  {r['sf']:>7.3f}  "
                   f"{'pass' if r['passed'] else 'FAIL':<6} {r['label']}")
         print(f"  verdict: {out['verdict'].upper()}")
-        print("  NOTE: b_haz for steel is ASSUMED - 25 mm carried over from "
-              "the aluminium case.")
-        print("  The Eurocode basis is INFERENCE from a clause written for "
-              "hour-long heat")
-        print("  treatment, not for a weld cycle. Both caveats are carried in "
-              "the source text.")
+        worst = max(STEEL_PEAK_DISTANCES_MM.values())
+        print(f"  extent b_haz = {STEEL_HAZ_EXTENT_MM:g} mm, from the "
+              f"cold-worked stainless design rule")
+        print(f"  NON-BINDING here: the recorded peaks sit "
+              f"{min(STEEL_PEAK_DISTANCES_MM.values()):.1f}-{worst:.1f} mm "
+              f"from a weld, so any")
+        print(f"  extent above ~{worst:.1f} mm gives this same verdict. It "
+              f"would start to matter only")
+        print("  if a design moved the peak off the joint.")
+        print("  Both the factor's Eurocode basis and the extent's transfer "
+              "from stainless are")
+        print("  INFERENCE from mechanism, not citation. Carried in the "
+              "source text.")
     return out
 
 

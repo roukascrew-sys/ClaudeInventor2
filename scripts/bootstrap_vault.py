@@ -671,12 +671,38 @@ establish this application: the clause's stated condition is heat treatment
 for **more than one hour**, and a weld exceeds 580 °C locally for *seconds*.
 Reading a weld HAZ under that clause is inference from the principle.
 
-**b_haz for steel is assumed, not sourced.** The 25 mm currently used is
-carried over from EN 1999-1-1, which is an aluminium figure. It is not
-obviously conservative either: the softened zone for cold-worked material is
-bounded by the ~300 °C annealing isotherm, which lies **outside** the
-classical austenitised HAZ, so the truly softened region may be *wider* than
-the metallurgical one.
+**b_haz was sourced on 2026-08-29, and the first value was too small.** It
+began as 25 mm carried over from EN 1999-1-1, an aluminium figure.
+
+The classical HAZ is the wrong measure. A steel weld's metallurgical HAZ
+extends roughly **2–5 mm** from the fusion line, bounded by austenitisation
+near 723 °C — but cold work is not destroyed at 723 °C. Recrystallisation
+begins near 200 °C and annealing completes near 300 °C, so the *softened*
+zone lies well **outside** the zone a metallurgist would call the HAZ. Sizing
+b_haz from it would understate the softened region by about an order of
+magnitude.
+
+The sourced figure comes from the cold-worked stainless literature, the only
+body of design guidance addressing this exact mechanism: assume **full
+softening to 50 mm in any direction from the weld** unless partial softening
+is justified by testing. The same work measures the softened width in
+mid-material as roughly the plate thickness — about 16 mm for this frame's
+15.875 mm crossbeam — so 50 mm is the conservative envelope, not the typical
+measurement.
+
+**Transfer to carbon steel is inference.** The mechanism is identical; the
+material is not. Austenitic stainless conducts heat about a third as well as
+carbon steel, which concentrates weld heat and generally gives stainless a
+*narrower* HAZ at equal heat input. That argues the carbon-steel softened
+zone could be **wider** than 50 mm, so this is the better-sourced and more
+conservative of the available figures rather than a demonstrated bound.
+
+**It is currently non-binding, and that was checked rather than assumed.**
+The recorded steel peaks sit **6.2–7.2 mm** from a weld line, so every extent
+above ~7.3 mm produces the same verdict — re-solving at 50 mm instead of
+25 mm returned identical safety factors to seven figures. The extent starts
+to matter only if a design moves the peak off the joint, and then a
+*too-small* extent would wrongly exempt it. That is the direction to watch.
 
 ## What it changed
 
