@@ -148,7 +148,7 @@ def validate_spec(spec: dict) -> None:
                 f"features[{idx}] ({op}): needs 'mode': 'union'|'cut' after the base")
 
 
-_SEL_KEYS = {"parallel_to", "at", "tol"}
+_SEL_KEYS = {"parallel_to", "at", "tol", "sharp_concave"}
 _AXES = ("X", "Y", "Z")
 
 
@@ -278,6 +278,62 @@ def build(spec: dict) -> cq.Workplane:
                         f"nothing is exactly the failure this engine refuses.")
             elif op == "fillet":
                 sel = feat["edges"]
+                if isinstance(sel, dict) and sel.get("sharp_concave"):
+                    # DECLARATIVE, not imperative. This does not say "round
+                    # the edge at these coordinates"; it says "no sharp
+                    # concave edge shall survive with this radius", and asks
+                    # singularity.py which edges those are.
+                    #
+                    # Written this way because the coordinate version is
+                    # brittle in a way that matters. Hand-computing where the
+                    # sharp edges sit worked for one frame and silently
+                    # selected nothing for 15 of 81 designs in the same space,
+                    # because which faces meet which depends on parameters -
+                    # a doubler pad thicker than its crossbeam puts the edge
+                    # on the crossbeam, a thinner one puts it on the pad. A
+                    # selector that must be re-derived per design is a
+                    # selector that will be wrong for some design.
+                    from .singularity import sharp_concave_edges
+
+                    solid = result.val()
+                    flagged = sharp_concave_edges(solid)
+                    if not flagged:
+                        # Nothing to blend, and the POSTCONDITION is already
+                        # met. Unlike a coordinate selector matching nothing -
+                        # which means the engineer's intent missed the solid -
+                        # this means the intent is satisfied. Not a no-op.
+                        continue
+
+                    def _key(a, b):
+                        pts = sorted([tuple(round(float(c), 3) for c in a),
+                                      tuple(round(float(c), 3) for c in b)])
+                        return (pts[0], pts[1])
+
+                    want = {_key(f["p0"], f["p1"]) for f in flagged}
+                    edges = []
+                    for e in solid.Edges():
+                        vtx = e.Vertices()
+                        if len(vtx) != 2:
+                            continue
+                        if _key((vtx[0].X, vtx[0].Y, vtx[0].Z),
+                                (vtx[1].X, vtx[1].Y, vtx[1].Z)) in want:
+                            edges.append(e)
+                    if len(edges) != len(flagged):
+                        raise GeometryError(
+                            f"features[{idx}] (fillet): detected {len(flagged)} "
+                            f"sharp concave edges but could only locate "
+                            f"{len(edges)} of them in the solid")
+                    blended = solid.fillet(feat["radius"], edges)
+                    remaining = sharp_concave_edges(blended)
+                    if remaining:
+                        raise GeometryError(
+                            f"features[{idx}] (fillet): radius "
+                            f"{feat['radius']} left {len(remaining)} sharp "
+                            f"concave edge(s) standing, so the peak stress "
+                            f"can still be unbounded. The postcondition this "
+                            f"feature asserts is not met")
+                    result = cq.Workplane(obj=blended)
+                    continue
                 picked = result.edges(
                     sel if isinstance(sel, str) else _StructuredEdgeSelector(sel))
                 # Same principle as a hole that removes nothing: a fillet that

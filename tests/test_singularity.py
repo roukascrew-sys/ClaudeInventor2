@@ -22,7 +22,8 @@ import pytest
 
 from design_engine.geometry import build
 from design_engine.singularity import (DEFAULT_RADIUS_ELEMENTS, TANGENT_TOL_DEG,
-                                       RefinementRefused, _williams_exponent,
+                                       MIN_BLEND_ELEMENTS, RefinementRefused,
+                                       blend_resolution, _williams_exponent,
                                        classify_peak, refinement_permitted,
                                        require_refinable, sharp_concave_edges)
 
@@ -313,3 +314,41 @@ def test_P0048_the_filleted_peak_is_still_allowed_to_refine():
     v = classify_peak(solid, [29.513, -0.024, 199.225], mesh_size_mm=3.2)
     assert refinement_permitted(v)["permitted"] is True
     assert v["singular_edges"] > 0, "allowed despite the part having edges"
+
+
+# ------------------------------------------------- blend resolution
+# Blending a sharp corner makes the peak finite, so classify_peak stops
+# objecting. That is correct and it is not sufficient: the check that caught
+# the unbounded case does not catch the under-resolved one it creates.
+def test_a_blend_too_small_for_the_mesh_is_reported_unresolved():
+    """The trap in fixing a singularity. A 1 mm notch radius at a 3 mm mesh
+    has a third of an element across it: bounded, and still measuring the
+    mesh rather than the structure."""
+    v = blend_resolution(1.0, 3.0)
+    assert v["resolved"] is False
+    assert v["elements_across_blend"] == pytest.approx(0.333, abs=0.01)
+    assert "measures the mesh" in v["reason"]
+
+
+def test_it_says_what_mesh_size_would_be_needed():
+    """A refusal that does not say what would fix it sends the reader back to
+    arithmetic they have already done."""
+    v = blend_resolution(1.0, 3.0)
+    assert "0.33 mm" in v["reason"]
+
+
+def test_an_adequately_meshed_blend_passes():
+    assert blend_resolution(10.0, 3.0)["resolved"] is True
+    assert blend_resolution(1.0, 0.3)["resolved"] is True
+
+
+def test_the_minimum_is_a_floor_not_a_target():
+    """Three elements is where the blend stops being represented at all, not
+    where it is well resolved - notch-stress practice asks for far more."""
+    assert MIN_BLEND_ELEMENTS == 3.0
+    assert blend_resolution(3.0, 1.0)["resolved"] is True   # exactly at it
+
+
+@pytest.mark.parametrize("r,m", [(0.0, 3.0), (1.0, 0.0), (-1.0, 3.0)])
+def test_nonsense_inputs_return_unknown_not_a_verdict(r, m):
+    assert blend_resolution(r, m)["resolved"] is None

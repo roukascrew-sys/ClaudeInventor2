@@ -42,7 +42,7 @@ from .mesh import (MeshError, describe_axis_options, mesh_step,
                    select_nodes)
 from .parts import PartStore, _check_reason
 from .geometry import build as build_solid
-from .singularity import classify_peak
+from .singularity import blend_resolution, classify_peak
 from .submodel import (SubmodelError, coplanar_risk, converged,
                        cut_region, driven_nodes, plan,
                        refinement_ladder, solid_bounds,
@@ -1481,6 +1481,19 @@ class ValidationTools:
             except Exception as exc:        # noqa: BLE001 - never break a solve
                 singularity = {"verdict": "unknown", "singular_edges": 0,
                                "reason": f"not analysed: {type(exc).__name__}: {exc}"}
+            # A clean geometry is not the same as a resolved one. Blending a
+            # sharp corner makes the peak FINITE, so classify_peak stops
+            # objecting - correctly. But a 1 mm blend meshed at 3 mm has a
+            # third of an element across it, and the peak still measures the
+            # mesh. Fixing the geometry moves the problem from "unbounded" to
+            # "under-resolved", and the check that caught the first does not
+            # catch the second.
+            radii = [float(f["radius"]) for f in part["spec"].get("features", [])
+                     if f.get("op") == "fillet" and f.get("radius")]
+            blend = (blend_resolution(min(radii),
+                                      float(case["mesh"]["max_size_mm"]))
+                     if radii else None)
+
             max_disp = max(math.sqrt(sum(v ** 2 for v in u[:3]))
                            for u in disp.values())
 
@@ -1539,6 +1552,7 @@ class ValidationTools:
                 "stress_outlier_ratio": round(outlier_ratio, 4),
                 "stress_outlier_warning": outlier_warning,
                 "singularity": singularity,
+                "blend_resolution": blend,
                 "max_von_mises_node": int(max_node),
                 "max_von_mises_at_mm": [round(float(v), 3) for v in coords[int(max_node)]],
                 "max_displacement_mm": round(max_disp, 9),

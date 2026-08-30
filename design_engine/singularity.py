@@ -279,6 +279,49 @@ def classify_peak(solid, peak_xyz, mesh_size_mm: float,
     }
 
 
+#: Elements wanted across a blend before its peak stress means anything.
+#: NOT a sourced standard - notch-stress practice commonly asks for far more
+#: (the IIW notch method meshes a 1 mm reference radius with elements of about
+#: r/6). Three is the point below which the blend is not represented AT ALL
+#: rather than the point at which it is well resolved, so it is a floor, not
+#: a target. Flagged as an estimate wherever it is reported.
+MIN_BLEND_ELEMENTS = 3.0
+
+
+def blend_resolution(radius_mm: float, mesh_size_mm: float) -> dict:
+    """Is the mesh fine enough for a blend of this radius to mean anything?
+
+    WHY THIS EXISTS, and it is the awkward part of fixing a singularity.
+    Blending a sharp re-entrant corner makes the peak stress FINITE, so
+    `classify_peak` stops objecting - correctly, because the geometry really
+    is clean. But a 1 mm blend meshed at 3 mm has a third of an element across
+    it: the peak is now bounded and still meaningless, and the check that used
+    to catch it no longer fires.
+
+    Fixing the geometry therefore moves the problem rather than removing it,
+    from "unbounded" to "under-resolved". Those need different remedies -
+    a fillet versus a finer mesh - and only the second one is honest here.
+    """
+    if radius_mm <= 0 or mesh_size_mm <= 0:
+        return {"resolved": None, "reason": "radius and mesh size must be > 0"}
+    n = float(radius_mm) / float(mesh_size_mm)
+    return {
+        "elements_across_blend": round(n, 3),
+        "radius_mm": float(radius_mm),
+        "mesh_size_mm": float(mesh_size_mm),
+        "minimum": MIN_BLEND_ELEMENTS,
+        "resolved": bool(n >= MIN_BLEND_ELEMENTS),
+        "reason": (
+            f"{n:.2f} element(s) across a {radius_mm:g} mm blend at "
+            f"{mesh_size_mm:g} mm mesh"
+            + ("" if n >= MIN_BLEND_ELEMENTS else
+               f" - below {MIN_BLEND_ELEMENTS:g}, so the blend is barely "
+               f"represented and its peak stress measures the mesh. The "
+               f"geometry is clean; the discretisation is not. Needs about "
+               f"{radius_mm / MIN_BLEND_ELEMENTS:.2f} mm elements locally")),
+    }
+
+
 class RefinementRefused(RuntimeError):
     """A refinement campaign that could not converge, refused before it ran."""
 

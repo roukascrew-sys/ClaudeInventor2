@@ -343,6 +343,13 @@ def haz_zones(v) -> list:
 # Resolvability follows from the choice rather than driving it: the arc is
 # 15.7 mm, about 4.9 elements at 3.2 mm and 5.6 at 2.8 mm.
 FILLET_R = 10.0
+
+#: Secondary blend on the sharp concave edges the primary fillet leaves behind.
+#: 1.0 mm is the IIW effective-notch-stress reference radius (Radaj), adopted
+#: there to avoid infinite stress at a geometrically sharp weld toe. Defined
+#: for fatigue assessment, borrowed here to make a static gate convergeable -
+#: see build_spec for the two caveats that go with the borrowing.
+NOTCH_R = 1.0
 KT_BASIS = ("Two stated stress-concentration factors, both calibrated against "
             "named FEA runs rather than assumed. Doubler step Kt=1.5 from "
             "P0031@v2 (31.5 -> 47.6 MPa, ratio 1.51). T-junction Kt=1.85 from "
@@ -488,6 +495,49 @@ def build_spec(v, ctx) -> dict:
                                              float(v["spine_x"]) / 2.0],
                                        "z": [cb_z, cb_z + cb_h]},
                                 "tol": 0.01}})
+    # ...and that leaves EIGHT more, which is the finding of 2026-08-29. The
+    # fillet above blends the x-z profile of the junction; it is a 2D fix to a
+    # 3D corner. Two families survive it, and every frame this search has ever
+    # produced peaked on one of them - steel and aluminium alike, so not one
+    # safety factor in any run was converged:
+    #
+    #   X-parallel at y = +/-spine_y/2, z = cb_z and cb_z+cb_h
+    #       where the crossbeam's top and bottom faces run out against the
+    #       spine's side walls
+    #   Z-parallel at x = +/-pad_len/2, y = +/-pad_thick/2
+    #       where the doubler pad terminates on the crossbeam
+    #
+    # NOTCH_R = 1.0 mm, and the number is not arbitrary. The IIW effective
+    # notch stress method fictitiously rounds a weld toe or root to r = 1 mm
+    # for exactly this reason - Radaj's reference radius, adopted "in order to
+    # avoid arbitrary or infinite stress results" at a notch that is
+    # geometrically sharp. It is defined for steel and aluminium alloys, which
+    # is both of this study's materials, and for sections well above the 5 mm
+    # where the thin-section value would apply instead.
+    #
+    # TWO CAVEATS, and they are not small:
+    #   * IIW defines r = 1 mm for FATIGUE assessment by notch stress. Using it
+    #     to make a STATIC yield gate convergeable is a transfer of the
+    #     geometric device, not a citation of the method.
+    #   * It is a FICTITIOUS radius (rho = 1 mm + rho_real) chosen to embed
+    #     micro-structural support effects. It is not a claim that the real
+    #     weld toe measures 1 mm.
+    #
+    # 1.5 mm was the largest radius the kernel would accept here and 1.0 mm
+    # also builds, so the sourced value was taken over the maximum available.
+    if NOTCH_R > 0:
+        # DECLARATIVE: "no sharp concave edge shall survive", with
+        # singularity.py naming them. The coordinate version of this worked
+        # for one frame and silently selected nothing for 15 of 81 designs in
+        # the same space, because which faces meet which depends on the
+        # parameters - a doubler thicker than its crossbeam puts the sharp
+        # edge on the crossbeam, a thinner one puts it on the pad, and with no
+        # doubler at all the survivors are vertical instead of horizontal.
+        # A selector that has to be re-derived per design will be wrong for
+        # some design.
+        feats.append({"op": "fillet", "radius": NOTCH_R,
+                      "edges": {"sharp_concave": True}})
+
     # harness lug holes through the spine - the life-safety load path
     for z in (SPINE_Z - 50.0, 40.0):
         feats.append({"op": "hole", "d": LUG_D, "at": [0.0, z], "face": ">X"})
@@ -683,7 +733,7 @@ def make_evaluator(engine, space, reqs, cache, with_fea=True):
         # 5.0 was refused on all three promoted frames (Jacobian gate vs
         # the 6.5mm lug holes). The ladder refines instead of giving up.
         stages.append(FeaStage(build_case, analysis="static",
-                               mesh_ladder=[5.0, 4.0, 3.2],
+                               mesh_ladder=[5.0, 4.0, 3.2, 3.0, 2.5],
                                fidelity=Fidelity.L3_HIGH_FEA))
     return Evaluator(stages, ctx, cache=cache)
 
