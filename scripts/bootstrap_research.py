@@ -2585,7 +2585,65 @@ Recorded classifications: **P0047 SINGULAR** at 1.28 mm; **P0048 CLEAN** at
   adaptive loop never terminates — [[Adaptivity cannot rescue a singular goal]].
 - **Geometry comes before mesh work.** Any convergence or submodelling effort
   must gate on `classify_peak()` first, or it spends the budget producing a
-  number that rises with every hour.""",
+  number that rises with every hour.
+
+## Blending them all, 2026-08-30
+
+**Every frame the search had ever produced was singular** — all 8 edges, steel
+and aluminium alike. Not one safety factor in any run was converged, and the
+filleted P0048 was the exception rather than the rule.
+
+**r = 1.0 mm, from IIW.** The effective-notch-stress method fictitiously rounds
+a weld toe to 1 mm — Radaj's reference radius, adopted *"to avoid arbitrary or
+infinite stress results"* at a geometrically sharp notch. Same problem,
+established answer. Two caveats travel with it: IIW defines it for **fatigue**
+assessment, so using it to make a static gate convergeable is a transfer of the
+geometric device rather than a citation of the method; and it is a
+**fictitious** radius embedding micro-structural support effects, not a claim
+that the real toe measures 1 mm.
+
+**The selector had to become declarative.** Hand-computing where the sharp
+edges sit worked for one frame and silently selected nothing for **15 of 81**
+designs in the same space — which faces meet which depends on the parameters. A
+doubler thicker than its crossbeam puts the edge on the crossbeam, a thinner
+one on the pad, and with no doubler the survivors are vertical instead of
+horizontal. So `geometry.py` now accepts
+`{"edges": {"sharp_concave": true}}` and asks this module which edges those
+are. It states a **postcondition** — no sharp concave edge shall survive at
+this radius — and raises if one does. Matching nothing is *success* there, not
+a silent no-op, because the intent is already satisfied.
+
+> A selector that has to be re-derived per design will be wrong for some
+> design. The module that finds the problem should name the edges to fix.
+
+## Fixing it disabled the gate that caught it
+
+The awkward part, and the reason `blend_resolution()` now exists. A blended
+corner has **finite** peak stress, so `classify_peak` correctly stops
+objecting — while a 1 mm blend meshed at 3 mm has **a third of an element**
+across it, and the peak still measures the mesh.
+
+The problem moves from **unbounded** to **under-resolved**. Those need
+different remedies — a fillet versus a finer mesh — and the check that caught
+the first does not catch the second. `MIN_BLEND_ELEMENTS = 3` is a floor, not
+a target, and is flagged as an estimate: notch practice asks for roughly r/6.
+
+## And then the wall
+
+The geometry is provably clean and the frame **cannot currently be evaluated
+on this machine**. Two designs are refused by the Jacobian gate at every rung
+down to 2.5 mm; the third meshes at 3.0 mm and then CalculiX exits
+`3221225477` at **5,007 MB**.
+
+Meshing is non-monotonic again, and the old ladder just missed: **3.2 mm fails
+where 3.0 mm passes**, and 2.0 mm fails where 2.5 and 1.5 pass.
+
+So the memory ceiling is now reached three independent ways — global
+refinement at 6.1 GB, ccx `*SUBMODEL` at a cost per driven node that never
+finishes, and now a blend-clean geometry that needs a finer mesh. **They were
+always the same problem**, and it is the one thing standing between this
+project and a converged number.
+→ [[Solver memory bounds mesh refinement]]""",
         links=["Peak stress at a sharp re-entrant corner cannot converge",
                "The outlier ratio does not detect geometric singularities",
                "Adaptivity cannot rescue a singular goal",
