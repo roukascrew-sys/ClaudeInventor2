@@ -46,7 +46,9 @@ from .singularity import blend_resolution, classify_peak
 from .submodel import (SubmodelError, coplanar_risk, converged,
                        cut_region, driven_nodes, plan,
                        refinement_ladder, solid_bounds,
-                       submodel_deck_fragment)
+                       )
+from .interpolate import (InterpolationError, boundary_cards,
+                          interpolate, read_frd)
 from .fatigue import SNCurve, stress_range_from_ratio
 from . import weld as _weld
 
@@ -1659,8 +1661,7 @@ class ValidationTools:
                      reason: str, *, feature_mm: float,
                      standoff_elements: float, standoff_source: str = "",
                      centre=None, ladder_steps: int = 3,
-                     ladder_factor: float = 2.0, tol_pct: float = 5.0,
-                     allow_hanging_solver: bool = False) -> dict:
+                     ladder_factor: float = 2.0, tol_pct: float = 5.0) -> dict:
         """Re-solve a small region around the peak, driven by a global solve.
 
         Consumes an existing `fea_static` result rather than re-running it.
@@ -1751,19 +1752,20 @@ class ValidationTools:
             # C3D10 containing each driven node and evaluate its shape
             # functions) or to find a ccx configuration that is affordable.
             #
-            # Refusing fast, rather than letting a caller discover this as a
-            # 15-minute timeout per rung.
-            if not allow_hanging_solver:
-                raise FeaError(
-                    f"submodel_interpolation_unaffordable: CalculiX 2.23 "
-                    f"*SUBMODEL interpolation costs ~88-182 ms per driven "
-                    f"node and scales superlinearly (measured 2026-08-28); on "
-                    f"the real geometry it did not complete within 900 s. "
-                    f"The region {region.to_dict()['bounds_mm']} and the cut "
-                    f"are computed and valid - only the interpolation is "
-                    f"unusable, so the {len(ladder)}-rung ladder would not "
-                    f"finish. Pass allow_hanging_solver=True only to "
-                    f"re-measure the solver's behaviour")
+            # Since 2026-08-30 the interpolation is ours, so none of that
+            # applies any more: the deck states the displacements outright
+            # instead of asking ccx to work them out. Measured on the real
+            # global solve at 3.5 ms per driven node against ccx's 88-182 ms,
+            # and exact on a linear field to 7.1e-15 mm.
+            #
+            # Read ONCE, outside the ladder. The jetpack global .frd is 394 MB
+            # and every rung drives points from the same field; re-reading it
+            # per rung would cost more than the solving.
+            try:
+                field = read_frd(global_frd)
+            except InterpolationError as exc:
+                raise FeaError(f"global results unreadable: {exc}") from exc
+
             peaks, rungs = [], []
             binary = threads = None
             for mm in ladder:
@@ -1773,8 +1775,24 @@ class ValidationTools:
                 cq.exporters.export(cut, str(step_path))
                 m = mesh_step(str(step_path), mm, None)
                 driven = driven_nodes(m, region)
-                rel = os.path.relpath(global_frd, run_dir).replace("\\", "/")
-                frag = submodel_deck_fragment(rel, driven)
+                by_tag = {int(t): xyz for t, xyz
+                          in zip(m["node_tags"], m["coords"])}
+                interp = interpolate(field=field,
+                                     points={t: by_tag[t] for t in driven})
+                if interp["outside"]:
+                    # A driven node outside every global element would have to
+                    # be extrapolated, and nothing downstream could tell. The
+                    # cut is supposed to lie INSIDE the global solve, so this
+                    # means the region and the global model disagree.
+                    raise FeaError(
+                        f"{len(interp['outside'])} of {len(driven)} driven "
+                        f"nodes at {mm:g} mm fell outside every global "
+                        f"element, the worst by "
+                        f"{interp['worst_outside_mm']:.4g} mm. They cannot be "
+                        f"driven without extrapolating, so the submodel is "
+                        f"refused rather than guessed")
+                frag = {"before_step": [],
+                        "inside_step": boundary_cards(interp["values"])}
                 self._write_submodel_inp(run_dir / "job.inp", m, case, frag)
                 _, binary, threads, solve_s = self._solve(
                     run_dir, len(m["node_tags"]), what=f"submodel {mm:g}mm")
@@ -1812,12 +1830,26 @@ class ValidationTools:
                 details["submodel_vs_global_ratio"] = round(
                     peaks[-1] / float(coarse), 4)
 
+            # The log's vocabulary is deliberately binary, and this closes
+            # FAIL when the peak has not settled. That is the study failing to
+            # establish convergence, NOT the part failing its gate - the gate
+            # belongs to fea_static and giving one number two verdicts is how
+            # a result ends up with two answers. The failure_mode says so in
+            # terms, because "fail" on a row about a passing part is exactly
+            # the sort of thing a later reader misreads.
+            #
+            # This line previously closed with "unknown", which close_action
+            # refuses. It had never executed: the *SUBMODEL refusal returned
+            # before reaching it, so removing that refusal is what exposed it.
             converged_ok = bool(verdict.get("converged"))
             self.log.close_action(
-                action_id, "pass" if converged_ok else "unknown",
+                action_id, "pass" if converged_ok else "fail",
                 details=details,
-                failure_mode=(None if converged_ok
-                              else f"not converged: {verdict['reason']}"))
+                failure_mode=(None if converged_ok else
+                              f"convergence_not_established: "
+                              f"{verdict['reason']}. This is the refinement "
+                              f"study failing to converge, not the part "
+                              f"failing a limit state"))
             if global_result.get("action_id") is not None:
                 self.log._conn.execute(
                     "UPDATE actions SET linked_parent_id = ? WHERE id = ?",

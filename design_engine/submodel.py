@@ -273,34 +273,18 @@ def solid_bounds(solid) -> tuple:
     return (bb.xmin, bb.ymin, bb.zmin, bb.xmax, bb.ymax, bb.zmax)
 
 
-def submodel_deck_fragment(global_frd_path, driven: list,
-                           step: int = 1) -> dict:
-    """The `*SUBMODEL` lines for a submodel deck, split by where they go.
-
-    `TYPE=NODE` with an explicit node set: CalculiX reads the global results
-    and interpolates displacement onto each listed node. All three
-    translational DOFs are driven, because a cut surface transmits the full
-    displacement vector - driving a subset would leave the region free to
-    slide in the untouched direction.
-
-    Returned as `{"before_step": [...], "inside_step": [...]}` because the two
-    halves are not adjacent in the deck and must not be concatenated blindly:
-    the set and the `*SUBMODEL` card are model data, and `*BOUNDARY, SUBMODEL`
-    is a step card. The `*NSET` comes first because CalculiX resolves a set
-    name at the point of use.
-    """
-    if not driven:
-        raise SubmodelError(
-            "no driven nodes: the submodel would be unrestrained, and a solve "
-            "with rigid-body modes reports nothing about the structure. Check "
-            "the region actually intersects the part")
-    before = ["*NSET, NSET=NDRIVEN"]
-    before += [", ".join(str(t) for t in driven[i:i + 8])
-               for i in range(0, len(driven), 8)]
-    before += [f"*SUBMODEL, TYPE=NODE, INPUT={global_frd_path}", "NDRIVEN"]
-    return {"before_step": before,
-            "inside_step": [f"*BOUNDARY, SUBMODEL, STEP={int(step)}",
-                            "NDRIVEN, 1, 3"]}
+# `submodel_deck_fragment` lived here until 2026-09-01. It emitted the
+# `*SUBMODEL` cards that asked CalculiX to interpolate the driven
+# displacements itself, and it was removed rather than kept, because ccx's
+# interpolation was measured at 88-182 ms per driven node and did not finish
+# inside 900 s on the real geometry. `design_engine/interpolate.py` does the
+# job in 3.5 ms per node, so the deck now STATES the displacements instead of
+# asking for them.
+#
+# Deleted rather than deprecated: a working-looking emitter for a path proven
+# unaffordable is an invitation to use it, and this project has already been
+# bitten once by code that existed, passed its tests, and was reachable only
+# from a test fixture.
 
 
 def refinement_ladder(coarse_mm: float, region: SubmodelRegion,

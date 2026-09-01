@@ -25,7 +25,7 @@ from design_engine.singularity import RefinementRefused
 from design_engine.submodel import (SUGGESTED_STANDOFF,
                                     SubmodelError, SubmodelRegion, converged,
                                     coplanar_risk, driven_nodes, plan,
-                                    refinement_ladder, submodel_deck_fragment)
+                                    refinement_ladder)
 
 CLEAN = {"verdict": "clean", "reason": "well clear of every edge"}
 SINGULAR = {"verdict": "singular", "reason": "1.28 mm from a 270-degree edge"}
@@ -128,12 +128,6 @@ def test_driven_nodes_picks_the_cut_surface_out_of_a_mesh():
     assert driven_nodes(mesh, _region()) == [1, 3]
 
 
-def test_an_empty_driven_set_is_refused_rather_than_solved():
-    """A submodel with nothing driven is unrestrained; the solve would report
-    rigid-body motion, not structure."""
-    with pytest.raises(SubmodelError, match="unrestrained"):
-        submodel_deck_fragment("global.frd", [])
-
 
 def test_coplanar_part_faces_are_reported_not_silently_driven():
     """The stated limitation. Classification is geometric, so an original free
@@ -151,33 +145,8 @@ def test_no_coplanar_risk_when_the_region_is_interior():
 
 
 # --------------------------------------------------------------- the deck
-def test_the_node_set_is_defined_before_it_is_used():
-    """CalculiX resolves a set name where it is used, so *NSET must precede
-    the *SUBMODEL card that names it."""
-    frag = submodel_deck_fragment("../R0047/job.frd", [1, 2, 3])
-    before = frag["before_step"]
-    assert before.index("*NSET, NSET=NDRIVEN") < next(
-        i for i, l in enumerate(before) if l.startswith("*SUBMODEL"))
 
 
-def test_the_deck_names_the_global_results_file():
-    frag = submodel_deck_fragment("../R0047/job.frd", [7])
-    assert any("INPUT=../R0047/job.frd" in l for l in frag["before_step"])
-
-
-def test_all_three_translations_are_driven():
-    """A cut surface transmits the full displacement vector. Driving a subset
-    leaves the region free to slide in the untouched direction."""
-    frag = submodel_deck_fragment("g.frd", [1])
-    assert "NDRIVEN, 1, 3" in frag["inside_step"]
-
-
-def test_step_and_model_lines_are_kept_apart():
-    """*BOUNDARY, SUBMODEL is a step card; the set and *SUBMODEL are model
-    data. Concatenating them blindly produces a deck ccx rejects."""
-    frag = submodel_deck_fragment("g.frd", [1])
-    assert not any(l.startswith("*BOUNDARY") for l in frag["before_step"])
-    assert not any(l.startswith("*NSET") for l in frag["inside_step"])
 
 
 # ------------------------------------------------------------- the ladder
@@ -340,42 +309,6 @@ def test_a_region_swallowing_the_whole_part_is_refused(solved):
             standoff_source=STANDOFF_SRC, centre=(0.0, 0.0, 60.0))
 
 
-def test_the_solve_is_refused_because_calculix_submodel_is_unaffordable(solved):
-    """The finding that stopped this feature, pinned so it cannot be
-    forgotten or silently re-enabled.
-
-    ccx 2.23 win-x64 *SUBMODEL interpolation costs 88-182 ms per driven node
-    and scales superlinearly (measured: 272 driven -> 23.8 s, 1082 driven ->
-    197.1 s on one fixed C3D10 submodel mesh). On the real geometry it did not
-    complete within a 900 s timeout at all.
-
-    An earlier reading of this as an infinite createtet loop was wrong - the
-    probe cases terminate. The operational conclusion is unchanged and the
-    mechanism is not fully explained, which is why this test pins the REFUSAL
-    rather than a claimed cause.
-
-    Everything before the solve is validated and runs: the gate, the region,
-    the cut, the driven set, the boundary-condition conflict check.
-    """
-    eng, gid, res = solved
-    with pytest.raises(FeaError, match="submodel_interpolation_unaffordable"):
-        eng.validation.fea_submodel(
-            gid, _case(), res, reason="the solver cannot interpolate yet",
-            feature_mm=4.0, standoff_elements=3.0,
-            standoff_source=STANDOFF_SRC, centre=(0.0, 0.0, 60.0),
-            ladder_steps=3)
-
-
-def test_the_refusal_still_reports_the_region_it_computed(solved):
-    """A refusal that discards its work makes the next attempt start over."""
-    eng, gid, res = solved
-    with pytest.raises(FeaError) as caught:
-        eng.validation.fea_submodel(
-            gid, _case(), res, reason="region should survive the refusal",
-            feature_mm=4.0, standoff_elements=3.0,
-            standoff_source=STANDOFF_SRC, centre=(0.0, 0.0, 60.0),
-            ladder_steps=3)
-    assert "44.0" in str(caught.value), "the z bounds of the cut, 44 to 76"
 
 
 def test_the_cheap_refusals_still_fire_before_the_solver_limitation(solved):
@@ -389,3 +322,43 @@ def test_the_cheap_refusals_still_fire_before_the_solver_limitation(solved):
             feature_mm=4.0, standoff_elements=3.0,
             standoff_source=STANDOFF_SRC, centre=(0.0, 0.0, 118.0),
             ladder_steps=3)
+
+
+def test_the_submodel_now_solves_with_our_own_interpolation(solved):
+    """The point of the whole exercise.
+
+    ccx's *SUBMODEL cost 88-182 ms per driven node and did not finish inside
+    900 s on the real geometry. The deck now states the displacements outright
+    instead of asking the solver to work them out, so this runs.
+    """
+    eng, gid, res = solved
+    out = eng.validation.fea_submodel(
+        gid, _case(), res, reason="solve with the local interpolation",
+        feature_mm=4.0, standoff_elements=3.0, standoff_source=STANDOFF_SRC,
+        centre=(0.0, 0.0, 60.0), ladder_steps=3, tol_pct=5.0)
+    assert len(out["rungs"]) == 3
+    assert all(r["max_von_mises_MPa"] > 0 for r in out["rungs"])
+    assert all(r["driven_nodes"] > 0 for r in out["rungs"])
+
+
+def test_a_study_that_does_not_converge_closes_FAIL_not_unknown(solved):
+    """The log's vocabulary is pass|fail and nothing else.
+
+    This line closed with "unknown" until 2026-09-01 and close_action refuses
+    that - the *SUBMODEL refusal returned before ever reaching it, so the bug
+    sat behind a guard. Removing the guard is what ran the code.
+
+    The failure_mode has to distinguish the two failures it could mean: the
+    STUDY did not converge; the PART did not fail anything.
+    """
+    eng, gid, res = solved
+    out = eng.validation.fea_submodel(
+        gid, _case(), res, reason="tolerance too tight to ever converge",
+        feature_mm=4.0, standoff_elements=3.0, standoff_source=STANDOFF_SRC,
+        centre=(0.0, 0.0, 60.0), ladder_steps=3, tol_pct=1e-9)
+    row = eng.log._conn.execute(
+        "SELECT result, failure_mode FROM actions WHERE id = ?",
+        (out["action_id"],)).fetchone()
+    assert row["result"] == "fail"
+    assert "convergence_not_established" in row["failure_mode"]
+    assert "not the part failing a limit state" in row["failure_mode"]
