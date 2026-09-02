@@ -400,3 +400,135 @@ def test_a_scoped_correction_still_answers_when_other_problems_exist(tmp_path):
     est = kb.correction("max_von_mises_MPa", problem="mine")
     assert est is not None and est.n == 3
     assert 0.9 < est.factor < 0.95
+
+
+# ------------------------------------------- censoring and solve-type scoping
+# Added 2026-09-02, when widening the ingest to fea_submodel / fea_modal
+# surfaced two defects at once: a killed run's LOWER BOUND was about to be
+# fitted as if it were a cost, and the existing fit had been pooling solve
+# types that differ by 2.9x at an identical node count on an identical part.
+
+def test_a_killed_run_is_recorded_as_a_bound_not_a_cost(kb):
+    kb.ingest_log(FakeLog([
+        _row(1, action="fea_submodel", result="fail",
+             details={"nodes": 478_512, "solve_seconds_at_kill": 2400.0,
+                      "solve_seconds_is_lower_bound": True,
+                      "peak_rss_mb": 4437.0, "peak_rss_is_lower_bound": True},
+             failure_mode="FeaError: solver_timeout")]))
+    import sqlite3
+    r = kb._conn.execute(
+        "SELECT solve_seconds, cost_is_censored, memory_is_censored"
+        " FROM observations WHERE source_action_id = 1").fetchone()
+    assert r["solve_seconds"] == 2400.0
+    assert r["cost_is_censored"] == 1
+    assert r["memory_is_censored"] == 1
+
+
+def test_censored_rows_are_excluded_from_the_fit(kb):
+    """The whole point. Five honest points, then one enormous mesh stopped
+    early — which, taken at face value, is the cheapest large solve on record
+    and would drag the exponent down."""
+    pairs = [(n, 1e-5 * n ** 1.5) for n in (10_000, 50_000, 100_000, 400_000, 800_000)]
+    rows = [_row(i, details={"nodes": n, "solve_seconds": s})
+            for i, (n, s) in enumerate(pairs, start=1)]
+    kb.ingest_log(FakeLog(rows))
+    clean = kb.solver_cost_model()
+
+    kb.ingest_log(FakeLog([
+        _row(99, result="fail",
+             details={"nodes": 5_000_000, "solve_seconds_at_kill": 60.0,
+                      "solve_seconds_is_lower_bound": True})]))
+    after = kb.solver_cost_model()
+    assert after == clean, "a censored lower bound leaked into the fit"
+    assert after["n"] == 5
+
+
+def test_a_censored_bound_can_still_refute_the_model(kb):
+    """Excluding censored rows must not become a way of never being wrong."""
+    pairs = [(n, 1e-5 * n ** 1.5) for n in (10_000, 50_000, 100_000, 400_000, 800_000)]
+    kb.ingest_log(FakeLog([_row(i, details={"nodes": n, "solve_seconds": s})
+                           for i, (n, s) in enumerate(pairs, start=1)]))
+    # 200k nodes fits at 1e-5 * 200000^1.5 = 894 s. This run passed 20000 s
+    # and had still not finished, so the model is refuted there.
+    kb.ingest_log(FakeLog([
+        _row(99, action="fea_submodel", result="fail",
+             details={"nodes": 200_000, "solve_seconds_at_kill": 20_000.0,
+                      "solve_seconds_is_lower_bound": True})]))
+    v = kb.cost_model_violations()
+    assert len(v) == 1
+    assert v[0]["nodes"] == 200_000
+    assert v[0]["at_least_s"] == 20_000.0
+    assert v[0]["exceeds_high_by"] > 1.0
+    assert "refuted" in v[0]["verdict"]
+
+
+def test_a_censored_bound_consistent_with_the_model_is_not_a_violation(kb):
+    """A run stopped at 10 s on a mesh the model says takes 894 s says nothing
+    at all. Reporting it as a violation would be noise dressed as evidence."""
+    pairs = [(n, 1e-5 * n ** 1.5) for n in (10_000, 50_000, 100_000, 400_000, 800_000)]
+    kb.ingest_log(FakeLog([_row(i, details={"nodes": n, "solve_seconds": s})
+                           for i, (n, s) in enumerate(pairs, start=1)]))
+    kb.ingest_log(FakeLog([
+        _row(99, result="fail",
+             details={"nodes": 200_000, "solve_seconds_at_kill": 10.0,
+                      "solve_seconds_is_lower_bound": True})]))
+    assert kb.cost_model_violations() == []
+
+
+def test_solve_types_are_not_pooled(kb):
+    """Static and buckling are different solves. Pooling them answers no
+    question anyone asked."""
+    static = [_row(i, action="fea_static",
+                   details={"nodes": n, "solve_seconds": 1e-5 * n ** 1.5})
+              for i, n in enumerate((10_000, 50_000, 100_000, 400_000), start=1)]
+    buckle = [_row(100 + i, action="fea_buckling",
+                   details={"nodes": n, "solve_seconds": 5e-5 * n ** 1.5})
+              for i, n in enumerate((10_000, 50_000, 100_000, 400_000), start=1)]
+    kb.ingest_log(FakeLog(static + buckle))
+
+    s = kb.solver_cost_model()                       # default scope
+    b = kb.solver_cost_model(("fea_buckling",))
+    assert s["n"] == 4 and s["scope"] == ["fea_static"]
+    assert b["n"] == 4 and b["scope"] == ["fea_buckling"]
+    # 5x the coefficient, same exponent — the scoped fits must recover that
+    assert b["seconds_at_100k_nodes"] == pytest.approx(
+        5 * s["seconds_at_100k_nodes"], rel=0.02)
+    # and the prediction must follow the scope it was asked for
+    assert kb.predict_solve(100_000, ("fea_buckling",))["estimate_s"] == \
+        pytest.approx(b["seconds_at_100k_nodes"], rel=0.02)
+
+
+def test_a_solve_type_with_too_little_data_refuses_rather_than_fits(kb):
+    """One modal run is not a model of modal solves."""
+    kb.ingest_log(FakeLog([
+        _row(1, action="fea_modal",
+             details={"nodes": 338_446, "solve_seconds": 599.03})]))
+    assert kb.solver_cost_model(("fea_modal",)) is None
+    assert kb.predict_solve(100_000, ("fea_modal",)) is None
+
+
+def test_the_migration_reaches_a_database_written_before_censoring(tmp_path):
+    """The accumulated history is not disposable, so a schema change has to
+    reach the existing file rather than only new ones."""
+    import sqlite3
+    db = tmp_path / "old.sqlite"
+    con = sqlite3.connect(db)
+    con.executescript(
+        "CREATE TABLE observations (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " source_action_id INTEGER UNIQUE, ingested_at REAL NOT NULL,"
+        " action TEXT NOT NULL, result TEXT NOT NULL, nodes INTEGER,"
+        " solve_seconds REAL);")
+    con.execute("INSERT INTO observations (source_action_id, ingested_at,"
+                " action, result, nodes, solve_seconds)"
+                " VALUES (1, 0.0, 'fea_static', 'pass', 1000, 2.0)")
+    con.commit()
+    con.close()
+
+    k = kbm.KnowledgeBase(db)
+    cols = {r["name"] for r in
+            k._conn.execute("PRAGMA table_info(observations)")}
+    assert {"cost_is_censored", "memory_is_censored"} <= cols
+    # the pre-existing row must read as UNcensored: it was a real measurement
+    r = k._conn.execute("SELECT cost_is_censored, memory_is_censored"
+                        " FROM observations WHERE source_action_id = 1").fetchone()
+    assert r["cost_is_censored"] == 0 and r["memory_is_censored"] == 0

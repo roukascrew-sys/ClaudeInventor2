@@ -74,7 +74,14 @@ CREATE TABLE IF NOT EXISTS observations (
     outlier_ratio REAL,
     service_temp_C REAL,
     failure_mode TEXT,
-    reason TEXT
+    reason TEXT,
+    -- A run killed at its deadline cost AT LEAST this, not exactly it. Storing
+    -- the lower bound in the same column as a completed measurement, with no
+    -- flag, would teach the cost model that the largest meshes are the
+    -- cheapest -- because every one of them was stopped early. The flag is what
+    -- lets a censored row falsify the fit without polluting it.
+    cost_is_censored INTEGER NOT NULL DEFAULT 0,
+    memory_is_censored INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS calibrations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -168,7 +175,27 @@ class KnowledgeBase:
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns that `CREATE TABLE IF NOT EXISTS` cannot add to a table
+        that already exists.
+
+        This database is not disposable — it is the accumulated history the
+        whole knowledge layer is for — so a schema change has to reach the
+        existing file, not only new ones. Both columns default to 0, which is
+        the correct reading of every row ingested before censoring existed:
+        those all came from `fea_static` and `fea_buckling` success paths,
+        where the timings are real.
+        """
+        have = {r["name"] for r in
+                self._conn.execute("PRAGMA table_info(observations)")}
+        for col in ("cost_is_censored", "memory_is_censored"):
+            if col not in have:
+                self._conn.execute(
+                    f"ALTER TABLE observations ADD COLUMN {col} "
+                    f"INTEGER NOT NULL DEFAULT 0")
 
     def close(self) -> None:
         self._conn.close()
@@ -180,9 +207,25 @@ class KnowledgeBase:
         Idempotent: `source_action_id` is UNIQUE, so re-ingesting an unchanged
         log adds nothing. That matters because this is expected to be run
         after every design session.
+
+        Covers `fea_submodel` and `fea_modal` as well as the two it started
+        with. Until 2026-09-02 it read only `fea_static` and `fea_buckling`,
+        so the 6 submodel runs and 1 modal run — every one of them a FAILURE —
+        were invisible to a knowledge base whose entire purpose is learning
+        from history. The most expensive runs in the project were the ones not
+        being learned from.
+
+        CENSORING. A run killed at its deadline measured a LOWER BOUND, not a
+        cost. `fea.py` records those as `solve_seconds_at_kill` with
+        `solve_seconds_is_lower_bound`, deliberately not under the key a
+        completed run uses; this reads both and sets `cost_is_censored` so the
+        fits can exclude them and `cost_model_violations()` can still use them
+        to falsify. Putting a lower bound in the same column as a measurement
+        is how a cost model comes to believe the largest meshes are cheapest.
         """
         added = skipped = 0
-        for action in ("fea_static", "fea_buckling"):
+        for action in ("fea_static", "fea_buckling", "fea_submodel",
+                       "fea_modal"):
             for row in log.rows(action=action):
                 if row["result"] == "pending":
                     continue
@@ -196,6 +239,17 @@ class KnowledgeBase:
                 derate = d.get("thermal_derating") or {}
                 sf = d.get("safety_factor")
                 sf = _num(sf) if not isinstance(sf, str) else None
+
+                # A completed timing wins; a censored one is taken only when
+                # there is no completed one, and is flagged as what it is.
+                secs = _num(d.get("solve_seconds"))
+                cost_censored = 0
+                if secs is None:
+                    secs = _num(d.get("solve_seconds_at_kill"))
+                    cost_censored = 1 if secs is not None else 0
+                rss = _num(d.get("peak_rss_mb"))
+                mem_censored = 1 if (rss is not None
+                                     and d.get("peak_rss_is_lower_bound")) else 0
                 try:
                     self._conn.execute(
                         "INSERT INTO observations (source_action_id, ingested_at,"
@@ -203,8 +257,9 @@ class KnowledgeBase:
                         " result, safety_factor, required_sf, max_von_mises_MPa,"
                         " allowable_MPa, nodes, elements, mesh_mm, solve_seconds,"
                         " peak_rss_mb, outlier_ratio, service_temp_C,"
-                        " failure_mode, reason)"
-                        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        " failure_mode, reason, cost_is_censored,"
+                        " memory_is_censored)"
+                        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (row["id"], time.time(), project, row["geometry_version"],
                          action, d.get("limit_state"),
                          mat.get("name") if isinstance(mat, dict) else None,
@@ -213,16 +268,19 @@ class KnowledgeBase:
                          _num(d.get("allowable_MPa")),
                          d.get("nodes"), d.get("elements"),
                          _num((d.get("mesh") or {}).get("max_size_mm")),
-                         _num(d.get("solve_seconds")),
-                         _num(d.get("peak_rss_mb")),
+                         secs, rss,
                          _num(d.get("stress_outlier_ratio")),
                          _num(derate.get("service_temp_C")),
-                         row["failure_mode"], row["reason"]))
+                         row["failure_mode"], row["reason"],
+                         cost_censored, mem_censored))
                     added += 1
                 except sqlite3.IntegrityError:
                     skipped += 1
         self._conn.commit()
         return {"added": added, "already_known": skipped,
+                "censored": self._conn.execute(
+                    "SELECT COUNT(*) FROM observations"
+                    " WHERE cost_is_censored = 1").fetchone()[0],
                 "total": self.count("observations")}
 
     def observe_candidate(self, cand: Candidate, problem: str) -> int:
@@ -415,16 +473,40 @@ class KnowledgeBase:
             raise ValueError(f"unknown table {table!r}")
         return self._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
-    def solver_cost_model(self) -> dict | None:
-        """What a solve actually costs, learned from real runs.
+    #: Solve types are not interchangeable, and mixing them was a real defect.
+    #: Measured 2026-09-02 on P0048@v1 at an IDENTICAL 338,446 nodes: the
+    #: static solve took 209.95 s and the modal solve 599.03 s, a ratio of
+    #: 2.853 with the same part and the same mesh. Across the whole table the
+    #: medians are 26.33 s per 100k nodes for static, 52.62 for buckling and
+    #: 176.99 for modal. A model fitted across all of them answers no question
+    #: anyone asked, so every fit is scoped and the scope is reported.
+    COST_SCOPE_DEFAULT = ("fea_static",)
+
+    def solver_cost_model(self, actions: Sequence[str] | None = None
+                          ) -> dict | None:
+        """What a solve of a given TYPE actually costs, from real runs.
 
         Lets a planner answer "can I afford to promote this?" before spending
         ten minutes finding out. Fitted on log(nodes) vs log(seconds), which is
         the right shape for a direct solver, and reported with its sample size.
+
+        `actions` defaults to static solves alone. Until 2026-09-02 there was
+        no scope at all: static and buckling were pooled, and widening the
+        ingest was about to add modal to the same pool. A static budget taken
+        from a fit containing eigenvalue solves is high, and a modal budget
+        taken from one dominated by static solves is catastrophically low —
+        which is the shape of every timeout this project has recorded.
         """
+        scope = tuple(actions) if actions else self.COST_SCOPE_DEFAULT
+        marks = ",".join("?" * len(scope))
         rows = self._conn.execute(
             "SELECT nodes, solve_seconds FROM observations"
-            " WHERE nodes > 0 AND solve_seconds > 0").fetchall()
+            " WHERE nodes > 0 AND solve_seconds > 0"
+            f" AND action IN ({marks})"
+            # Censored rows are lower bounds, not measurements. They
+            # falsify this fit via cost_model_violations(); they must
+            # never be a point inside it.
+            " AND cost_is_censored = 0", scope).fetchall()
         pts = [(math.log(r["nodes"]), math.log(r["solve_seconds"])) for r in rows]
         if len(pts) < 4:
             return None
@@ -445,6 +527,7 @@ class KnowledgeBase:
         return {"exponent": round(slope, 3),
                 "seconds_at_100k_nodes": round(math.exp(intercept + slope * math.log(1e5)), 1),
                 "n": len(pts),
+                "scope": list(scope),
                 "log_residual_sigma": round(sigma, 3),
                 "band_multiplier": round(math.exp(sigma), 2),
                 "note": "fitted on log(nodes) vs log(seconds) from real runs, "
@@ -452,7 +535,8 @@ class KnowledgeBase:
                         "treat the HIGH end as the budget - under-predicting a "
                         "solve wastes the whole timeout returning nothing."}
 
-    def predict_solve(self, nodes: int) -> dict | None:
+    def predict_solve(self, nodes: int,
+                      actions: Sequence[str] | None = None) -> dict | None:
         """Affordability estimate for a solve of this size, with its band.
 
         Returns the high end alongside the estimate, and callers should budget
@@ -461,16 +545,17 @@ class KnowledgeBase:
         entire solver timeout and yields no information at all - which is
         exactly what happened twice on the jetpack run.
         """
-        m = self.solver_cost_model()
+        m = self.solver_cost_model(actions)
         if not m or nodes <= 0:
             return None
         est = m["seconds_at_100k_nodes"] * (nodes / 1e5) ** m["exponent"]
         band = m["band_multiplier"]
         return {"nodes": nodes, "estimate_s": round(est, 1),
                 "low_s": round(est / band, 1), "high_s": round(est * band, 1),
-                "n": m["n"], "band_multiplier": band}
+                "n": m["n"], "scope": m["scope"], "band_multiplier": band}
 
-    def solver_memory_model(self) -> dict | None:
+    def solver_memory_model(self, actions: Sequence[str] | None = None
+                            ) -> dict | None:
         """What a solve costs in MEMORY, learned the same way as time.
 
         This exists because time was never the binding constraint. On
@@ -483,9 +568,13 @@ class KnowledgeBase:
         Same log-log fit as the cost model: a direct sparse solve's fill-in
         grows as a power of the node count, so memory takes the same shape.
         """
+        scope = tuple(actions) if actions else self.COST_SCOPE_DEFAULT
+        marks = ",".join("?" * len(scope))
         rows = self._conn.execute(
             "SELECT nodes, peak_rss_mb FROM observations"
-            " WHERE nodes > 0 AND peak_rss_mb > 0").fetchall()
+            " WHERE nodes > 0 AND peak_rss_mb > 0"
+            f" AND action IN ({marks})"
+            " AND memory_is_censored = 0", scope).fetchall()
         pts = [(math.log(r["nodes"]), math.log(r["peak_rss_mb"])) for r in rows]
         if len(pts) < 4:
             return None
@@ -502,15 +591,17 @@ class KnowledgeBase:
                 "mb_at_100k_nodes": round(
                     math.exp(intercept + slope * math.log(1e5)), 1),
                 "n": len(pts),
+                "scope": list(scope),
                 "log_residual_sigma": round(sigma, 3),
                 "band_multiplier": round(math.exp(sigma), 2),
                 "note": "peak working set vs node count, from real runs. Budget "
                         "against the HIGH end: exceeding available memory does "
                         "not slow the solve down, it kills it outright."}
 
-    def predict_memory(self, nodes: int) -> dict | None:
+    def predict_memory(self, nodes: int,
+                       actions: Sequence[str] | None = None) -> dict | None:
         """Peak memory estimate for a solve of this size, with its band."""
-        m = self.solver_memory_model()
+        m = self.solver_memory_model(actions)
         if not m or nodes <= 0:
             return None
         est = m["mb_at_100k_nodes"] * (nodes / 1e5) ** m["exponent"]
@@ -518,6 +609,55 @@ class KnowledgeBase:
         return {"nodes": nodes, "estimate_mb": round(est, 1),
                 "low_mb": round(est / band, 1), "high_mb": round(est * band, 1),
                 "n": m["n"], "band_multiplier": band}
+
+    def cost_model_violations(self) -> list[dict]:
+        """Runs whose LOWER BOUND already exceeds what the model predicts.
+
+        This is the one thing a censored observation can do, and it is not a
+        small thing. A run killed at 2400 s tells you nothing about what it
+        would eventually have cost — so it cannot be a point in the fit — but
+        it does tell you the cost was at least 2400 s. If the model's own high
+        end for that node count is 699 s, the model is REFUTED there. No
+        distribution, no assumption, no averaging: one inequality.
+
+        That is the asymmetry worth having. Excluding censored rows from the
+        fit is what stops them biasing it downward; running them back through
+        the fit as bounds is what stops the exclusion from being a way of
+        ignoring the inconvenient runs. A model is not allowed to earn its
+        confidence by never being shown the cases it fails on.
+
+        Returns one entry per violation, worst first, each carrying the ratio
+        of observed bound to predicted high end so the size of the miss is
+        visible rather than only its existence.
+        """
+        rows = self._conn.execute(
+            "SELECT source_action_id, geometry_id, action, nodes,"
+            " solve_seconds, failure_mode FROM observations"
+            " WHERE cost_is_censored = 1 AND nodes > 0 AND solve_seconds > 0"
+        ).fetchall()
+        out = []
+        for r in rows:
+            pred = self.predict_solve(r["nodes"])
+            if not pred:
+                continue
+            bound = float(r["solve_seconds"])
+            if bound <= pred["high_s"]:
+                continue                  # consistent with the fit; no claim
+            out.append({
+                "source_action_id": r["source_action_id"],
+                "geometry_id": r["geometry_id"],
+                "action": r["action"],
+                "nodes": r["nodes"],
+                "at_least_s": round(bound, 1),
+                "predicted_s": pred["estimate_s"],
+                "predicted_high_s": pred["high_s"],
+                "exceeds_high_by": round(bound / pred["high_s"], 2),
+                "verdict": "the fitted cost model is refuted at this node "
+                           "count: the run cost at least this much and the "
+                           "model's own upper bound is lower",
+            })
+        out.sort(key=lambda x: -x["exceeds_high_by"])
+        return out
 
     @staticmethod
     def available_memory_mb() -> float | None:
