@@ -80,7 +80,10 @@ def main() -> int:
         hvs, feas, masses, costs, fronts, times = [], [], [], [], [], []
         for run, secs in runs:
             front = run.front()
-            hvs.append(hypervolume(front, reqs.objectives, ref) or 0.0)
+            # No `or 0.0` guard: hypervolume returned None for >2
+            # objectives until 2026-09-02, and that guard silently
+            # scored every such run as zero instead of failing.
+            hvs.append(hypervolume(front, reqs.objectives, ref))
             fl = [c for c in run.all_candidates if c.feasible]
             feas.append(len(fl))
             masses.append(min((c.result.metrics["mass_kg"] for c in fl),

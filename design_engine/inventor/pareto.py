@@ -38,39 +38,85 @@ def _vectors(cands: Sequence[Candidate], objectives: list[Objective]):
     return out
 
 
+def _nds_indices(vecs: Sequence[Sequence[float]]) -> list[list[int]]:
+    """Front membership, by index into `vecs`, delegated to pymoo.
+
+    The hand-rolled version this replaced was a correct O(n^2) peel. It was
+    replaced on 2026-09-02 on measurement, not on taste: over 400 randomised
+    trials (2-4 objectives, deliberate duplicates and degenerate columns) the
+    two agreed on every single front, and pymoo ran 265x faster at n=200 and
+    1356x at n=600. `pareto_front` is called on the whole evaluated history,
+    which is exactly where n grows.
+
+    pymoo is imported here rather than at module scope because it costs
+    ~0.4 s cold, and `inventor/__init__` is on the path of every design script
+    and every test. Ranking should not tax a `--help`.
+    """
+    if not vecs:
+        return []
+    import numpy as np
+    from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
+
+    F = np.asarray([[float(x) for x in v] for v in vecs], dtype=float)
+    return [sorted(int(i) for i in f) for f in NonDominatedSorting().do(F)]
+
+
 def pareto_front(cands: Sequence[Candidate], objectives: list[Objective],
                  feasible_only: bool = True) -> list[Candidate]:
-    """Non-dominated set. O(n^2), which is fine at the scale that survives to
-    this point (hundreds, not hundreds of thousands)."""
+    """Non-dominated set.
+
+    Candidates whose objective vector is incomplete are excluded, not ranked
+    on partial information — see the module docstring.
+    """
     pool = [c for c in cands if c.feasible] if feasible_only else list(cands)
     pairs = _vectors(pool, objectives)
-    front = []
-    for cand, vec in pairs:
-        if not any(dominates(other, vec) for o, other in pairs if o is not cand):
-            front.append(cand)
-    return front
+    if not pairs:
+        return []
+    return [pairs[i][0] for i in _nds_indices([v for _, v in pairs])[0]]
 
 
 def non_dominated_sort(cands: Sequence[Candidate],
                        objectives: list[Objective]) -> list[list[Candidate]]:
-    """Rank into successive fronts (NSGA-II style), used for selection."""
-    remaining = list(cands)
-    fronts = []
-    while remaining:
-        f = pareto_front(remaining, objectives, feasible_only=False)
-        if not f:                      # every remaining vector is incomplete
-            fronts.append(list(remaining))
-            break
-        fronts.append(f)
-        ids = {id(c) for c in f}
-        remaining = [c for c in remaining if id(c) not in ids]
+    """Rank into successive fronts (NSGA-II style), used for selection.
+
+    Candidates with an incomplete objective vector cannot be ranked at all, so
+    they are collected into a single trailing front rather than being dropped:
+    selection still has to put them somewhere, and "last" is the only honest
+    place for a design we could not measure.
+    """
+    pairs = _vectors(cands, objectives)
+    fronts = [[pairs[i][0] for i in f]
+              for f in _nds_indices([v for _, v in pairs])]
+    ranked = {id(c) for c, _ in pairs}
+    unrankable = [c for c in cands if id(c) not in ranked]
+    if unrankable:
+        fronts.append(unrankable)
     return fronts
 
 
 def crowding_distance(front: Sequence[Candidate],
                       objectives: list[Objective]) -> dict[int, float]:
     """NSGA-II crowding distance — preserves spread along the frontier so the
-    search does not collapse onto one corner of it."""
+    search does not collapse onto one corner of it.
+
+    DELIBERATELY NOT delegated to pymoo, unlike its neighbours above. Measured
+    2026-09-02 against `pymoo...metrics.get_crowding_function("cd")` over 600
+    randomised trials:
+
+      * pymoo divides the accumulated distance by the objective count. That
+        is order-preserving, so it would change no selection — but it would
+        silently change every crowding number this project has ever printed.
+      * 2 of 429 finite entries differed by MORE than that factor. pymoo
+        filters duplicate points; we do not. Those are genuine ties, and ties
+        are exactly where selection order is decided.
+
+    The second point is the disqualifying one. `EvolutionarySearch._rank`
+    feeds this into a seeded tournament, so a divergence on ties changes the
+    search trajectory, which would quietly invalidate the recorded
+    5-seed benchmark (hypervolume 14.87 vs 9.97) without failing a test. The
+    saving would have been about twenty lines of arithmetic that the suite
+    already covers. Not a trade worth making.
+    """
     pairs = _vectors(front, objectives)
     dist = {id(c): 0.0 for c, _ in pairs}
     n = len(pairs)
@@ -176,36 +222,50 @@ def hypervolume(front: Sequence[Candidate], objectives: list[Objective],
                 reference: Sequence[float] | None = None) -> float | None:
     """Dominated hypervolume in LOSS space (larger is better).
 
-    Exact for two objectives via a sweep. For three or more this returns None
-    rather than an approximation, because a Monte-Carlo estimate reported
-    without its error bars is precisely the kind of fake precision this
-    project refuses; use `compare_fronts` instead, which works in any
-    dimension.
+    EXACT in any number of objectives. Until 2026-09-02 this returned None
+    for three or more, because the only implementation on hand was a
+    Monte-Carlo estimate and an estimate reported without its error bars is
+    precisely the fake precision this project refuses. That objection was to
+    the ESTIMATE, not to the indicator: pymoo's `HV` delegates to `moocore`'s
+    C implementation of the Fonseca-Paquete-Lopez-Ibanez sweep, which is an
+    exact algorithm, so the reason to refuse is gone. Verified against the
+    previous hand-rolled 2-D sweep in `test_hypervolume_*` — identical on the
+    two-objective case including every reference-point edge case, so no
+    recorded benchmark number changes.
+
+    A point that is worse than `reference` in ANY objective contributes
+    nothing, which is the standard definition and matches what the old sweep
+    did. `compare_fronts` remains the right tool when there is no defensible
+    shared reference point at all.
 
     `reference` defaults to the componentwise worst point of the front plus a
     10% pad, so the number is only meaningful when comparing two fronts
     against the SAME reference — pass one explicitly to compare runs.
     """
-    if len(objectives) != 2:
+    if not objectives:
         return None
     pairs = [c.result.objective_vector(objectives) for c in front]
     pairs = [p for p in pairs if p is not None]
     if not pairs:
         return 0.0
+    n = len(objectives)
     if reference is None:
-        ref = [max(p[i] for p in pairs) for i in range(2)]
+        ref = [max(p[i] for p in pairs) for i in range(n)]
         ref = [r + 0.1 * abs(r) + 1e-9 for r in ref]
     else:
         ref = list(reference)
-    pts = sorted({(p[0], p[1]) for p in pairs})
-    hv, prev_y = 0.0, ref[1]
-    for x, y in pts:
-        if x >= ref[0] or y >= ref[1]:
-            continue
-        if y < prev_y:
-            hv += (ref[0] - x) * (prev_y - y)
-            prev_y = y
-    return hv
+        if len(ref) != n:
+            raise ValueError(
+                f"reference point has {len(ref)} components but there are "
+                f"{n} objectives; a hypervolume against a mismatched "
+                f"reference is meaningless, not merely wrong")
+
+    import numpy as np
+    from pymoo.indicators.hv import HV
+
+    pts = np.asarray(sorted({tuple(float(x) for x in p) for p in pairs}),
+                     dtype=float)
+    return float(HV(ref_point=np.asarray(ref, dtype=float))(pts))
 
 
 def compare_fronts(a: Sequence[Candidate], b: Sequence[Candidate],

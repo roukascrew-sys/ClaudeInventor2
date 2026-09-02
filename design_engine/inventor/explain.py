@@ -201,6 +201,13 @@ def render_text(exp: dict, reqs: RequirementSet, alternatives: dict | None = Non
         L.append(f"  {rb['samples']} perturbed samples, all re-evaluated at "
                  f"[{rb_label}] fidelity; observed failure fraction "
                  f"{rb['failure_rate']:.3f}")
+        if rb.get("sampling") == "latin_hypercube":
+            L.append("  (drawn as a Latin hypercube: each tolerance's range is "
+                     "covered evenly, so the fraction is a tighter estimate of "
+                     "the same quantity - but the draws are NOT independent, "
+                     "so no binomial interval applies to it either)")
+        else:
+            L.append("  (independent random draws)")
         L.append("  (an observed fraction over a finite sample - NOT a "
                  "reliability figure; no distribution was fitted)")
         # A sweep run at cheap fidelity reports the CHEAP model's value for a
@@ -231,8 +238,14 @@ def render_text(exp: dict, reqs: RequirementSet, alternatives: dict | None = Non
             if top:
                 L.append(f"  {metric}:")
                 for r in top:
+                    # rho is the effect size; p only says whether this many
+                    # samples could have produced it by chance. Both, or the
+                    # reader silently supplies the missing one wrongly.
+                    p = r.get("p_value")
+                    ptxt = ("p<0.001" if p is not None and p < 0.001 else
+                            f"p={p:.3f}" if p is not None else "p n/a")
                     L.append(f"    {r['variable']:24s} rho={r['spearman']:+.2f} "
-                             f"(n={r['n']})")
+                             f"(n={r['n']}, {ptxt})")
 
     L.append("\nVALIDATION PERFORMED")
     for v in exp["validations_performed"]:

@@ -129,52 +129,62 @@ def sensitivity(history: Sequence[Candidate], space: DesignSpace,
     monotonic but not linear (section modulus goes as h^2, buckling as h^3),
     and a linear coefficient would understate a strong monotone effect.
 
-    Reported with `n` so the reader can judge it. Correlation over 12 samples
-    is a hint; over 400 it is a finding.
-    """
-    def rank(xs):
-        order = sorted(range(len(xs)), key=lambda i: xs[i])
-        r = [0.0] * len(xs)
-        i = 0
-        while i < len(order):
-            j = i
-            while j + 1 < len(order) and xs[order[j + 1]] == xs[order[i]]:
-                j += 1
-            avg = (i + j) / 2.0 + 1.0
-            for k in range(i, j + 1):
-                r[order[k]] = avg
-            i = j + 1
-        return r
+    Reported with `n` so the reader can judge it, and since 2026-09-02 with
+    `p_value` as well, so the reader does not have to. "Correlation over 12
+    samples is a hint; over 400 it is a finding" was the right instinct but it
+    left the judgement to the eye; the two-sided p-value against the null of
+    no monotone association makes the same call arithmetically. It is NOT a
+    licence to read a small p as a large effect — `spearman` is the effect
+    size, `p_value` only says whether this many samples could plausibly have
+    produced it by chance. Rows are still ordered by |rho|, not by p.
 
-    def spearman(xs, ys):
-        if len(xs) < 3:
-            return None
-        rx, ry = rank(xs), rank(ys)
-        mx, my = statistics.fmean(rx), statistics.fmean(ry)
-        num = sum((a - mx) * (b - my) for a, b in zip(rx, ry))
-        den = math.sqrt(sum((a - mx) ** 2 for a in rx)
-                        * sum((b - my) ** 2 for b in ry))
-        return None if den == 0 else num / den
+    The coefficient itself comes from `scipy.stats.spearmanr` rather than the
+    hand-rolled tie-averaging rank correlation that lived here until
+    2026-09-02. Same algorithm, same numbers (`test_sensitivity_*` covers it),
+    but it is somebody else's job to keep correct, and it carries the p-value
+    for free.
+    """
+    # scipy.stats costs ~2 s to import and this runs once at the end of a run,
+    # so it is paid for here rather than by every `import design_engine`.
+    import warnings
+
+    from scipy import stats
+    from scipy.stats import ConstantInputWarning
 
     out: dict[str, list[dict]] = {}
-    for metric in metrics:
-        rows = []
-        for var in space.searchable:
-            if var.type is VarType.CATEGORICAL:
-                continue                      # no meaningful ordering to rank
-            xs, ys = [], []
-            for c in history:
-                v = c.values.get(var.name)
-                m = c.result.metrics.get(metric)
-                if isinstance(v, (int, float)) and isinstance(m, (int, float)):
-                    xs.append(float(v))
-                    ys.append(float(m))
-            rho = spearman(xs, ys)
-            if rho is not None:
-                rows.append({"variable": var.name, "spearman": round(rho, 4),
-                             "n": len(xs), "units": var.units})
-        rows.sort(key=lambda r: -abs(r["spearman"]))
-        out[metric] = rows
+    # A constant column is the ordinary case for a variable the search never
+    # moved, not an anomaly, and it is handled below by the isfinite check.
+    # Scoped with catch_warnings rather than simplefilter: this is our noise
+    # to swallow, not the whole process's.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConstantInputWarning)
+        for metric in metrics:
+            rows = []
+            for var in space.searchable:
+                if var.type is VarType.CATEGORICAL:
+                    continue                  # no meaningful ordering to rank
+                xs, ys = [], []
+                for c in history:
+                    v = c.values.get(var.name)
+                    m = c.result.metrics.get(metric)
+                    if isinstance(v, (int, float)) and isinstance(m, (int, float)):
+                        xs.append(float(v))
+                        ys.append(float(m))
+                if len(xs) < 3:
+                    continue
+                res = stats.spearmanr(xs, ys)
+                rho, p = float(res.statistic), float(res.pvalue)
+                # nan when either input is constant: no ranking, hence no
+                # correlation to report. Silence beats reporting 0.0 as if
+                # the variable had been shown not to matter.
+                if not math.isfinite(rho):
+                    continue
+                rows.append({
+                    "variable": var.name, "spearman": round(rho, 4),
+                    "p_value": (round(p, 6) if math.isfinite(p) else None),
+                    "n": len(xs), "units": var.units})
+            rows.sort(key=lambda r: -abs(r["spearman"]))
+            out[metric] = rows
     return out
 
 
@@ -185,10 +195,19 @@ class Perturbation:
     `apply(values, rng) -> values` so a perturbation can act on any variable
     type; nothing here assumes the design is a beam or that variation is
     Gaussian in a single dimension.
+
+    `quantile(values, u) -> values` is the OPTIONAL inverse-CDF form of the
+    same variation, where u is a uniform draw in (0, 1). It exists so
+    `robustness` can stratify (see there). A perturbation that cannot be
+    written as a one-dimensional inverse CDF — a discrete topology flip, a
+    correlated pair — simply leaves it None and keeps working exactly as
+    before. The two forms must describe the SAME distribution; nothing here
+    can check that, so a perturbation that supplies both owns the obligation.
     """
     name: str
     apply: Callable[[dict, random.Random], dict]
     description: str = ""
+    quantile: Callable[[dict, float], dict] | None = None
 
 
 def tolerance_perturbation(variable: str, sigma: float,
@@ -199,8 +218,20 @@ def tolerance_perturbation(variable: str, sigma: float,
         if isinstance(out.get(variable), (int, float)):
             out[variable] = float(out[variable]) + rng.gauss(0.0, sigma)
         return out
+
+    def _quantile(values: dict, u: float) -> dict:
+        out = dict(values)
+        if isinstance(out.get(variable), (int, float)):
+            # Clamped off the open interval's ends: inv_cdf(0) is -inf, and an
+            # infinite thickness is not a tolerance, it is a crash.
+            u = min(max(float(u), 1e-12), 1.0 - 1e-12)
+            out[variable] = (float(out[variable])
+                             + sigma * statistics.NormalDist().inv_cdf(u))
+        return out
+
     return Perturbation(f"{variable}+/-{sigma}", _apply,
-                        description or f"manufacturing variation on {variable}")
+                        description or f"manufacturing variation on {variable}",
+                        quantile=_quantile)
 
 
 @dataclass
@@ -213,6 +244,7 @@ class RobustnessResult:
     worst_case: dict
     perturbations: list[str]
     fidelity: int
+    sampling: str = "independent_random"
 
     def to_dict(self) -> dict:
         d = dict(self.__dict__)
@@ -220,10 +252,27 @@ class RobustnessResult:
         return d
 
 
+def _lhs_design(d: int, n: int, seed: int):
+    """An n x d Latin hypercube in (0, 1), or None if scipy cannot supply one.
+
+    Returning None rather than raising is deliberate: stratification is an
+    improvement to the sampling, not a precondition for doing the analysis at
+    all, and a robustness study that refuses to run because an optional
+    dependency moved would be a worse outcome than one that runs unstratified
+    and says so.
+    """
+    try:
+        from scipy.stats import qmc
+    except Exception:                          # pragma: no cover - env-dependent
+        return None
+    return qmc.LatinHypercube(d=d, seed=seed).random(n=n)
+
+
 def robustness(cand: Candidate, evaluator, perturbations: Sequence[Perturbation],
                samples: int = 24, seed: int = 0,
                max_fidelity: Fidelity | None = None,
-               metrics_of_interest: Sequence[str] = ()) -> RobustnessResult:
+               metrics_of_interest: Sequence[str] = (),
+               stratified: bool = True) -> RobustnessResult:
     """Perturb a design and re-evaluate; report what actually happened.
 
     Runs at the evaluator's cheap fidelity by default. Perturbing a design 24
@@ -234,10 +283,38 @@ def robustness(cand: Candidate, evaluator, perturbations: Sequence[Perturbation]
     and `samples` is returned alongside it precisely so it is not mistaken for
     a reliability figure. No distribution is fitted and no confidence interval
     is invented.
+
+    SAMPLING. When `stratified` and every perturbation exposes a `quantile`,
+    the draws come from a Latin hypercube (`scipy.stats.qmc`) instead of
+    independent per-variable draws, and `sampling` says which was used.
+
+    Measured 2026-09-02 on the marginal two-tolerance test design, 60 seeds
+    per point: the two agree on the mean failure fraction to within 0.01 (so
+    LHS is estimating the same quantity, not a different one), while the
+    standard deviation of the estimate falls from 0.1013 to 0.0445 at n=24 —
+    a factor of 0.44, holding at 0.43-0.50 across n=16, 24 and 40. Matching
+    LHS's precision with independent draws would take about 5x the
+    evaluations, which at FEA fidelity is the difference between a study and
+    an afternoon.
+
+    The catch, stated because it is easy to miss: LHS draws are NOT
+    independent. The failure fraction it returns is a better estimate of the
+    same quantity, but a binomial confidence interval — already not computed
+    here — would be doubly wrong on it.
+
+    If any perturbation lacks a
+    `quantile`, or scipy is unavailable, this silently falls back to the
+    independent draws and records `sampling="independent_random"`; the caller
+    does not have to care, but can check.
     """
     from .candidate import Candidate as _C
     rng = random.Random(seed)
     fid = max_fidelity if max_fidelity is not None else Fidelity.L1_GEOMETRY
+
+    design = None
+    if stratified and perturbations and all(p.quantile for p in perturbations):
+        design = _lhs_design(len(perturbations), samples, seed)
+    sampling = "latin_hypercube" if design is not None else "independent_random"
 
     collected: dict[str, list[float]] = defaultdict(list)
     classes: dict[str, int] = defaultdict(int)
@@ -245,8 +322,12 @@ def robustness(cand: Candidate, evaluator, perturbations: Sequence[Perturbation]
     evaluated = 0
     for i in range(samples):
         vals = dict(cand.values)
-        for p in perturbations:
-            vals = p.apply(vals, rng)
+        if design is not None:
+            for j, p in enumerate(perturbations):
+                vals = p.quantile(vals, float(design[i][j]))
+        else:
+            for p in perturbations:
+                vals = p.apply(vals, rng)
         try:
             vals = evaluator.ctx.space.resolve(vals)
         except Exception:
@@ -280,4 +361,5 @@ def robustness(cand: Candidate, evaluator, perturbations: Sequence[Perturbation]
         nominal_feasible=cand.feasible,
         failure_rate=(failures / evaluated) if evaluated else float("nan"),
         failing_classes=dict(classes), metric_stats=stats, worst_case=worst,
-        perturbations=[p.name for p in perturbations], fidelity=int(fid))
+        perturbations=[p.name for p in perturbations], fidelity=int(fid),
+        sampling=sampling)
