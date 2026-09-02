@@ -25,11 +25,28 @@ class MeshError(RuntimeError):
 
 
 def mesh_step(step_path: str | Path, max_size_mm: float,
-              min_size_mm: float | None = None) -> dict:
+              min_size_mm: float | None = None,
+              refine: dict | None = None) -> dict:
     """Mesh a STEP file. Returns {'node_tags', 'coords', 'connectivity'}.
 
     connectivity rows are 10 node tags in **CalculiX C3D10 order** (the
     gmsh->Abaqus midside swap is already applied here).
+
+    `refine` grades the mesh instead of sizing it uniformly:
+
+        {"centre": (x, y, z), "radius": mm, "size": mm}
+
+    WHY GRADING IS NOT A LUXURY HERE. A submodel has two requirements that
+    pull against each other under a uniform mesh. The cut boundary has to
+    stand well off from the stress being read, or the peak is an artefact of
+    the imposed displacements - measured 2026-09-01, +150.6% between rungs
+    with every peak sitting ON a driven node. And the feature has to be
+    resolved, which for a 1 mm blend means sub-millimetre elements. Node count
+    grows with the CUBE of region size, so satisfying both uniformly put a
+    12 mm box at 478,512 nodes and a 2400 s timeout at 4,437 MB.
+
+    Grading decouples them: fine inside the ball, coarse at the cut. The
+    region can then be enlarged without paying for it everywhere.
     """
     import gmsh
 
@@ -48,6 +65,41 @@ def mesh_step(step_path: str | Path, max_size_mm: float,
         gmsh.option.setNumber("Mesh.MeshSizeMax", max_size_mm)
         if min_size_mm:
             gmsh.option.setNumber("Mesh.MeshSizeMin", min_size_mm)
+
+        if refine:
+            for key in ("centre", "radius", "size"):
+                if key not in refine:
+                    raise MeshError(
+                        f"refine.{key} is required; got {sorted(refine)}")
+            fine = float(refine["size"])
+            rad = float(refine["radius"])
+            if fine <= 0 or rad <= 0:
+                raise MeshError(
+                    f"refine.size and refine.radius must be > 0, got "
+                    f"{fine} and {rad}")
+            if fine > max_size_mm:
+                raise MeshError(
+                    f"refine.size {fine} is COARSER than max_size_mm "
+                    f"{max_size_mm}, so the 'refinement' would coarsen the "
+                    f"region it is supposed to resolve")
+            cx, cy, cz = (float(v) for v in refine["centre"])
+            # A Ball field: `size` inside the radius, `max_size_mm` outside,
+            # blended over Thickness so the transition does not itself create
+            # badly shaped elements.
+            fid = gmsh.model.mesh.field.add("Ball")
+            gmsh.model.mesh.field.setNumber(fid, "XCenter", cx)
+            gmsh.model.mesh.field.setNumber(fid, "YCenter", cy)
+            gmsh.model.mesh.field.setNumber(fid, "ZCenter", cz)
+            gmsh.model.mesh.field.setNumber(fid, "Radius", rad)
+            gmsh.model.mesh.field.setNumber(fid, "Thickness", rad)
+            gmsh.model.mesh.field.setNumber(fid, "VIn", fine)
+            gmsh.model.mesh.field.setNumber(fid, "VOut", max_size_mm)
+            gmsh.model.mesh.field.setAsBackgroundMesh(fid)
+            # Without these the CAD's own curvature and point sizes fight the
+            # field and the grading silently does not happen.
+            gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
+            gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
+            gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
         gmsh.option.setNumber("Mesh.Optimize", 1)
         gmsh.model.mesh.generate(3)
         gmsh.model.mesh.setOrder(2)
@@ -72,7 +124,8 @@ def mesh_step(step_path: str | Path, max_size_mm: float,
 
     mesh = {"node_tags": node_tags, "coords": coords, "connectivity": conn,
             "tri6": tri6}
-    mesh["quality"] = check_element_quality(mesh, max_size_mm)
+    mesh["quality"] = check_element_quality(
+        mesh, float(refine["size"]) if refine else max_size_mm)
     return mesh
 
 

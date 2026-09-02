@@ -1827,7 +1827,22 @@ class ValidationTools:
                 step_path = run_dir / "submodel.step"
                 import cadquery as cq              # noqa: PLC0415
                 cq.exporters.export(cut, str(step_path))
-                m = mesh_step(str(step_path), mm, None)
+                # GRADED, not uniform. The coarsest rung sets the size at
+                # the cut; each rung refines only a ball around the feature.
+                #
+                # Uniform refinement forces a choice the submodel should not
+                # have to make: stand the cut far enough off that the peak is
+                # not a boundary artefact, OR resolve the feature - node count
+                # goes as the cube of region size, so a 12 mm box at 0.2 mm
+                # reached 478,512 nodes and timed out at 4,437 MB. Grading
+                # buys both. Measured on a plain bar: 0.8 mm everywhere is
+                # 303,191 nodes, 0.8 mm inside an 8 mm ball is 40,928 - the
+                # same resolution where it matters at a seventh of the cost.
+                m = mesh_step(str(step_path), ladder[0], None,
+                              refine={"centre": peak_xyz,
+                                      "radius": max(2.0 * feature_mm,
+                                                    6.0 * mm),
+                                      "size": mm})
                 driven = driven_nodes(m, region)
                 by_tag = {int(t): xyz for t, xyz
                           in zip(m["node_tags"], m["coords"])}
@@ -1891,7 +1906,7 @@ class ValidationTools:
                 pk = by_tag.get(int(peak_node))
                 on_driven = int(peak_node) in set(int(t) for t in driven)
                 peaks.append(peak_vm)
-                rungs.append({"mesh_mm": mm, "nodes": len(m["node_tags"]),
+                rungs.append({"mesh_mm": mm, "coarse_mm": ladder[0], "nodes": len(m["node_tags"]),
                               "projected_nodes": len(interp["projected"]),
                               "worst_projection_mm": (
                                   max((x["gap_mm"] for x in interp["projected"]),
