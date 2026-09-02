@@ -206,7 +206,8 @@ class _Grid:
 
 
 def interpolate(field=None, points=None, coords=None, elements=None,
-                disp=None, tol: float = INSIDE_TOL) -> dict:
+                disp=None, tol: float = INSIDE_TOL,
+                max_projection_mm: float = 0.0) -> dict:
     """Carry a solved nodal field onto `points`.
 
     `field` is the dict from `read_frd`, or the three parts may be passed
@@ -216,6 +217,25 @@ def interpolate(field=None, points=None, coords=None, elements=None,
     `values` - never extrapolated. Driving a submodel from an invented
     displacement is the failure this module exists to avoid, and nothing
     downstream could detect it.
+
+    `max_projection_mm` opts in to a bounded exception, and defaults to 0 so
+    nothing changes without being asked for. A point outside every element by
+    less than that distance is snapped to the nearest one and interpolated
+    there, and is reported in `projected` - never folded silently into
+    `carried`.
+
+    The exception exists for a real and specific case. A concave blend ADDS
+    material at a re-entrant corner, so a blended submodel is NOT contained
+    within its sharp global: on the jetpack junction, 3 of 2535 driven nodes
+    landed 0.08-0.62 mm outside, every one of them inside the 1 mm blend. No
+    standoff avoids it, because the blend runs the full length of the edge
+    that any cut plane crosses.
+
+    It is sound HERE because the quantity carried is DISPLACEMENT, which is
+    finite and convergent at a re-entrant corner even though stress is not.
+    The same projection applied to a stress field would be reading a value
+    that does not exist. Keep the tolerance at the scale of the geometric
+    difference that causes it - a blend radius - and never larger.
     """
     if field is not None:
         coords, elements, disp = field["coords"], field["elements"], field["disp"]
@@ -224,7 +244,23 @@ def interpolate(field=None, points=None, coords=None, elements=None,
     points = points or {}
 
     grid = _Grid(coords, elements)
-    values, outside, degenerate = {}, [], 0
+    values, outside, projected, degenerate = {}, [], [], 0
+
+    node_xyz = None
+    if max_projection_mm > 0:
+        _tags = sorted(coords)
+        node_xyz = (np.asarray(_tags, dtype=np.int64),
+                    np.asarray([coords[t] for t in _tags], dtype=float))
+        # Index by ALL ten tags, not just the four corners. The barycentric
+        # test uses corners, but ADJACENCY must not: if the node nearest an
+        # outside point happens to be a mid-side node it would have no
+        # elements attached, and the projection would find nothing and refuse
+        # a point it could perfectly well have carried. That is what happened
+        # on the jetpack junction's 0.4 mm rung - one node in 9,277.
+        node_elems: dict = {}
+        for idx, (_, tags_) in enumerate(elements):
+            for t in tags_:
+                node_elems.setdefault(int(t), []).append(idx)
 
     for label, p in points.items():
         p = np.asarray(p, dtype=float)
@@ -238,6 +274,28 @@ def interpolate(field=None, points=None, coords=None, elements=None,
             if bary.min() >= -tol:
                 found = (tags, bary)
                 break
+        if found is None and node_xyz is not None:
+            # Snap to the nearest element that touches the nearest node, and
+            # only if the miss is inside the stated tolerance.
+            tags_arr, xyz_arr = node_xyz
+            d = np.linalg.norm(xyz_arr - p, axis=1)
+            near_tag = int(tags_arr[int(np.argmin(d))])
+            gap = float(d.min())
+            if gap <= max_projection_mm:
+                best = None
+                for idx in node_elems.get(near_tag, ()):
+                    _, tags_ = elements[idx]
+                    b = barycentric(p, [coords[t] for t in tags_[:4]])
+                    if np.isnan(b).any():
+                        continue
+                    miss = float(-min(0.0, b.min()))
+                    if best is None or miss < best[0]:
+                        best = (miss, tags_, b)
+                if best is not None:
+                    projected.append({
+                        "label": label, "gap_mm": round(gap, 6),
+                        "point": [round(float(v), 4) for v in p]})
+                    found = (best[1], best[2])
         if found is None:
             outside.append({"label": label,
                             "point": [round(float(v), 4) for v in p]})
@@ -253,7 +311,8 @@ def interpolate(field=None, points=None, coords=None, elements=None,
             u += w * np.asarray(disp[t])
         values[label] = tuple(float(v) for v in u)
 
-    return {"values": values, "outside": outside,
+    return {"values": values, "outside": outside, "projected": projected,
+            "max_projection_mm": float(max_projection_mm),
             "requested": len(points), "carried": len(values),
             "degenerate_elements_skipped": degenerate,
             "note": ("barycentric coordinates come from the corner nodes: "

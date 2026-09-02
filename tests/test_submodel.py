@@ -273,16 +273,56 @@ def test_a_region_containing_a_constraint_is_refused(solved):
             ladder_steps=2)
 
 
-def test_a_singular_global_peak_is_refused_before_any_solver_time(solved):
+def test_a_singular_GLOBAL_does_not_block_a_clean_submodel(solved):
+    """The workflow this enables, and it is the normal one.
+
+    A global model carries simplified geometry and the submodel carries the
+    detail. Here it is forced: a 1 mm blend gives gmsh slivers at a coarse
+    global size and 690k elements at a fine one, so the blend-clean jetpack
+    frame cannot be globally meshed at all, while the sharp one solves in
+    seconds.
+
+    Reading the GLOBAL's singularity verdict would refuse that outright. It
+    should not, because DISPLACEMENTS converge at a re-entrant corner even
+    though stresses do not - which is the whole reason submodelling works.
+    """
     eng, gid, res = solved
     poisoned = dict(res)
     poisoned["singularity"] = {"verdict": "singular",
                                "reason": "1.28 mm from a 270-degree edge"}
+    out = eng.validation.fea_submodel(
+        gid, _case(), poisoned, reason="sharp global, clean submodel",
+        feature_mm=4.0, standoff_elements=3.0, standoff_source=STANDOFF_SRC,
+        centre=(0.0, 0.0, 60.0), ladder_steps=3, tol_pct=5.0)
+    assert out["singularity_of_refined_geometry"]["verdict"] == "clean"
+    assert len(out["rungs"]) == 3
+
+
+def test_a_singular_REFINED_geometry_is_still_refused(tmp_path_factory):
+    """The half that must keep firing.
+
+    Refining a peak that sits on a sharp corner of the geometry being SOLVED
+    produces a number that rises with every rung. Moving the gate onto the
+    refined part must not weaken it.
+    """
+    eng = DesignEngine(tmp_path_factory.mktemp("sing") / "data")
+    eng.validation = ValidationTools(eng.validation.root, eng.log, eng.parts,
+                                     eng.validation.ccx_path,
+                                     solve_timeout_s=900)
+    if not eng.validation.ccx_path.is_file():
+        pytest.skip("CalculiX not installed in this working copy")
+    tee = {"name": "sharp-tee", "units": "mm", "features": [
+        {"op": "box", "x": 40.0, "y": 20.0, "z": 120.0},
+        {"op": "box", "x": 160.0, "y": 20.0, "z": 25.0,
+         "at": [0, 0, 60.0], "mode": "union"}]}
+    gid = eng.create_part(tee, reason="singular submodel regression")["geometry_id"]
+    fake_global = {"run_dir": "unused", "max_von_mises_at_mm": [0, 0, 0],
+                   "singularity": {"verdict": "clean", "reason": "not read"}}
     with pytest.raises(RefinementRefused):
         eng.validation.fea_submodel(
-            gid, _case(), poisoned, reason="must refuse before cutting",
+            gid, _case(), fake_global, reason="must refuse on the real corner",
             feature_mm=4.0, standoff_elements=3.0,
-            standoff_source=STANDOFF_SRC, centre=(0.0, 0.0, 60.0))
+            standoff_source=STANDOFF_SRC, centre=(20.0, 0.0, 60.0))
 
 
 def test_a_missing_global_frd_is_named(solved, tmp_path):

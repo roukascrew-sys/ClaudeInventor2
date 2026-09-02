@@ -1660,7 +1660,9 @@ class ValidationTools:
     def fea_submodel(self, geometry_id: str, case: dict, global_result: dict,
                      reason: str, *, feature_mm: float,
                      standoff_elements: float, standoff_source: str = "",
-                     centre=None, ladder_steps: int = 3,
+                     centre=None, start_mesh_mm: float | None = None,
+                     max_projection_mm: float = 0.0,
+                     ladder_steps: int = 3,
                      ladder_factor: float = 2.0, tol_pct: float = 5.0) -> dict:
         """Re-solve a small region around the peak, driven by a global solve.
 
@@ -1692,10 +1694,37 @@ class ValidationTools:
             peak_xyz = [float(v) for v in
                         (centre if centre is not None
                          else global_result["max_von_mises_at_mm"])]
-            region = plan(global_result.get("singularity"), peak_xyz,
+            part = self.parts.get_part(geometry_id)
+            solid = build_solid(part["spec"])
+
+            # Classify the peak against the geometry being REFINED, not
+            # against whatever the global solve happened to report.
+            #
+            # These are frequently not the same part, and that is the normal
+            # way to use submodelling rather than an edge case: the global
+            # model carries simplified geometry and the submodel carries the
+            # detail. Here it is forced - a 1 mm blend gives gmsh slivers at a
+            # coarse global size and 690k elements at a fine one, so the
+            # blend-clean frame cannot be globally meshed on this machine at
+            # all, while the sharp one solves in seconds.
+            #
+            # Reading the global's verdict would refuse exactly that workflow:
+            # the sharp global IS singular, and it does not matter, because
+            # DISPLACEMENTS converge at a re-entrant corner even though
+            # stresses do not. Driving a blended submodel from a sharp
+            # global's displacement field is sound; refining a sharp
+            # submodel's stress is not. The gate has to look at the second.
+            local_class = classify_peak(
+                solid.val() if hasattr(solid, "val") else solid,
+                peak_xyz, case["mesh"]["max_size_mm"])
+            region = plan(local_class, peak_xyz,
                           feature_mm, standoff_elements,
                           case["mesh"]["max_size_mm"], source=standoff_source)
 
+            # Only now touch the global results. The gate above is cheap -
+            # build the solid, classify one peak - and reading the field is
+            # not: the jetpack global .frd is 394 MB. Cheap refusals first is
+            # the same ordering `_prepare` uses, for the same reason.
             global_frd = Path(global_result["run_dir"]) / "job.frd"
             if not global_frd.is_file():
                 raise FeaError(
@@ -1703,13 +1732,36 @@ class ValidationTools:
                     f"is driven by them; without the .frd there is nothing to "
                     f"interpolate from")
 
-            part = self.parts.get_part(geometry_id)
-            solid = build_solid(part["spec"])
+            # Read ONCE. Every rung drives points from the same field, so
+            # re-reading per rung would cost more than the solving.
+            try:
+                field = read_frd(global_frd)
+            except InterpolationError as exc:
+                raise FeaError(f"global results unreadable: {exc}") from exc
+
             cut, cut_report = cut_region(solid, region)
             risks = coplanar_risk(solid_bounds(solid), region)
 
-            gm = mesh_step(part["step_file_path"], case["mesh"]["max_size_mm"],
-                           case["mesh"].get("min_size_mm"))
+            # Check the boundary conditions against the GLOBAL FIELD's own
+            # nodes, not a fresh mesh of the part.
+            #
+            # This used to call mesh_step on the whole submodel part, which
+            # defeated the entire feature: if the part could be globally
+            # meshed there would be no reason to submodel it. On the jetpack
+            # frame it failed exactly there - 20 of 64,373 elements degenerate
+            # at 5 mm - after the gate, the cut and the region had all
+            # succeeded.
+            #
+            # The global field is also the RIGHT mesh to ask. Those are the
+            # nodes the boundary conditions were actually applied to, so a
+            # selector evaluated against them answers the real question:
+            # does an applied load or restraint fall inside the region whose
+            # effect the driven surface already carries?
+            gm = {"node_tags": np.asarray(sorted(field["coords"]),
+                                          dtype=np.int64),
+                  "coords": np.asarray([field["coords"][t] for t
+                                        in sorted(field["coords"])],
+                                       dtype=float)}
             conflicts = self._region_conflicts(gm, case, region)
             if conflicts:
                 raise FeaError(
@@ -1720,9 +1772,16 @@ class ValidationTools:
                     f"are not supported yet - move the region, or solve the "
                     f"part directly")
 
-            ladder = refinement_ladder(case["mesh"]["max_size_mm"], region,
-                                       steps=ladder_steps,
-                                       factor=ladder_factor)
+            # The ladder starts where the CALLER says, defaulting to the
+            # global size. Tying it to the global was wrong: a submodel exists
+            # to be finer than the global, and on the jetpack junction the
+            # global 5 mm is far too coarse for a 1 mm blend - the first rung
+            # failed the Jacobian gate with 8 of 4,547 elements degenerate
+            # before any of the refinement happened. The region is small, so
+            # it can afford elements the whole part never could.
+            ladder = refinement_ladder(
+                float(start_mesh_mm or case["mesh"]["max_size_mm"]), region,
+                steps=ladder_steps, factor=ladder_factor)
 
             # MEASURED 2026-08-28. ccx 2.23 win-x64 *SUBMODEL interpolation is
             # PROHIBITIVELY SLOW, and superlinear in the number of driven
@@ -1761,11 +1820,6 @@ class ValidationTools:
             # Read ONCE, outside the ladder. The jetpack global .frd is 394 MB
             # and every rung drives points from the same field; re-reading it
             # per rung would cost more than the solving.
-            try:
-                field = read_frd(global_frd)
-            except InterpolationError as exc:
-                raise FeaError(f"global results unreadable: {exc}") from exc
-
             peaks, rungs = [], []
             binary = threads = None
             for mm in ladder:
@@ -1778,19 +1832,25 @@ class ValidationTools:
                 by_tag = {int(t): xyz for t, xyz
                           in zip(m["node_tags"], m["coords"])}
                 interp = interpolate(field=field,
-                                     points={t: by_tag[t] for t in driven})
+                                     points={t: by_tag[t] for t in driven},
+                                     max_projection_mm=max_projection_mm)
                 if interp["outside"]:
                     # A driven node outside every global element would have to
                     # be extrapolated, and nothing downstream could tell. The
                     # cut is supposed to lie INSIDE the global solve, so this
                     # means the region and the global model disagree.
+                    sample = ", ".join(
+                        str(o["point"]) for o in interp["outside"][:3])
                     raise FeaError(
                         f"{len(interp['outside'])} of {len(driven)} driven "
-                        f"nodes at {mm:g} mm fell outside every global "
-                        f"element, the worst by "
-                        f"{interp['worst_outside_mm']:.4g} mm. They cannot be "
-                        f"driven without extrapolating, so the submodel is "
-                        f"refused rather than guessed")
+                        f"nodes at {mm:g} mm fell outside every element of "
+                        f"the global mesh, e.g. {sample}. They cannot be "
+                        f"driven without extrapolating, and nothing "
+                        f"downstream could tell an invented displacement "
+                        f"from a real one, so this is refused rather than "
+                        f"guessed. Either the region is not fully inside the "
+                        f"global model, or the submodel's surface lies "
+                        f"outside the global tet mesh's faceted boundary")
                 frag = {"before_step": [],
                         "inside_step": boundary_cards(interp["values"])}
                 self._write_submodel_inp(run_dir / "job.inp", m, case, frag)
@@ -1805,6 +1865,10 @@ class ValidationTools:
                 peak_vm = max(von_mises(s) for s in stress.values())
                 peaks.append(peak_vm)
                 rungs.append({"mesh_mm": mm, "nodes": len(m["node_tags"]),
+                              "projected_nodes": len(interp["projected"]),
+                              "worst_projection_mm": (
+                                  max((x["gap_mm"] for x in interp["projected"]),
+                                      default=0.0)),
                               "elements": len(m["connectivity"]),
                               "driven_nodes": len(driven),
                               "max_von_mises_MPa": round(peak_vm, 6),
@@ -1815,6 +1879,7 @@ class ValidationTools:
             coarse = global_result.get("max_von_mises_MPa")
             details = {
                 "region": region.to_dict(),
+                "singularity_of_refined_geometry": local_class,
                 "cut": cut_report,
                 "coplanar_risk": risks,
                 "global_run_dir": str(global_result["run_dir"]),
