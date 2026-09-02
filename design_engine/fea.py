@@ -54,7 +54,24 @@ from . import weld as _weld
 
 
 class FeaError(RuntimeError):
-    pass
+    """A validation failure, optionally carrying the numbers that caused it.
+
+    `details` exists because those numbers used to be formatted into the
+    message and then thrown away. Action #346 recorded, as prose, "exceeded
+    2400s on a submodel 0.2mm solve of 478512 nodes ... Peak memory at the
+    kill: 4437 MB" — with `details_json` empty. So the single run that could
+    have shown why a submodel solve costs more than the fitted cost model
+    predicts was unfittable, and the knowledge base could not see it at all.
+
+    A number the writer already held should never have to be parsed back out
+    of a sentence. That is the mistake the calibration back-fill had to make
+    once already, and once was enough. The message stays human-readable; the
+    fields go to the log beside it.
+    """
+
+    def __init__(self, *args, details: dict | None = None):
+        super().__init__(*args)
+        self.details = dict(details) if details else None
 
 
 _CASE_KEYS = {"material", "mesh", "constraints", "loads", "limit_state",
@@ -931,6 +948,14 @@ class ValidationTools:
         it. Only the EXCEPTION path is handled here; the pass/fail-with-details
         close stays with the analysis, because only the analysis knows what its
         details are and whether it passed.
+
+        A failing run may still have MEASURED something — how many nodes it got
+        to, how long it burned, how much memory it took — and until 2026-09-02
+        all of that was discarded, leaving `details_json` empty on every failed
+        row. Any exception carrying a `details` dict now has it written to the
+        log beside the message. `getattr` rather than an isinstance check, so a
+        `MeshError` or anything else can opt in by setting the attribute
+        without this module having to know the exception's type.
         """
         action_id = self.log.open_action(
             "validation", name, geometry_version=str(geometry_id),
@@ -939,7 +964,8 @@ class ValidationTools:
             yield action_id
         except Exception as exc:
             self.log.close_action(
-                action_id, "fail", failure_mode=f"{type(exc).__name__}: {exc}")
+                action_id, "fail", details=getattr(exc, "details", None),
+                failure_mode=f"{type(exc).__name__}: {exc}")
             raise
 
     def _prepare(self, geometry_id: str, case: dict) -> _SolveInputs:
@@ -998,13 +1024,34 @@ class ValidationTools:
         except subprocess.TimeoutExpired as timeout:
             peak = getattr(timeout, "peak_rss_mb", None)
             mem = f" Peak memory at the kill: {peak:.0f} MB." if peak else ""
+            # The same numbers as FIELDS, not only as prose. A timed-out solve
+            # is still a measurement of what that node count costs - arguably
+            # the most valuable one, since it is the only kind that establishes
+            # a LOWER bound above the budget. The fitted cost model is blind to
+            # exactly these runs, which is why it under-predicts submodels.
             raise FeaError(
                 f"solver_timeout: {binary.name} exceeded {self.solve_timeout_s}s "
                 f"on {'a ' + what + ' solve of ' if what else ''}{n_nodes} nodes "
                 f"using {threads} thread(s).{mem} Direct-solve cost grows steeply "
                 f"with node count - coarsen case.mesh.max_size_mm (subject to "
                 f"the Jacobian gate on the thinnest feature), or raise "
-                f"ValidationTools(solve_timeout_s=...).") from None
+                f"ValidationTools(solve_timeout_s=...).",
+                details={
+                    "failure_kind": "solver_timeout",
+                    "nodes": n_nodes,
+                    # Censored, not observed: the solve was killed, so this is
+                    # a lower bound on the true cost. Named so nothing fits it
+                    # as if the run had finished at this figure.
+                    "solve_seconds_at_kill": round(time.time() - t0, 3),
+                    "solve_seconds_is_lower_bound": True,
+                    "timeout_s": self.solve_timeout_s,
+                    "peak_rss_mb": peak,
+                    "peak_rss_is_lower_bound": True,
+                    "solver_binary": binary.name,
+                    "threads": threads,
+                    "solve_kind": what or "static",
+                    "run_dir": str(run_dir),
+                }) from None
         seconds = time.time() - t0
         bad = proc.returncode != 0 or (require_finished
                                        and "Job finished" not in proc.stdout)
@@ -1014,7 +1061,20 @@ class ValidationTools:
                    if proc.peak_rss_mb else "")
             raise FeaError(f"solver_error: {binary.name} exit "
                            f"{proc.returncode};{mem} "
-                           f"tail: {proc.stdout[-400:]!r}")
+                           f"tail: {proc.stdout[-400:]!r}",
+                           details={
+                               "failure_kind": "solver_error",
+                               "nodes": n_nodes,
+                               # This one DID run to completion, badly, so the
+                               # time and memory are real rather than censored.
+                               "solve_seconds": round(seconds, 3),
+                               "peak_rss_mb": proc.peak_rss_mb,
+                               "returncode": proc.returncode,
+                               "solver_binary": binary.name,
+                               "threads": threads,
+                               "solve_kind": what or "static",
+                               "run_dir": str(run_dir),
+                           })
         return proc, binary, threads, seconds
 
     def _run_buckle(self, m, case, constraint_sets, load_sets, run_dir,
@@ -1822,103 +1882,126 @@ class ValidationTools:
             # per rung would cost more than the solving.
             peaks, rungs = [], []
             binary = threads = None
-            for mm in ladder:
-                run_dir = self._next_run_dir()
-                step_path = run_dir / "submodel.step"
-                import cadquery as cq              # noqa: PLC0415
-                cq.exporters.export(cut, str(step_path))
-                # GRADED, not uniform. The coarsest rung sets the size at
-                # the cut; each rung refines only a ball around the feature.
-                #
-                # Uniform refinement forces a choice the submodel should not
-                # have to make: stand the cut far enough off that the peak is
-                # not a boundary artefact, OR resolve the feature - node count
-                # goes as the cube of region size, so a 12 mm box at 0.2 mm
-                # reached 478,512 nodes and timed out at 4,437 MB. Grading
-                # buys both. Measured on a plain bar: 0.8 mm everywhere is
-                # 303,191 nodes, 0.8 mm inside an 8 mm ball is 40,928 - the
-                # same resolution where it matters at a seventh of the cost.
-                m = mesh_step(str(step_path), ladder[0], None,
-                              refine={"centre": peak_xyz,
-                                      "radius": max(2.0 * feature_mm,
-                                                    6.0 * mm),
-                                      "size": mm})
-                driven = driven_nodes(m, region)
-                by_tag = {int(t): xyz for t, xyz
-                          in zip(m["node_tags"], m["coords"])}
-                interp = interpolate(field=field,
-                                     points={t: by_tag[t] for t in driven},
-                                     max_projection_mm=max_projection_mm)
-                if interp["outside"]:
-                    # A driven node outside every global element would have to
-                    # be extrapolated, and nothing downstream could tell. The
-                    # cut is supposed to lie INSIDE the global solve, so this
-                    # means the region and the global model disagree.
-                    sample = ", ".join(
-                        str(o["point"]) for o in interp["outside"][:3])
-                    raise FeaError(
-                        f"{len(interp['outside'])} of {len(driven)} driven "
-                        f"nodes at {mm:g} mm fell outside every element of "
-                        f"the global mesh, e.g. {sample}. They cannot be "
-                        f"driven without extrapolating, and nothing "
-                        f"downstream could tell an invented displacement "
-                        f"from a real one, so this is refused rather than "
-                        f"guessed. Either the region is not fully inside the "
-                        f"global model, or the submodel's surface lies "
-                        f"outside the global tet mesh's faceted boundary")
-                frag = {"before_step": [],
-                        "inside_step": boundary_cards(interp["values"])}
-                self._write_submodel_inp(run_dir / "job.inp", m, case, frag)
-                _, binary, threads, solve_s = self._solve(
-                    run_dir, len(m["node_tags"]), what=f"submodel {mm:g}mm")
-                blocks = _parse_frd(run_dir / "job.frd")
-                stress = blocks.get("STRESS", {})
-                if not stress:
-                    raise FeaError(
-                        f"the submodel at {mm:g} mm produced no STRESS "
-                        f"results ({run_dir}/job.frd)")
-                vm_by_node = {n: von_mises(sv) for n, sv in stress.items()}
-                peak_node = max(vm_by_node, key=vm_by_node.get)
-                peak_vm = vm_by_node[peak_node]
+            # Bound before the try so the handler below can never raise
+            # NameError over the top of a real solver failure. An empty ladder
+            # cannot reach the handler at all, but a diagnostic that destroys
+            # the diagnosis is not a trade worth one saved line.
+            mm = None
+            # A rung that dies still measured what it reached, and the
+            # rungs BEFORE it completed normally. Discarding both is how
+            # action #346 came to record a 2400 s overrun with an empty
+            # details_json, leaving the one run that shows a submodel
+            # costing >3.4x its node-count-implied price unfittable.
+            try:
+                for mm in ladder:
+                    run_dir = self._next_run_dir()
+                    step_path = run_dir / "submodel.step"
+                    import cadquery as cq              # noqa: PLC0415
+                    cq.exporters.export(cut, str(step_path))
+                    # GRADED, not uniform. The coarsest rung sets the size at
+                    # the cut; each rung refines only a ball around the feature.
+                    #
+                    # Uniform refinement forces a choice the submodel should not
+                    # have to make: stand the cut far enough off that the peak is
+                    # not a boundary artefact, OR resolve the feature - node count
+                    # goes as the cube of region size, so a 12 mm box at 0.2 mm
+                    # reached 478,512 nodes and timed out at 4,437 MB. Grading
+                    # buys both. Measured on a plain bar: 0.8 mm everywhere is
+                    # 303,191 nodes, 0.8 mm inside an 8 mm ball is 40,928 - the
+                    # same resolution where it matters at a seventh of the cost.
+                    m = mesh_step(str(step_path), ladder[0], None,
+                                  refine={"centre": peak_xyz,
+                                          "radius": max(2.0 * feature_mm,
+                                                        6.0 * mm),
+                                          "size": mm})
+                    driven = driven_nodes(m, region)
+                    by_tag = {int(t): xyz for t, xyz
+                              in zip(m["node_tags"], m["coords"])}
+                    interp = interpolate(field=field,
+                                         points={t: by_tag[t] for t in driven},
+                                         max_projection_mm=max_projection_mm)
+                    if interp["outside"]:
+                        # A driven node outside every global element would have to
+                        # be extrapolated, and nothing downstream could tell. The
+                        # cut is supposed to lie INSIDE the global solve, so this
+                        # means the region and the global model disagree.
+                        sample = ", ".join(
+                            str(o["point"]) for o in interp["outside"][:3])
+                        raise FeaError(
+                            f"{len(interp['outside'])} of {len(driven)} driven "
+                            f"nodes at {mm:g} mm fell outside every element of "
+                            f"the global mesh, e.g. {sample}. They cannot be "
+                            f"driven without extrapolating, and nothing "
+                            f"downstream could tell an invented displacement "
+                            f"from a real one, so this is refused rather than "
+                            f"guessed. Either the region is not fully inside the "
+                            f"global model, or the submodel's surface lies "
+                            f"outside the global tet mesh's faceted boundary")
+                    frag = {"before_step": [],
+                            "inside_step": boundary_cards(interp["values"])}
+                    self._write_submodel_inp(run_dir / "job.inp", m, case, frag)
+                    _, binary, threads, solve_s = self._solve(
+                        run_dir, len(m["node_tags"]), what=f"submodel {mm:g}mm")
+                    blocks = _parse_frd(run_dir / "job.frd")
+                    stress = blocks.get("STRESS", {})
+                    if not stress:
+                        raise FeaError(
+                            f"the submodel at {mm:g} mm produced no STRESS "
+                            f"results ({run_dir}/job.frd)")
+                    vm_by_node = {n: von_mises(sv) for n, sv in stress.items()}
+                    peak_node = max(vm_by_node, key=vm_by_node.get)
+                    peak_vm = vm_by_node[peak_node]
 
-                # WHERE the peak sits decides what it means.
-                #
-                # A peak ON a driven node is not automatically wrong - over a
-                # region with a monotonic field, like mid-span of a bent bar,
-                # the largest stress legitimately sits on a cut face because
-                # the region simply contains no local maximum. What it is
-                # NEVER able to be is evidence about the feature, because the
-                # value is set by the imposed displacements rather than by the
-                # geometry being studied.
-                #
-                # And when the interpolation feeding those displacements is
-                # slightly off, the error becomes a local concentration that
-                # SHARPENS with refinement - so it climbs exactly like a
-                # singularity while the geometry is provably blend-clean.
-                # Measured on the jetpack junction 2026-09-01: 91.09 MPa at
-                # 0.8 mm rising to 228.30 MPa at 0.4 mm, +150.6%, with every
-                # top peak on a driven node 0.000 mm from a cut face and 6 mm
-                # from the junction being studied.
-                #
-                # So it is recorded, not raised, and it BLOCKS a claim of
-                # convergence: a settled number read off the driven boundary
-                # is still not a number about the feature.
-                pk = by_tag.get(int(peak_node))
-                on_driven = int(peak_node) in set(int(t) for t in driven)
-                peaks.append(peak_vm)
-                rungs.append({"mesh_mm": mm, "coarse_mm": ladder[0], "nodes": len(m["node_tags"]),
-                              "projected_nodes": len(interp["projected"]),
-                              "worst_projection_mm": (
-                                  max((x["gap_mm"] for x in interp["projected"]),
-                                      default=0.0)),
-                              "elements": len(m["connectivity"]),
-                              "driven_nodes": len(driven),
-                              "max_von_mises_MPa": round(peak_vm, 6),
-                              "peak_at_mm": ([round(float(v), 4) for v in pk]
-                                             if pk is not None else None),
-                              "peak_on_driven_boundary": on_driven,
-                              "solve_seconds": round(solve_s, 3),
-                              "run_dir": str(run_dir)})
+                    # WHERE the peak sits decides what it means.
+                    #
+                    # A peak ON a driven node is not automatically wrong - over a
+                    # region with a monotonic field, like mid-span of a bent bar,
+                    # the largest stress legitimately sits on a cut face because
+                    # the region simply contains no local maximum. What it is
+                    # NEVER able to be is evidence about the feature, because the
+                    # value is set by the imposed displacements rather than by the
+                    # geometry being studied.
+                    #
+                    # And when the interpolation feeding those displacements is
+                    # slightly off, the error becomes a local concentration that
+                    # SHARPENS with refinement - so it climbs exactly like a
+                    # singularity while the geometry is provably blend-clean.
+                    # Measured on the jetpack junction 2026-09-01: 91.09 MPa at
+                    # 0.8 mm rising to 228.30 MPa at 0.4 mm, +150.6%, with every
+                    # top peak on a driven node 0.000 mm from a cut face and 6 mm
+                    # from the junction being studied.
+                    #
+                    # So it is recorded, not raised, and it BLOCKS a claim of
+                    # convergence: a settled number read off the driven boundary
+                    # is still not a number about the feature.
+                    pk = by_tag.get(int(peak_node))
+                    on_driven = int(peak_node) in set(int(t) for t in driven)
+                    peaks.append(peak_vm)
+                    rungs.append({"mesh_mm": mm, "coarse_mm": ladder[0], "nodes": len(m["node_tags"]),
+                                  "projected_nodes": len(interp["projected"]),
+                                  "worst_projection_mm": (
+                                      max((x["gap_mm"] for x in interp["projected"]),
+                                          default=0.0)),
+                                  "elements": len(m["connectivity"]),
+                                  "driven_nodes": len(driven),
+                                  "max_von_mises_MPa": round(peak_vm, 6),
+                                  "peak_at_mm": ([round(float(v), 4) for v in pk]
+                                                 if pk is not None else None),
+                                  "peak_on_driven_boundary": on_driven,
+                                  "solve_seconds": round(solve_s, 3),
+                                  "run_dir": str(run_dir)})
+            except Exception as exc:
+                # Merge, never overwrite: _solve has already attached the
+                # failing rung's own nodes / seconds / peak memory, and those
+                # are the fields the cost model actually needs.
+                exc.details = {**(getattr(exc, 'details', None) or {}),
+                               'partial': True,
+                               'rungs': rungs,
+                               'ladder': ladder,
+                               'failed_rung_mm': mm,
+                               'completed_rungs': len(rungs),
+                               'region': region.to_dict()}
+                raise
 
             verdict = converged(peaks, tol_pct)
             boundary_rungs = [r["mesh_mm"] for r in rungs

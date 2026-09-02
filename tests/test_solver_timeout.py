@@ -247,3 +247,133 @@ def test_the_configured_solver_is_an_executable_not_a_wrapper_script():
     cmd.exe would be the child and ccx the grandchild."""
     assert _DEFAULT_CCX.suffix.lower() == ".exe"
     assert _DEFAULT_CCX.read_bytes()[:2] == b"MZ", "not a PE executable"
+
+
+# --------------------------------------------- failure numbers as FIELDS, not prose
+# Added 2026-09-02. The tests above pin that the timeout MESSAGE names the peak.
+# That was not enough: action #346 recorded "exceeded 2400s on a submodel 0.2mm
+# solve of 478512 nodes ... Peak memory at the kill: 4437 MB" with an empty
+# details_json, so the one run showing a submodel cost >3.4x its node-implied
+# price could not be fitted, only read. These pin the same numbers as fields.
+
+def test_a_timeout_records_its_numbers_as_fields_not_only_as_prose(
+        tmp_path, monkeypatch):
+    eng = DesignEngine(tmp_path / "data")
+
+    def fake_run_solver(cmd, cwd, env, timeout_s):
+        raise _SolverTimeout(cmd, timeout_s, 4437.0)
+
+    monkeypatch.setattr(fea_mod, "_run_solver", fake_run_solver)
+    with pytest.raises(FeaError) as caught:
+        eng.validation._solve(tmp_path, 478_512, what="submodel 0.2mm")
+
+    d = caught.value.details
+    assert d is not None, "the numbers were formatted into prose and discarded"
+    assert d["failure_kind"] == "solver_timeout"
+    assert d["nodes"] == 478_512
+    assert d["peak_rss_mb"] == 4437.0
+    assert d["solve_kind"] == "submodel 0.2mm"
+    assert d["threads"] >= 1
+    # A killed solve is CENSORED. Anything fitting this must be able to tell
+    # "cost at least this" from "cost exactly this", or the cost model learns
+    # that huge meshes are cheap because they were all stopped early.
+    assert d["solve_seconds_is_lower_bound"] is True
+    assert d["peak_rss_is_lower_bound"] is True
+    assert "solve_seconds" not in d, (
+        "a censored time must not be recorded under the same key as a "
+        "completed one")
+
+
+def test_a_timeout_with_no_measurement_records_none_not_zero(
+        tmp_path, monkeypatch):
+    """Zero memory is a measurement. Missing memory is not."""
+    eng = DesignEngine(tmp_path / "data")
+
+    def fake_run_solver(cmd, cwd, env, timeout_s):
+        raise subprocess.TimeoutExpired(cmd, timeout_s)
+
+    monkeypatch.setattr(fea_mod, "_run_solver", fake_run_solver)
+    with pytest.raises(FeaError) as caught:
+        eng.validation._solve(tmp_path, 1000, what="static")
+    assert caught.value.details["peak_rss_mb"] is None
+
+
+def test_a_solver_error_records_a_real_time_not_a_censored_one(
+        tmp_path, monkeypatch):
+    """A solve that ran to completion badly DID cost what it cost. Recording
+    that under the censored key would throw away a usable observation."""
+    eng = DesignEngine(tmp_path / "data")
+
+    class _Bad:
+        returncode = 3221225477                # 0xC0000005
+        stdout = "*ERROR in u_calloc"
+        peak_rss_mb = 8192.0
+
+    monkeypatch.setattr(fea_mod, "_run_solver",
+                        lambda cmd, cwd, env, timeout_s: _Bad())
+    with pytest.raises(FeaError) as caught:
+        eng.validation._solve(tmp_path, 250_000, what="static")
+
+    d = caught.value.details
+    assert d["failure_kind"] == "solver_error"
+    assert d["returncode"] == 3221225477
+    assert d["peak_rss_mb"] == 8192.0
+    assert d["nodes"] == 250_000
+    assert "solve_seconds" in d and "solve_seconds_at_kill" not in d
+    assert "solve_seconds_is_lower_bound" not in d
+
+
+def test_the_action_wrapper_writes_failure_details_to_the_log(tmp_path):
+    """The mechanism, end to end.
+
+    `_action` used to close the exception path with a failure_mode string and
+    nothing else, so EVERY failed validation row in the project has an empty
+    details_json. This is the regression against that.
+    """
+    import json
+    eng = DesignEngine(tmp_path / "data")
+
+    with pytest.raises(FeaError):
+        with eng.validation._action("fea_static", "P0001@v1", "a test") as aid:
+            raise FeaError("boom", details={"nodes": 123, "peak_rss_mb": 45.6})
+
+    row = [r for r in eng.log.rows(action="fea_static") if r["id"] == aid][0]
+    assert row["result"] == "fail"
+    assert "boom" in row["failure_mode"]
+    d = json.loads(row["details_json"])
+    assert d["nodes"] == 123 and d["peak_rss_mb"] == 45.6
+
+
+def test_an_exception_carrying_no_details_still_closes_the_action(tmp_path):
+    """A MeshError, a KeyError, anything at all. Opting in must stay optional
+    or the wrapper stops being a safety net and becomes a second failure."""
+    eng = DesignEngine(tmp_path / "data")
+
+    with pytest.raises(KeyError):
+        with eng.validation._action("fea_static", "P0001@v1", "a test") as aid:
+            raise KeyError("worst_outside_mm")
+
+    row = [r for r in eng.log.rows(action="fea_static") if r["id"] == aid][0]
+    assert row["result"] == "fail"
+    assert "worst_outside_mm" in row["failure_mode"]
+
+
+def test_any_exception_can_opt_in_by_setting_the_attribute(tmp_path):
+    """`getattr`, not isinstance: the submodel ladder attaches its partial
+    rungs to whatever came out of the loop, including a MeshError."""
+    import json
+    from design_engine.mesh import MeshError
+    eng = DesignEngine(tmp_path / "data")
+
+    with pytest.raises(MeshError):
+        with eng.validation._action("fea_submodel", "P0001@v1", "a test") as aid:
+            exc = MeshError("degenerate_mesh: 8 of 4547 elements")
+            exc.details = {"partial": True, "completed_rungs": 2,
+                           "rungs": [{"mesh_mm": 0.8, "nodes": 60_000,
+                                      "solve_seconds": 41.2}]}
+            raise exc
+
+    row = [r for r in eng.log.rows(action="fea_submodel") if r["id"] == aid][0]
+    d = json.loads(row["details_json"])
+    assert d["completed_rungs"] == 2
+    assert d["rungs"][0]["nodes"] == 60_000
