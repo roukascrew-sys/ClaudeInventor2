@@ -1862,7 +1862,34 @@ class ValidationTools:
                     raise FeaError(
                         f"the submodel at {mm:g} mm produced no STRESS "
                         f"results ({run_dir}/job.frd)")
-                peak_vm = max(von_mises(s) for s in stress.values())
+                vm_by_node = {n: von_mises(sv) for n, sv in stress.items()}
+                peak_node = max(vm_by_node, key=vm_by_node.get)
+                peak_vm = vm_by_node[peak_node]
+
+                # WHERE the peak sits decides what it means.
+                #
+                # A peak ON a driven node is not automatically wrong - over a
+                # region with a monotonic field, like mid-span of a bent bar,
+                # the largest stress legitimately sits on a cut face because
+                # the region simply contains no local maximum. What it is
+                # NEVER able to be is evidence about the feature, because the
+                # value is set by the imposed displacements rather than by the
+                # geometry being studied.
+                #
+                # And when the interpolation feeding those displacements is
+                # slightly off, the error becomes a local concentration that
+                # SHARPENS with refinement - so it climbs exactly like a
+                # singularity while the geometry is provably blend-clean.
+                # Measured on the jetpack junction 2026-09-01: 91.09 MPa at
+                # 0.8 mm rising to 228.30 MPa at 0.4 mm, +150.6%, with every
+                # top peak on a driven node 0.000 mm from a cut face and 6 mm
+                # from the junction being studied.
+                #
+                # So it is recorded, not raised, and it BLOCKS a claim of
+                # convergence: a settled number read off the driven boundary
+                # is still not a number about the feature.
+                pk = by_tag.get(int(peak_node))
+                on_driven = int(peak_node) in set(int(t) for t in driven)
                 peaks.append(peak_vm)
                 rungs.append({"mesh_mm": mm, "nodes": len(m["node_tags"]),
                               "projected_nodes": len(interp["projected"]),
@@ -1872,10 +1899,27 @@ class ValidationTools:
                               "elements": len(m["connectivity"]),
                               "driven_nodes": len(driven),
                               "max_von_mises_MPa": round(peak_vm, 6),
+                              "peak_at_mm": ([round(float(v), 4) for v in pk]
+                                             if pk is not None else None),
+                              "peak_on_driven_boundary": on_driven,
                               "solve_seconds": round(solve_s, 3),
                               "run_dir": str(run_dir)})
 
             verdict = converged(peaks, tol_pct)
+            boundary_rungs = [r["mesh_mm"] for r in rungs
+                              if r["peak_on_driven_boundary"]]
+            if boundary_rungs:
+                # Convergence is not claimable while the peak is being read
+                # off the driven surface, however steady the number looks.
+                verdict = dict(verdict, converged=False, reason=(
+                    f"the peak sits on a DRIVEN node at "
+                    f"{len(boundary_rungs)} of {len(rungs)} rungs "
+                    f"({boundary_rungs}), so it is set by the imposed "
+                    f"displacements rather than by the feature. "
+                    f"{verdict.get('reason', '')} Enlarge the region so the "
+                    f"cut stands further off from the stress being read - "
+                    f"standoff_elements is currently "
+                    f"{region.standoff_elements:g}"))
             coarse = global_result.get("max_von_mises_MPa")
             details = {
                 "region": region.to_dict(),
