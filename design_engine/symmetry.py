@@ -448,3 +448,48 @@ def plane_nodes(mesh: dict, plane: Plane, tol: float = 1e-6) -> list[int]:
     idx = plane.index
     return [int(t) for t, xyz in zip(mesh["node_tags"], mesh["coords"])
             if abs(float(xyz[idx]) - plane.at) <= tol]
+
+
+def drop_discarded(items: Sequence[dict], mesh: dict, plane: Plane,
+                   select, kind: str = "load") -> tuple[list[dict], list[int]]:
+    """Remove items that live entirely in the half being thrown away.
+
+    A load at x = -330 on a model cut to keep x >= 0 selects nothing, and
+    that is correct rather than an error: its half is gone, and so is it.
+    Node selection refuses an empty selector - rightly, since an empty
+    selector is usually a typo - so the discarded ones have to be removed
+    before they reach it.
+
+    The safeguard is that an item is only dropped when its MIRROR matches
+    nodes. `verify()` has already established that every item is mirror-paired,
+    so an item selecting nothing whose mirror selects something is the
+    discarded partner of a kept one. An item selecting nothing whose mirror
+    ALSO selects nothing is a broken selector, and is raised rather than
+    quietly deleted - which would otherwise turn a typo into a silently
+    unloaded model.
+    """
+    kept, dropped = [], []
+    for i, item in enumerate(items):
+        try:
+            if len(select(mesh, item["where"])) > 0:
+                kept.append(item)
+                continue
+        except Exception:
+            pass                                  # empty selection, handled below
+
+        try:
+            mirrored = mirror_selector(item["where"], plane)
+            n_mirror = len(select(mesh, mirrored))
+        except Exception:
+            n_mirror = 0
+
+        if n_mirror > 0:
+            dropped.append(i)                     # the discarded half's partner
+        else:
+            raise SymmetryError(
+                f"{kind} {i} selects no node in the kept half AND no node in "
+                f"its mirror image, so it is not a symmetry consequence - it "
+                f"is a selector that matches nothing anywhere: "
+                f"{item['where']}. Dropping it would leave the model quietly "
+                f"missing a {kind}")
+    return kept, dropped

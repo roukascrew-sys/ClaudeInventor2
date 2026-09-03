@@ -926,11 +926,16 @@ class _SolveInputs:
                  # None unless a symmetry cut was asked for AND demonstrated.
                  # `symmetry` carries the evidence so the log records why the
                  # cut was allowed, not merely that it happened.
-                 "symmetry", "plane")
+                 "symmetry", "plane",
+                 # The case as _prepare left it. A symmetry cut removes the
+                 # discarded half's loads and restraints, and the caller must
+                 # build its deck from THAT case, not the one it passed in.
+                 "case")
 
     def __init__(self, part, run_dir, mesh, constraint_sets, rbm):
         self.symmetry = None
         self.plane = None
+        self.case = None
         self.part = part
         self.run_dir = run_dir
         self.mesh = mesh
@@ -1075,12 +1080,29 @@ class ValidationTools:
 
         m = mesh_step(step_path, case["mesh"]["max_size_mm"],
                       case["mesh"].get("min_size_mm"))
+
+        if plane is not None:
+            # The discarded half took its loads and restraints with it. A load
+            # at x = -330 on a model keeping x >= 0 now selects nothing, and
+            # `select_nodes` refuses an empty selector - rightly, since that is
+            # usually a typo. So they are removed here, and only where the
+            # MIRROR image does select nodes, which is what distinguishes "its
+            # half is gone" from "this selector matches nothing anywhere".
+            case = dict(case)
+            case["loads"], dropped_l = symmetry.drop_discarded(
+                case["loads"], m, plane, select_nodes, "load")
+            case["constraints"], dropped_c = symmetry.drop_discarded(
+                case["constraints"], m, plane, select_nodes, "constraint")
+            sym_evidence["dropped"] = {"loads": dropped_l,
+                                       "constraints": dropped_c}
+
         constraint_sets = [select_nodes(m, c["where"])
                            for c in case["constraints"]]
         rbm = check_rigid_body_modes(m, constraint_sets, case["constraints"])
         si = _SolveInputs(part, run_dir, m, constraint_sets, rbm)
         si.symmetry = sym_evidence
         si.plane = plane
+        si.case = case
         return si
 
     #: Below this fraction of free memory the solve is expected to fit outright.
@@ -1733,6 +1755,8 @@ class ValidationTools:
         with self._action("fea_static", geometry_id, reason) as action_id:
             _check_reason(reason)
             si = self._prepare(geometry_id, case)
+            # _prepare may have trimmed the case - see _SolveInputs.case.
+            case = si.case
             m, run_dir, part = si.mesh, si.run_dir, si.part
             constraint_sets, rbm = si.constraint_sets, si.rbm
             # A load whose selector is its own mirror image spans BOTH
