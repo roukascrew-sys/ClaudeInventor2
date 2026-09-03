@@ -989,6 +989,102 @@ class ValidationTools:
         rbm = check_rigid_body_modes(m, constraint_sets, case["constraints"])
         return _SolveInputs(part, run_dir, m, constraint_sets, rbm)
 
+    #: Below this fraction of free memory the solve is expected to fit outright.
+    #: Above it the solve still starts, but the run is flagged: the machine can
+    #: satisfy the request only by paging, and paging does not fail, it crawls.
+    #: Measured 2026-09-02: a 297,794-node global predicted at 5,091 MB (high
+    #: end) against 5,484 MB free took 1282 s where the cost model's upper bound
+    #: was 259 s - 4.95x - while a 338,446-node solve with room to spare took
+    #: 209.95 s. More nodes, a sixth of the time, same solver and machine.
+    _PAGING_RISK_FRACTION = 0.80
+
+    def _knowledge(self):
+        """The knowledge base over this engine's own log, or None.
+
+        Lazy because it is only needed at solve time, and optional because a
+        missing or unreadable history must not stop a solve that would have
+        worked. Gating on absent knowledge would be worse than not gating.
+        """
+        if getattr(self, "_kb", None) is None:
+            try:
+                from .inventor.knowledge import KnowledgeBase  # noqa: PLC0415
+                self._kb = KnowledgeBase(self.log.db_path)
+            except Exception:                  # pragma: no cover - env-dependent
+                self._kb = False
+        return self._kb or None
+
+    def _memory_gate(self, n_nodes: int, run_dir: Path, what: str) -> None:
+        """Refuse a solve the machine cannot hold, BEFORE spending it.
+
+        The engine has had an accurate memory model since 2026-08-27 and never
+        consulted it. On 2026-09-02 that cost three global solves - 442,725,
+        528,439 and 642,603 nodes - which ran 322, 332 and 530 s and then died
+        at `0xC0000005` reaching for 7.1-9.1 GB on a machine with about 6 GB
+        free. Roughly twenty minutes to discover something two already-written
+        functions could have answered in milliseconds. This is the non-linear
+        gate the project's own rules ask for: refuse before spending, and write
+        the refusal down; never retry blind.
+
+        The prediction is checked against AVAILABLE memory read live, not
+        installed memory, and not a figure cached from earlier in the session.
+        On this machine free memory moved between 2.7 GB and 6.1 GB over one
+        afternoon while an unrelated job ran, so a stale reading is a wrong
+        reading.
+
+        Refuses only when the model's own HIGH end exceeds what is free, which
+        is the case where a crash is predicted rather than merely possible. It
+        does not refuse the paging-risk band - a slow answer is still an answer,
+        and a gate that blocks work the machine can actually do would be traded
+        away by the first person it inconvenienced. That band is recorded
+        instead, so the cost model's outliers can be explained later rather
+        than puzzled over.
+
+        Silent when the history is too thin to fit a model, or when available
+        memory cannot be read (this uses a Windows API and returns None
+        elsewhere). An unknown is not a refusal.
+        """
+        kb = self._knowledge()
+        if kb is None or not n_nodes:
+            return
+        pred = kb.predict_memory(n_nodes)
+        avail = kb.available_memory_mb()
+        if not pred or avail is None:
+            return
+
+        if pred["high_mb"] >= avail:
+            raise FeaError(
+                f"insufficient_memory: a {n_nodes:,}-node "
+                f"{what or 'static'} solve is predicted to need "
+                f"{pred['estimate_mb']:.0f} MB (high end {pred['high_mb']:.0f} "
+                f"MB, from {pred['n']} real runs) and only {avail:.0f} MB is "
+                f"free. Exceeding available memory does not slow CalculiX "
+                f"down, it kills it outright, so this is refused before the "
+                f"solve rather than after it. Coarsen case.mesh.max_size_mm "
+                f"(subject to the Jacobian gate on the thinnest feature), "
+                f"free memory, or submodel the region of interest.",
+                details={
+                    "failure_kind": "insufficient_memory",
+                    "nodes": n_nodes,
+                    "predicted_mb": pred["estimate_mb"],
+                    "predicted_high_mb": pred["high_mb"],
+                    "available_mb": avail,
+                    "shortfall_mb": round(pred["high_mb"] - avail, 1),
+                    "model_n": pred["n"],
+                    "solve_kind": what or "static",
+                    "run_dir": str(run_dir),
+                    # No solver ran, so there is no timing to censor and none
+                    # is invented. This row must never enter a cost fit.
+                    "refused_before_solving": True,
+                })
+
+        if pred["high_mb"] >= avail * self._PAGING_RISK_FRACTION:
+            (run_dir / "memory_warning.txt").write_text(
+                f"paging risk: predicted high {pred['high_mb']:.0f} MB against "
+                f"{avail:.0f} MB free ({pred['high_mb'] / avail * 100:.0f}% of "
+                f"what is available). The solve was allowed to start; expect it "
+                f"to take considerably longer than the cost model predicts.\n",
+                encoding="utf-8")
+
     def _face_loads(self, m: dict, case: dict) -> list:
         return [_consistent_face_loads(
                     m, select_nodes(m, ld["where"]), ld["force_total_N"],
@@ -1017,6 +1113,7 @@ class ValidationTools:
         the log cannot even separate that case from the paging one.
         """
         binary, env, threads = self._solver_command(force_single=force_single)
+        self._memory_gate(n_nodes, run_dir, what)
         t0 = time.time()
         try:
             proc = _run_solver([str(binary), "-i", "job"], run_dir, env,

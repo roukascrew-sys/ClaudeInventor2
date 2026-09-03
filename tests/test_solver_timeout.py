@@ -403,3 +403,146 @@ def test_any_exception_can_opt_in_by_setting_the_attribute(tmp_path):
     d = json.loads(row["details_json"])
     assert d["completed_rungs"] == 2
     assert d["rungs"][0]["nodes"] == 60_000
+
+
+# ------------------------------------------------------ the memory gate
+# Added 2026-09-02. The engine had an accurate memory model since 2026-08-27
+# and never consulted it; that evening three global solves ran 322, 332 and
+# 530 s and then died at 0xC0000005 reaching for 7.1-9.1 GB with ~6 GB free.
+# Twenty minutes to learn something two existing functions knew already.
+
+class _FakeKB:
+    """Stands in for KnowledgeBase so the gate is tested, not the fit."""
+
+    def __init__(self, high_mb=None, avail=None, n=13):
+        self._high, self._avail, self._n = high_mb, avail, n
+
+    def predict_memory(self, nodes):
+        if self._high is None:
+            return None
+        return {"nodes": nodes, "estimate_mb": self._high / 1.05,
+                "low_mb": self._high / 1.1, "high_mb": self._high,
+                "n": self._n, "band_multiplier": 1.05}
+
+    def available_memory_mb(self):
+        return self._avail
+
+
+def _gated(tmp_path, monkeypatch, kb, nodes=442_725):
+    """Run _solve with a solver that would explode if it were ever reached."""
+    eng = DesignEngine(tmp_path / "data")
+    monkeypatch.setattr(eng.validation, "_knowledge", lambda: kb)
+
+    def _must_not_run(cmd, cwd, env, timeout_s):     # pragma: no cover
+        raise AssertionError("the solver ran despite the memory gate")
+
+    monkeypatch.setattr(fea_mod, "_run_solver", _must_not_run)
+    return eng
+
+
+def test_a_solve_the_machine_cannot_hold_is_refused_before_it_runs(
+        tmp_path, monkeypatch):
+    eng = _gated(tmp_path, monkeypatch, _FakeKB(high_mb=7908.6, avail=6048.1))
+    with pytest.raises(FeaError) as caught:
+        eng.validation._solve(tmp_path, 442_725, what="static")
+
+    msg = str(caught.value)
+    assert "insufficient_memory" in msg
+    d = caught.value.details
+    assert d["failure_kind"] == "insufficient_memory"
+    assert d["nodes"] == 442_725
+    assert d["available_mb"] == 6048.1
+    assert d["shortfall_mb"] == pytest.approx(1860.5, abs=0.2)
+    assert d["refused_before_solving"] is True
+    # No solver ran, so there is no timing. Inventing one - even a censored
+    # one - would put a fictional point in reach of the cost model.
+    assert "solve_seconds" not in d and "solve_seconds_at_kill" not in d
+    assert "peak_rss_mb" not in d
+
+
+def test_a_solve_that_fits_is_not_blocked(tmp_path, monkeypatch):
+    """The gate must not become a reason work does not happen."""
+    eng = DesignEngine(tmp_path / "data")
+    monkeypatch.setattr(eng.validation, "_knowledge",
+                        lambda: _FakeKB(high_mb=1200.0, avail=6048.1))
+
+    class _Ok:
+        returncode = 0
+        stdout = "Job finished"
+        peak_rss_mb = 1100.0
+
+    monkeypatch.setattr(fea_mod, "_run_solver",
+                        lambda cmd, cwd, env, timeout_s: _Ok())
+    proc, binary, threads, seconds = eng.validation._solve(
+        tmp_path, 60_000, what="static")
+    assert proc.returncode == 0
+    assert not (tmp_path / "memory_warning.txt").exists()
+
+
+def test_a_thin_history_does_not_gate(tmp_path, monkeypatch):
+    """Refusing on absent knowledge would be worse than not gating at all."""
+    eng = DesignEngine(tmp_path / "data")
+    monkeypatch.setattr(eng.validation, "_knowledge",
+                        lambda: _FakeKB(high_mb=None, avail=100.0))
+
+    class _Ok:
+        returncode = 0
+        stdout = "Job finished"
+        peak_rss_mb = 10.0
+
+    monkeypatch.setattr(fea_mod, "_run_solver",
+                        lambda cmd, cwd, env, timeout_s: _Ok())
+    eng.validation._solve(tmp_path, 900_000, what="static")   # must not raise
+
+
+def test_unreadable_available_memory_does_not_gate(tmp_path, monkeypatch):
+    """available_memory_mb() uses a Windows API and returns None elsewhere.
+    An unknown is not a refusal."""
+    eng = DesignEngine(tmp_path / "data")
+    monkeypatch.setattr(eng.validation, "_knowledge",
+                        lambda: _FakeKB(high_mb=99_000.0, avail=None))
+
+    class _Ok:
+        returncode = 0
+        stdout = "Job finished"
+        peak_rss_mb = 10.0
+
+    monkeypatch.setattr(fea_mod, "_run_solver",
+                        lambda cmd, cwd, env, timeout_s: _Ok())
+    eng.validation._solve(tmp_path, 900_000, what="static")   # must not raise
+
+
+def test_a_solve_that_will_page_is_allowed_but_flagged(tmp_path, monkeypatch):
+    """A slow answer is still an answer, so this band is recorded, not refused.
+
+    5,091 MB predicted against 5,484 MB free is the real 2026-09-02 case: it
+    completed, in 1282 s against a 259 s upper bound.
+    """
+    eng = DesignEngine(tmp_path / "data")
+    monkeypatch.setattr(eng.validation, "_knowledge",
+                        lambda: _FakeKB(high_mb=5091.0, avail=5484.0))
+
+    class _Slow:
+        returncode = 0
+        stdout = "Job finished"
+        peak_rss_mb = 5986.1
+
+    monkeypatch.setattr(fea_mod, "_run_solver",
+                        lambda cmd, cwd, env, timeout_s: _Slow())
+    eng.validation._solve(tmp_path, 297_794, what="static")
+    warn = (tmp_path / "memory_warning.txt").read_text(encoding="utf-8")
+    assert "paging risk" in warn
+    assert "5091" in warn and "5484" in warn
+
+
+def test_the_gate_reaches_every_solve_kind(tmp_path, monkeypatch):
+    """It sits in _solve, which static, buckling, modal and every submodel
+    rung all pass through. Pinned so a future caller cannot route around it."""
+    import inspect
+    src = inspect.getsource(fea_mod.ValidationTools._solve)
+    assert "_memory_gate" in src
+    gate_line = next(i for i, ln in enumerate(src.splitlines())
+                     if "_memory_gate" in ln)
+    run_line = next(i for i, ln in enumerate(src.splitlines())
+                    if "_run_solver(" in ln)
+    assert gate_line < run_line, "the gate must precede the solver call"
