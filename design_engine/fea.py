@@ -1839,6 +1839,7 @@ class ValidationTools:
                      reason: str, *, feature_mm: float,
                      standoff_elements: float, standoff_source: str = "",
                      centre=None, start_mesh_mm: float | None = None,
+                     base_mesh_mm: float | None = None,
                      max_projection_mm: float = 0.0,
                      ladder_steps: int = 3,
                      ladder_factor: float = 2.0, tol_pct: float = 5.0) -> dict:
@@ -1961,6 +1962,31 @@ class ValidationTools:
                 float(start_mesh_mm or case["mesh"]["max_size_mm"]), region,
                 steps=ladder_steps, factor=ladder_factor)
 
+            # The BACKGROUND size, away from the refined ball. Distinct from
+            # `ladder[0]` on purpose: they used to be the same value, which
+            # made the ball on rung one exactly as big as the background and
+            # turned the grading into a no-op precisely where the mesh is
+            # largest in extent.
+            #
+            # The default is one ladder step COARSER than the coarsest rung, so
+            # rung one is graded on the same terms as every later rung rather
+            # than being the one anomaly. It is only a default: the background
+            # still has to mesh whatever geometry lies OUTSIDE the ball, and on
+            # a blend-clean part the blend runs the length of an edge rather
+            # than sitting at a point, so it may not be coarsenable at all.
+            # When that happens `mesh_step`'s Jacobian gate refuses in seconds
+            # and names the feature - which is a better failure than meshing a
+            # million nodes and discovering it 40 minutes later - and the
+            # caller passes an explicit `base_mesh_mm`.
+            base_mm = float(base_mesh_mm if base_mesh_mm is not None
+                            else ladder[0] * ladder_factor)
+            if base_mm < ladder[0]:
+                raise FeaError(
+                    f"base_mesh_mm {base_mm:g} is FINER than the coarsest rung "
+                    f"{ladder[0]:g}, so the background would be denser than "
+                    f"the refinement it surrounds. The base sets the size away "
+                    f"from the feature and must be the coarser of the two")
+
             # MEASURED 2026-08-28. ccx 2.23 win-x64 *SUBMODEL interpolation is
             # PROHIBITIVELY SLOW, and superlinear in the number of driven
             # nodes. Holding one C3D10 submodel mesh fixed and varying only
@@ -2016,8 +2042,8 @@ class ValidationTools:
                     step_path = run_dir / "submodel.step"
                     import cadquery as cq              # noqa: PLC0415
                     cq.exporters.export(cut, str(step_path))
-                    # GRADED, not uniform. The coarsest rung sets the size at
-                    # the cut; each rung refines only a ball around the feature.
+                    # GRADED, not uniform: `base_mm` sets the size away from the
+                    # feature and each rung refines only a ball around it.
                     #
                     # Uniform refinement forces a choice the submodel should not
                     # have to make: stand the cut far enough off that the peak is
@@ -2027,7 +2053,17 @@ class ValidationTools:
                     # buys both. Measured on a plain bar: 0.8 mm everywhere is
                     # 303,191 nodes, 0.8 mm inside an 8 mm ball is 40,928 - the
                     # same resolution where it matters at a seventh of the cost.
-                    m = mesh_step(str(step_path), ladder[0], None,
+                    #
+                    # The base used to be `ladder[0]`, the coarsest RUNG. On rung
+                    # one those are the same number, so the ball matched the
+                    # background and the grading was a no-op: the whole region
+                    # meshed at the finest size the ladder would ever use there.
+                    # That made the COARSEST rung the most expensive, inverting
+                    # the point of a ladder. Measured 2026-09-02 on the jetpack
+                    # junction: rung one alone reached 1,176,235 nodes over an
+                    # 80 mm region and timed out at 2402 s / 7,246 MB having
+                    # resolved nothing. See `base_mesh_mm` for the default.
+                    m = mesh_step(str(step_path), base_mm, None,
                                   refine={"centre": peak_xyz,
                                           "radius": max(2.0 * feature_mm,
                                                         6.0 * mm),
@@ -2095,7 +2131,15 @@ class ValidationTools:
                     pk = by_tag.get(int(peak_node))
                     on_driven = int(peak_node) in set(int(t) for t in driven)
                     peaks.append(peak_vm)
-                    rungs.append({"mesh_mm": mm, "coarse_mm": ladder[0], "nodes": len(m["node_tags"]),
+                    rungs.append({"mesh_mm": mm, "coarse_mm": ladder[0],
+                                  # The background actually meshed, which is
+                                  # what decides the node count away from the
+                                  # feature. Recorded because `coarse_mm` used
+                                  # to be both this AND the coarsest rung, and
+                                  # a reader could not tell a graded rung from
+                                  # a uniform one.
+                                  "base_mm": base_mm,
+                                  "nodes": len(m["node_tags"]),
                                   "projected_nodes": len(interp["projected"]),
                                   "worst_projection_mm": (
                                       max((x["gap_mm"] for x in interp["projected"]),

@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from design_engine.mesh import mesh_step
+from design_engine.mesh import MeshError, mesh_step
 
 from design_engine.singularity import RefinementRefused
 from design_engine.submodel import (SUGGESTED_STANDOFF,
@@ -402,3 +402,54 @@ def test_a_study_that_does_not_converge_closes_FAIL_not_unknown(solved):
     assert row["result"] == "fail"
     assert "convergence_not_established" in row["failure_mode"]
     assert "not the part failing a limit state" in row["failure_mode"]
+
+# ------------------------------------------------- the ladder's background size
+# Added 2026-09-02. The background used to be `ladder[0]`, the coarsest RUNG.
+# On rung one those are the same number, so the refined ball was exactly as big
+# as the background and the grading did nothing -- the whole region meshed at
+# the finest size it would ever use there, making the COARSEST rung the most
+# expensive and inverting the point of a ladder. On the jetpack junction rung
+# one alone reached 1,176,235 nodes and timed out at 2402 s having resolved
+# nothing.
+
+def test_the_background_is_coarser_than_every_rung_including_the_first():
+    """The regression. base == ball on any rung means no grading on that rung."""
+    ladder = refinement_ladder(0.8, _region(feature_mm=10.0), steps=3, factor=2.0)
+    base = ladder[0] * 2.0                      # the shipped default
+    for rung in ladder:
+        assert base > rung, (
+            f"background {base} is not coarser than rung {rung}; the ball would "
+            f"match the background and the grading would be a no-op there")
+
+
+def test_grading_actually_reduces_the_node_count(tmp_path):
+    """The claim behind the fix, measured rather than asserted.
+
+    A ball of the rung size inside a coarser background must produce fewer
+    nodes than that rung size everywhere. If it does not, the Ball field is not
+    being applied and the fix is cosmetic.
+    """
+    cq = pytest.importorskip("cadquery")
+    step = tmp_path / "grading_probe.step"
+    cq.exporters.export(cq.Workplane("XY").box(40, 40, 40), str(step))
+
+    uniform = mesh_step(str(step), 0.8, None)
+    graded = mesh_step(str(step), 1.6, None,
+                       refine={"centre": [0.0, 0.0, 0.0], "radius": 8.0,
+                               "size": 0.8})
+    assert len(graded["node_tags"]) < len(uniform["node_tags"]), (
+        f"grading did not reduce the mesh: uniform "
+        f"{len(uniform['node_tags']):,} vs graded "
+        f"{len(graded['node_tags']):,}")
+
+
+def test_a_background_finer_than_its_refinement_is_refused(tmp_path):
+    """A background denser than the ball it surrounds is not a mesh anyone
+    asked for. mesh_step already refuses it; this pins that it still does,
+    because the new base_mesh_mm parameter is what could reintroduce it."""
+    cq = pytest.importorskip("cadquery")
+    step = tmp_path / "inverted.step"
+    cq.exporters.export(cq.Workplane("XY").box(20, 20, 20), str(step))
+    with pytest.raises(MeshError, match="COARSER than max_size_mm"):
+        mesh_step(str(step), 0.5, None,
+                  refine={"centre": [0.0, 0.0, 0.0], "radius": 5.0, "size": 1.0})
