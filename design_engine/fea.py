@@ -1107,7 +1107,8 @@ class ValidationTools:
                 self._kb = False
         return self._kb or None
 
-    def _memory_gate(self, n_nodes: int, run_dir: Path, what: str) -> None:
+    def _memory_gate(self, n_nodes: int, run_dir: Path, what: str,
+                     solver: str = "direct") -> None:
         """Refuse a solve the machine cannot hold, BEFORE spending it.
 
         The engine has had an accurate memory model since 2026-08-27 and never
@@ -1140,6 +1141,29 @@ class ValidationTools:
         kb = self._knowledge()
         if kb is None or not n_nodes:
             return
+
+        # The fitted model is built ENTIRELY from direct solves, because until
+        # 2026-09-03 there was no other kind. An iterative solver stores the
+        # matrix rather than its factor and measured 12-22% of the direct
+        # figure on the same meshes, so refusing an iterative run on this
+        # evidence would block work the machine can comfortably do - the exact
+        # failure this gate's docstring warns against.
+        #
+        # So it stays silent, and says why. Not a permanent answer: once
+        # iterative runs accumulate, `solver_equations` is already recorded on
+        # every observation, and the memory model can be scoped by solver the
+        # same way it is scoped by analysis type. Until then an unknown is not
+        # a refusal.
+        if solver != "direct":
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "memory_gate_skipped.txt").write_text(
+                f"memory gate not applied: it is fitted on direct solves and "
+                f"this run uses {solver!r}, which measured 12-22% of the "
+                f"direct memory on identical meshes. No prediction exists for "
+                f"this solver yet, and an unknown is not a refusal.\n",
+                encoding="utf-8")
+            return
+
         pred = kb.predict_memory(n_nodes)
         avail = kb.available_memory_mb()
         if not pred or avail is None:
@@ -1186,7 +1210,8 @@ class ValidationTools:
                 for i, ld in enumerate(case["loads"])]
 
     def _solve(self, run_dir: Path, n_nodes: int, *, force_single: bool = False,
-               what: str = "", require_finished: bool = True):
+               what: str = "", require_finished: bool = True,
+               solver: str = "direct"):
         """Run CalculiX on the deck in `run_dir`. Returns (run, binary, threads,
         seconds).
 
@@ -1207,7 +1232,7 @@ class ValidationTools:
         the log cannot even separate that case from the paging one.
         """
         binary, env, threads = self._solver_command(force_single=force_single)
-        self._memory_gate(n_nodes, run_dir, what)
+        self._memory_gate(n_nodes, run_dir, what, solver=solver)
         t0 = time.time()
         try:
             proc = _run_solver([str(binary), "-i", "job"], run_dir, env,
@@ -1725,7 +1750,7 @@ class ValidationTools:
             _write_inp(run_dir / "job.inp", m, case, constraint_sets, load_sets,
                        solver=solver)
             proc, binary, threads_used, solve_s = self._solve(
-                run_dir, si.nodes)
+                run_dir, si.nodes, solver=solver)
 
             blocks = _parse_frd(run_dir / "job.frd")
             stress = blocks.get("STRESS")
