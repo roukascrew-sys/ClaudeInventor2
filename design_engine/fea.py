@@ -1065,10 +1065,31 @@ class ValidationTools:
                            details={
                                "failure_kind": "solver_error",
                                "nodes": n_nodes,
-                               # This one DID run to completion, badly, so the
-                               # time and memory are real rather than censored.
-                               "solve_seconds": round(seconds, 3),
+                               # CENSORED, like a timeout, and for the same
+                               # reason. This was first written as a completed
+                               # measurement on the grounds that the process
+                               # "ran to completion, badly" — which is wrong: a
+                               # non-zero exit means ccx ABORTED, typically
+                               # mid-factorisation, and a clean exit without
+                               # "Job finished" means it stopped early too.
+                               # Either way the solve never finished, so the
+                               # time is a lower bound on what finishing costs.
+                               #
+                               # Caught on 2026-09-02 by the first real run
+                               # under this code: three global solves died at
+                               # 0xC0000005 having reached 442k-642k nodes in
+                               # 322-530 s. Recorded as completed, they would
+                               # have been the three largest meshes on file AND
+                               # among the fastest for their size — teaching the
+                               # cost model that huge meshes are cheap, which is
+                               # precisely the pathology the censoring flag was
+                               # added to prevent.
+                               "solve_seconds_at_kill": round(seconds, 3),
+                               "solve_seconds_is_lower_bound": True,
+                               # It died reaching for memory it could not get,
+                               # so the true requirement is above this figure.
                                "peak_rss_mb": proc.peak_rss_mb,
+                               "peak_rss_is_lower_bound": True,
                                "returncode": proc.returncode,
                                "solver_binary": binary.name,
                                "threads": threads,

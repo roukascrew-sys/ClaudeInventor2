@@ -242,14 +242,25 @@ class KnowledgeBase:
 
                 # A completed timing wins; a censored one is taken only when
                 # there is no completed one, and is flagged as what it is.
+                # A run that did not FINISH measured a lower bound, whichever
+                # key its timing happens to sit under. Deriving this from the
+                # failure kind rather than from the key name is deliberate:
+                # rows written before `_solve` learned to censor a crash put a
+                # real-looking `solve_seconds` on runs that died mid-solve, and
+                # a rule that trusted the key would ingest exactly those as the
+                # largest and fastest solves on file.
+                DID_NOT_FINISH = ("solver_timeout", "solver_error")
+                unfinished = d.get("failure_kind") in DID_NOT_FINISH
+
                 secs = _num(d.get("solve_seconds"))
-                cost_censored = 0
+                cost_censored = 1 if (secs is not None and unfinished) else 0
                 if secs is None:
                     secs = _num(d.get("solve_seconds_at_kill"))
                     cost_censored = 1 if secs is not None else 0
                 rss = _num(d.get("peak_rss_mb"))
                 mem_censored = 1 if (rss is not None
-                                     and d.get("peak_rss_is_lower_bound")) else 0
+                                     and (unfinished
+                                          or d.get("peak_rss_is_lower_bound"))) else 0
                 try:
                     self._conn.execute(
                         "INSERT INTO observations (source_action_id, ingested_at,"

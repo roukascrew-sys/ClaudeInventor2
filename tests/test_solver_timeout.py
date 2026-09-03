@@ -298,10 +298,17 @@ def test_a_timeout_with_no_measurement_records_none_not_zero(
     assert caught.value.details["peak_rss_mb"] is None
 
 
-def test_a_solver_error_records_a_real_time_not_a_censored_one(
+def test_a_crashed_solve_is_censored_too_not_treated_as_completed(
         tmp_path, monkeypatch):
-    """A solve that ran to completion badly DID cost what it cost. Recording
-    that under the censored key would throw away a usable observation."""
+    """A crash is not a completed measurement.
+
+    This test asserted the OPPOSITE when it was written, on the reasoning that
+    the process "ran to completion, badly". A non-zero exit means ccx aborted,
+    usually mid-factorisation, so the time is a lower bound on what finishing
+    costs — exactly like a timeout. Three real global solves died this way at
+    442k-642k nodes in 322-530 s; recorded as completed they would have been
+    the largest meshes on file and among the fastest for their size.
+    """
     eng = DesignEngine(tmp_path / "data")
 
     class _Bad:
@@ -319,8 +326,27 @@ def test_a_solver_error_records_a_real_time_not_a_censored_one(
     assert d["returncode"] == 3221225477
     assert d["peak_rss_mb"] == 8192.0
     assert d["nodes"] == 250_000
-    assert "solve_seconds" in d and "solve_seconds_at_kill" not in d
-    assert "solve_seconds_is_lower_bound" not in d
+    assert d["solve_seconds_is_lower_bound"] is True
+    assert d["peak_rss_is_lower_bound"] is True
+    assert "solve_seconds" not in d, (
+        "a crashed solve must not occupy the key a completed one uses")
+
+
+def test_a_clean_exit_without_finishing_is_censored_as_well(
+        tmp_path, monkeypatch):
+    """returncode 0 but no 'Job finished' means it stopped early. Same rule."""
+    eng = DesignEngine(tmp_path / "data")
+
+    class _Quiet:
+        returncode = 0
+        stdout = "*INFO reading input deck"     # never reports finishing
+        peak_rss_mb = 512.0
+
+    monkeypatch.setattr(fea_mod, "_run_solver",
+                        lambda cmd, cwd, env, timeout_s: _Quiet())
+    with pytest.raises(FeaError) as caught:
+        eng.validation._solve(tmp_path, 60_000, what="static")
+    assert caught.value.details["solve_seconds_is_lower_bound"] is True
 
 
 def test_the_action_wrapper_writes_failure_details_to_the_log(tmp_path):
