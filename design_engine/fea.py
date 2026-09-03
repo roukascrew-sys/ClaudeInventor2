@@ -43,6 +43,7 @@ from .mesh import (MeshError, describe_axis_options, mesh_step,
 from .parts import PartStore, _check_reason
 from .geometry import build as build_solid
 from .singularity import blend_resolution, classify_peak
+from . import symmetry
 from .submodel import (SubmodelError, coplanar_risk, converged,
                        cut_region, driven_nodes, plan,
                        refinement_ladder, solid_bounds,
@@ -75,12 +76,17 @@ class FeaError(RuntimeError):
 
 
 _CASE_KEYS = {"material", "mesh", "constraints", "loads", "limit_state",
-              "weld"}
+              "weld", "symmetry"}
 # `weld` is OPTIONAL: a machined or bonded part has no heat-affected zone, and
 # requiring an empty declaration from every case would be noise. _CASE_KEYS is
 # the ALLOWED set; this is the REQUIRED one, and they were the same set until
 # HAZ arrived.
-_REQUIRED_CASE_KEYS = _CASE_KEYS - {"weld"}
+#
+# `symmetry` is optional for a different reason: solving the WHOLE part is
+# always correct, and a half model is an optimisation the caller opts into and
+# must then justify. Making it required would invert that - the default has to
+# be the answer that needs no assumption.
+_REQUIRED_CASE_KEYS = _CASE_KEYS - {"weld", "symmetry"}
 _MATERIAL_KEYS = {"name", "E_MPa", "nu", "yield_MPa", "source",
                   "fatigue",
                   "service_temp_C", "yield_derate_curve", "E_derate_curve",
@@ -415,9 +421,44 @@ def _consistent_face_loads(mesh: dict, selected_tags, force_total_N: list,
     return nodal
 
 
+#: Solvers this deck writer will emit, and what each one costs.
+#:
+#: CalculiX defaults to a DIRECT sparse factorisation, and until 2026-09-03
+#: this writer emitted no `SOLVER=` at all, so every run this project has ever
+#: done used it. A direct solve stores the factor, whose fill-in for a 3D solid
+#: is far larger than the matrix itself, and that fill-in is what has been
+#: ending runs: 442,725 / 528,439 / 642,603-node solves all died at
+#: `0xC0000005` reaching for 7-9 GB, and a 420,896-node submodel was predicted
+#: at 7,498 MB against 3,662 MB free.
+#:
+#: An iterative solver stores essentially the matrix, so its memory is O(nnz)
+#: rather than O(fill-in). It is not free: PCG converges slowly or not at all
+#: on ill-conditioned problems, and a solve that silently under-converges
+#: returns a WRONG displacement field with no error - which is the failure mode
+#: this project cares most about. So it is opt-in, never the default, and
+#: `tests/test_solver_iterative.py` pins one case solved both ways.
+#: How close a node must be to the symmetry plane to be held by it. The cut
+#: face is exact in the CAD kernel and gmsh places nodes on it exactly, so this
+#: is float dust rather than a fit-up tolerance. Loose enough to survive a STEP
+#: round-trip, far tighter than any element.
+_SYM_NODE_TOL_MM = 1e-6
+
+_SOLVERS = {
+    # CalculiX's default. No card emitted, so existing decks are byte-identical.
+    "direct": None,
+    # Diagonally scaled conjugate gradient. Lowest memory, weakest
+    # preconditioner.
+    "iterative_scaling": "SOLVER=ITERATIVE SCALING",
+    # Incomplete-Cholesky preconditioned CG. More memory than SCALING, far
+    # better conditioned, still far below a direct factorisation.
+    "iterative_cholesky": "SOLVER=ITERATIVE CHOLESKY",
+}
+
+
 def _write_inp(path: Path, mesh: dict, case: dict,
                constraint_sets: list, load_sets: list,
-               analysis: str = "static", n_modes: int = 4) -> None:
+               analysis: str = "static", n_modes: int = 4,
+               solver: str = "direct") -> None:
     mat = case["material"]
     lines = ["*HEADING", f"design-engine fea_static, material {mat['name']}",
              "*NODE, NSET=NALL"]
@@ -463,11 +504,38 @@ def _write_inp(path: Path, mesh: dict, case: dict,
         # eigenfrequencies land in the .dat.
         lines += ["*FREQUENCY, STORAGE=0", str(int(n_modes))]
     else:
-        lines.append("*STATIC")
+        # The solver choice rides on the *STATIC card. Only static: CalculiX's
+        # iterative solvers are for linear equation systems, and *BUCKLE and
+        # *FREQUENCY are eigenvalue problems that use their own path - asking
+        # for one there would be silently ignored at best.
+        if solver not in _SOLVERS:
+            raise FeaError(
+                f"unknown solver {solver!r}; have {sorted(_SOLVERS)}")
+        opt = _SOLVERS[solver]
+        lines.append("*STATIC" if opt is None else f"*STATIC, {opt}")
     lines.append("*BOUNDARY")
     for i, c in enumerate(case["constraints"]):
         for dof in c["dof"]:
             lines.append(f"FIX{i}, {dof}, {dof}, 0.")
+    # The symmetry condition, and it is the whole method in two lines: hold the
+    # NORMAL displacement at zero on the cut face and the solver behaves as
+    # though the discarded half were there, mirrored. In-plane motion stays
+    # free - clamping it would restrain the model far more than its mirror
+    # image ever did and quietly stiffen the answer.
+    plane = symmetry.parse(case.get("symmetry"))
+    if plane is not None:
+        tags = symmetry.plane_nodes(mesh, plane, tol=_SYM_NODE_TOL_MM)
+        if not tags:
+            raise FeaError(
+                f"symmetry_plane_empty: no mesh node lies within "
+                f"{_SYM_NODE_TOL_MM:g} mm of {plane.axis}={plane.at:g}, so the "
+                f"symmetry condition would restrain nothing and the half model "
+                f"would be free to move through its own mirror plane")
+        lines.append("*NSET, NSET=SYMPLANE")
+        lines += [", ".join(str(t) for t in tags[j:j + 8])
+                  for j in range(0, len(tags), 8)]
+        lines.append("*BOUNDARY")
+        lines.append(f"SYMPLANE, {plane.dof}, {plane.dof}, 0.")
     if analysis != "frequency":
         lines.append("*CLOAD")
     for nodal in (load_sets if analysis != "frequency" else []):
@@ -854,9 +922,15 @@ class _SolveInputs:
     of them.
     """
 
-    __slots__ = ("part", "run_dir", "mesh", "constraint_sets", "rbm")
+    __slots__ = ("part", "run_dir", "mesh", "constraint_sets", "rbm",
+                 # None unless a symmetry cut was asked for AND demonstrated.
+                 # `symmetry` carries the evidence so the log records why the
+                 # cut was allowed, not merely that it happened.
+                 "symmetry", "plane")
 
     def __init__(self, part, run_dir, mesh, constraint_sets, rbm):
+        self.symmetry = None
+        self.plane = None
         self.part = part
         self.run_dir = run_dir
         self.mesh = mesh
@@ -982,12 +1056,32 @@ class ValidationTools:
             raise FeaError(f"ccx solver not found at {self.ccx_path}")
         part = self.parts.get_part(geometry_id)
         run_dir = self._next_run_dir()
-        m = mesh_step(part["step_file_path"], case["mesh"]["max_size_mm"],
+
+        # SYMMETRY, if the caller asked for it and can demonstrate it. The
+        # verification runs BEFORE anything is cut or meshed, because its whole
+        # purpose is to stop a cut that would produce a converged, plausible,
+        # wrong answer - and after the mesh exists that money is already spent.
+        plane = symmetry.parse(case.get("symmetry"))
+        step_path, sym_evidence = part["step_file_path"], None
+        if plane is not None:
+            solid = build_solid(part["spec"])
+            sym_evidence = symmetry.verify(solid, case, plane)
+            half, cut_report = symmetry.cut_half(solid, plane)
+            sym_evidence["cut"] = cut_report
+            import cadquery as cq                    # noqa: PLC0415
+            step_path = str(run_dir / "half.step")
+            run_dir.mkdir(parents=True, exist_ok=True)
+            cq.exporters.export(cq.Workplane(obj=half), step_path)
+
+        m = mesh_step(step_path, case["mesh"]["max_size_mm"],
                       case["mesh"].get("min_size_mm"))
         constraint_sets = [select_nodes(m, c["where"])
                            for c in case["constraints"]]
         rbm = check_rigid_body_modes(m, constraint_sets, case["constraints"])
-        return _SolveInputs(part, run_dir, m, constraint_sets, rbm)
+        si = _SolveInputs(part, run_dir, m, constraint_sets, rbm)
+        si.symmetry = sym_evidence
+        si.plane = plane
+        return si
 
     #: Below this fraction of free memory the solve is expected to fit outright.
     #: Above it the solve still starts, but the run is flagged: the machine can
@@ -1205,6 +1299,8 @@ class ValidationTools:
         require_finished=False: a *BUCKLE step does not print the "Job
         finished" banner that a *STATIC step does.
         """
+        symmetry.assert_static_only("buckle",
+                                    symmetry.parse(case.get("symmetry")))
         _write_inp(run_dir / "job.inp", m, case, constraint_sets, load_sets,
                    analysis="buckle", n_modes=n_modes)
         proc, binary, threads, _seconds = self._solve(
@@ -1532,6 +1628,8 @@ class ValidationTools:
             si = self._prepare(geometry_id, case)
             m, run_dir = si.mesh, si.run_dir
 
+            symmetry.assert_static_only("frequency",
+                                        symmetry.parse(case.get("symmetry")))
             _write_inp(run_dir / "job.inp", m, case, si.constraint_sets, [],
                        analysis="frequency", n_modes=n_modes)
             # force_single: an eigenvalue solve is never multithreaded here,
@@ -1598,14 +1696,34 @@ class ValidationTools:
                 "harmonics_checked": checked,
                 "clashes": clashes}
 
-    def fea_static(self, geometry_id: str, case: dict, reason: str) -> dict:
+    def fea_static(self, geometry_id: str, case: dict, reason: str,
+                   solver: str = "direct") -> dict:
+        """Linear static solve.
+
+        `solver` selects the equation solver; see `_SOLVERS`. It defaults to
+        `direct` so nothing changes without being asked for, and the choice is
+        recorded in the result, because a displacement field from an
+        under-converged iterative solve looks exactly like a converged one.
+        """
         with self._action("fea_static", geometry_id, reason) as action_id:
             _check_reason(reason)
             si = self._prepare(geometry_id, case)
             m, run_dir, part = si.mesh, si.run_dir, si.part
             constraint_sets, rbm = si.constraint_sets, si.rbm
+            # A load whose selector is its own mirror image spans BOTH
+            # halves - most often a face that straddles the plane, not a load
+            # sitting on it - and `force_total_N` is a total, so the kept half
+            # carries half of it. Omitting this is a clean factor of two:
+            # measured 2026-09-03, a cantilever loaded on its whole top face
+            # returned 3.86490 mm against the whole model's 1.93236 mm.
+            if si.plane is not None:
+                case = dict(case)
+                case["loads"] = symmetry.halve_shared_loads(
+                    case["loads"], si.plane, si.symmetry["loads"]["shared"])
+                si.symmetry["loads"]["halved"] = si.symmetry["loads"]["shared"]
             load_sets = self._face_loads(m, case)
-            _write_inp(run_dir / "job.inp", m, case, constraint_sets, load_sets)
+            _write_inp(run_dir / "job.inp", m, case, constraint_sets, load_sets,
+                       solver=solver)
             proc, binary, threads_used, solve_s = self._solve(
                 run_dir, si.nodes)
 
@@ -1739,8 +1857,20 @@ class ValidationTools:
                 **si.provenance(),
                 "result_records": {"disp": len(disp), "stress": len(stress)},
                 "equilibrium": equilibrium,
+                # Present only when a symmetry cut was applied, and it carries
+                # the evidence that permitted it: the volume balance, the
+                # matched load pairs, the matched restraints. A halved model
+                # reports HALF of every extensive quantity, so the cut report's
+                # extensive_factor travels with the result rather than living
+                # in someone's head.
+                "symmetry": si.symmetry,
                 "solver_binary": binary.name,
                 "solver_threads": threads_used,
+                # WHICH equation solver, not just which executable. An
+                # under-converged iterative solve returns a plausible-looking
+                # displacement field and no error, so a number carried out of
+                # here must say how it was obtained or it cannot be audited.
+                "solver_equations": solver,
                 "solve_seconds": round(solve_s, 2),
                 # None, never 0, when the platform cannot report it: a missing
                 # measurement must stay distinguishable from a real zero, or a
@@ -1784,6 +1914,17 @@ class ValidationTools:
             "thermal_derating": eff,
             "artifacts": [png_rel],
             "run_dir": str(run_dir),
+            # What the run COST, by the same argument as the allowable above:
+            # these lived only in the log, so any caller wanting to compare two
+            # runs had to go to the database for numbers it had just computed.
+            # `solver_equations` rides along because an iterative solve that
+            # under-converges returns a plausible field and no error, so the
+            # method must travel with the answer.
+            "nodes": details["nodes"],
+            "elements": details["elements"],
+            "solve_seconds": details["solve_seconds"],
+            "peak_rss_mb": details["peak_rss_mb"],
+            "solver_equations": details["solver_equations"],
         }
 
     # ------------------------------------------------------------ submodel
