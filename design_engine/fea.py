@@ -1929,8 +1929,58 @@ class ValidationTools:
                 "artifacts": [png_rel],
             }
             passed = sf >= required
+
+            # A SAFETY FACTOR DIVIDED BY AN UNCONVERGED STRESS IS NOT ONE.
+            #
+            # `classify_peak` above already decides whether the peak sits on a
+            # geometric singularity, where linear elasticity has NO finite
+            # stress (Williams 1952: sigma ~ r^(lambda-1), unbounded as h -> 0).
+            # Until 2026-09-30 that verdict was computed, logged, and then
+            # ignored by the gate: every jetpack junction run reported
+            # `singular`, peak 0.4894 mm from the corner, and a safety factor
+            # was published anyway - SF 3.7827 on a number whose value is set
+            # by the mesh size.
+            #
+            # The project's own rule is that a safety factor is only meaningful
+            # if the stress it derives from converges. So it is refused here
+            # rather than reported. This is deliberately a REFUSAL of the pass,
+            # not a strength failure: the part may well be fine, and the
+            # failure_mode says so, because "fail" on a row about a sound part
+            # is exactly what a later reader misreads.
+            #
+            # Blend the corner (the engine will then classify it `clean`), or
+            # gate on a limit state whose stress is defined at a weld - a
+            # nominal or structural stress - rather than on a notch peak.
+            sing_verdict = (singularity or {}).get("verdict")
+            gate_undefined = (ls_name in ("yield_von_mises",
+                                          "thermal_derated_yield")
+                              and sing_verdict == "singular")
+            if gate_undefined:
+                details["gate_undefined"] = {
+                    "reason": "peak_on_geometric_singularity",
+                    "limit_state": ls_name,
+                    "singularity": singularity,
+                    "reported_sf": round(sf, 6) if math.isfinite(sf) else None,
+                    "note": ("the safety factor is recorded for diagnosis and "
+                             "MUST NOT be used as a gate: its denominator has "
+                             "no converged value"),
+                }
+                passed = False
         if passed:
             self.log.close_action(action_id, "pass", details=details)
+        elif gate_undefined:
+            self.log.close_action(
+                action_id, "fail", details=details,
+                failure_mode=(
+                    f"limit_state_undefined: {ls_name} divides by a peak "
+                    f"stress that does not converge. The peak sits "
+                    f"{(singularity or {}).get('nearest_mm')} mm from a "
+                    f"geometric singularity, where linear elasticity has no "
+                    f"finite stress, so SF={sf:.3f} is set by the mesh size "
+                    f"rather than by the structure. This is the GATE being "
+                    f"inapplicable, NOT the part failing a limit state - blend "
+                    f"the corner, or gate on a stress that is defined at a "
+                    f"weld rather than on a notch peak"))
         else:
             # non-linear gate: mode + magnitude recorded BEFORE control returns
             self.log.close_action(
