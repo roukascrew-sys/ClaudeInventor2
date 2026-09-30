@@ -24,7 +24,7 @@ class MeshError(RuntimeError):
     pass
 
 
-def mesh_step(step_path: str | Path, max_size_mm: float,
+def _mesh_once(step_path: str | Path, max_size_mm: float,
               min_size_mm: float | None = None,
               refine: dict | None = None) -> dict:
     """Mesh a STEP file. Returns {'node_tags', 'coords', 'connectivity'}.
@@ -100,9 +100,37 @@ def mesh_step(step_path: str | Path, max_size_mm: float,
             gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
             gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
             gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
+        # Optimises the LINEAR tets, which is not the same thing as the
+        # high-order repair below: it runs before setOrder(2) and so cannot
+        # undo an inversion that curving introduces.
         gmsh.option.setNumber("Mesh.Optimize", 1)
         gmsh.model.mesh.generate(3)
         gmsh.model.mesh.setOrder(2)
+
+        # REPAIR CURVED ELEMENTS, then let check_element_quality judge.
+        #
+        # setOrder(2) inserts midside nodes and projects them onto the CAD
+        # surface. Where curvature is high relative to the element, that
+        # projection can push a midside node far enough to invert the element -
+        # so a mesh whose linear tets were all sound acquires a negative
+        # Jacobian purely from being curved, and refining can create the
+        # problem rather than remove it.
+        #
+        # Measured on the jetpack junction 2026-09-30: the 0.4 mm ladder rung
+        # produced ONE non-positive element in 1,329,310 (worst -0.131), which
+        # discarded the whole mesh. A marginal negative on 0.000075% of
+        # elements is the signature of curving, not of a mesh too coarse for
+        # its features - the 0.8 mm rung immediately before it was fine.
+        #
+        # gmsh's "HighOrderFast" pass exists for exactly this. It is attempted
+        # rather than assumed: the gate below still has the final say, so a
+        # failed or unavailable optimiser degrades to the previous behaviour
+        # instead of quietly passing a bad mesh.
+        try:
+            gmsh.option.setNumber("Mesh.HighOrderOptimize", 4)  # fast curving
+            gmsh.model.mesh.optimize("HighOrderFast", force=True)
+        except Exception:                        # pragma: no cover - gmsh build
+            pass
 
         node_tags, coords, _ = gmsh.model.mesh.getNodes()
         coords = np.asarray(coords, dtype=float).reshape(-1, 3)
@@ -127,6 +155,79 @@ def mesh_step(step_path: str | Path, max_size_mm: float,
     mesh["quality"] = check_element_quality(
         mesh, float(refine["size"]) if refine else max_size_mm)
     return mesh
+
+
+#: Deterministic size perturbations tried when a mesh is refused for CURVED
+#: high-order elements. Deterministic, not random, so the same request always
+#: produces the same mesh - the evaluation cache keys on the request, and a
+#: mesh that varied run to run would make a cached safety factor meaningless.
+#:
+#: Measured on the jetpack junction 2026-09-30, base 1.6 mm, ball at 0.40 mm:
+#:
+#:   0.40  refused  1 bad of   988,697  worst -0.6854
+#:   0.41  refused  2 bad of   931,610  worst -0.228
+#:   0.39  refused  1 bad of 1,050,139  worst -0.01425
+#:   0.42  MESHED   0 bad of   881,852  worst +0.01369
+#:   0.38  refused  3 bad of 1,115,644  worst -0.8486
+#:
+#: The bad count goes 1, 2, 1, 0, 3 with no trend. Refinement does not
+#: monotonically improve it, which is what distinguishes a stochastic
+#: tetrahedralisation artefact from a mesh genuinely too coarse for a feature -
+#: and it is why retrying the SAME size would be pointless while retrying a
+#: nudged one works.
+_RETRY_FACTORS = (1.0, 1.05, 0.95, 1.10, 0.90)
+
+
+def mesh_step(step_path: str | Path, max_size_mm: float,
+              min_size_mm: float | None = None,
+              refine: dict | None = None) -> dict:
+    """Mesh, retrying a nudged size when curving inverts a few elements.
+
+    A single inverted curved element out of a million is not a resolution
+    failure and cannot be refined away - see `_RETRY_FACTORS` for the
+    measurement. It is also not something to tolerate: CalculiX aborts on a
+    non-positive Jacobian, so a "tolerant" gate would trade a loud refusal for
+    a failed solve, or worse a silent wrong answer. So the mesh is REPAIRED by
+    asking gmsh for a slightly different size, and the gate keeps its veto.
+
+    Only the curving class is retried. A mesh genuinely too coarse for a thin
+    feature is refused on the first attempt, because nudging the size by 5%
+    will not fix it and five attempts would just cost five times as long to say
+    so.
+
+    `quality["size_requested"]`, `["size_used"]` and `["retries"]` record what
+    actually happened. Nothing here is allowed to be silent: a caller that
+    recorded the requested size while the mesh was built at another would put a
+    wrong number in the log, and the log is the source of truth.
+    """
+    target = float(refine["size"]) if refine else float(max_size_mm)
+    last: MeshError | None = None
+    for attempt, factor in enumerate(_RETRY_FACTORS):
+        scale = float(factor)
+        size = max_size_mm * scale
+        ref = dict(refine) if refine else None
+        if ref is not None:
+            ref["size"] = float(ref["size"]) * scale
+        try:
+            mesh = _mesh_once(step_path, size, min_size_mm, ref)
+        except MeshError as exc:
+            last = exc
+            # Only a curving refusal is worth another attempt; anything else
+            # (too coarse, no tets, a bad selector) is deterministic.
+            if not getattr(exc, "curving", False):
+                raise
+            continue
+        q = mesh["quality"]
+        q["size_requested"] = target
+        q["size_used"] = float(ref["size"]) if ref else size
+        q["retries"] = attempt
+        return mesh
+    raise MeshError(
+        f"degenerate_mesh_after_retries: {len(_RETRY_FACTORS)} sizes tried "
+        f"around {target:g} mm (factors {list(_RETRY_FACTORS)}) and every one "
+        f"produced a non-positive Jacobian. This is no longer a nudge away from "
+        f"working. Last refusal: {last}") from last
+
 
 
 # 4-point Gauss rule for tetrahedra, plus the 4 corners. Checking only corner
@@ -182,12 +283,46 @@ def check_element_quality(mesh: dict, max_size_mm: float) -> dict:
              "min_jacobian": float(min_per_elem.min()),
              "degenerate_elements": int(len(bad))}
     if len(bad):
-        raise MeshError(
-            f"degenerate_mesh: {len(bad)} of {len(conn)} elements have a "
-            f"non-positive Jacobian (worst {min_per_elem.min():.4g}); CalculiX "
-            f"would abort on these. The mesh size ({max_size_mm} mm) is too "
-            f"coarse for the smallest feature — reduce case.mesh.max_size_mm "
-            f"below the thinnest wall/radius, or thicken that feature.")
+        # The remedy depends on WHICH failure this is, and the two point in
+        # opposite directions. Guessing sent a reader the wrong way on
+        # 2026-09-30: one bad element in 1,329,310 at the 0.4 mm ladder rung
+        # was reported as "too coarse for the smallest feature - reduce
+        # max_size_mm", when refining from 0.8 mm is what produced it.
+        #
+        # A few marginal negatives are curved high-order elements that
+        # `optimize("HighOrderFast")` could not straighten. Many, or badly
+        # negative, is a mesh genuinely too coarse for a thin feature - the
+        # earlier real cases were -445.1, -16.02 and -12.8 across dozens of
+        # elements.
+        frac = len(bad) / max(1, len(conn))
+        worst = float(min_per_elem.min())
+        curving = frac < 1e-3 and worst > -1.0
+        if curving:
+            cause = (f"only {len(bad)} of {len(conn)} elements ({frac * 100:.5f}%) "
+                     f"and the worst is {worst:.4g}, marginally negative. That is "
+                     f"the signature of a CURVED high-order element that midside "
+                     f"projection inverted, not of a mesh too coarse for its "
+                     f"features - gmsh's HighOrderFast pass has already been "
+                     f"tried and could not straighten it. Refining further is as "
+                     f"likely to create another one as to remove this one. "
+                     f"Perturb the mesh size slightly (a few percent, in either "
+                     f"direction), or relax the local curvature")
+        else:
+            cause = (f"{len(bad)} of {len(conn)} elements ({frac * 100:.3f}%), "
+                     f"worst {worst:.4g}. The mesh size ({max_size_mm} mm) is too "
+                     f"coarse for the smallest feature - reduce "
+                     f"case.mesh.max_size_mm below the thinnest wall/radius, or "
+                     f"thicken that feature")
+        err = MeshError(
+            f"degenerate_mesh: {cause}. CalculiX would abort on these, so the "
+            f"mesh is refused rather than solved.")
+        # `mesh_step` retries a nudged size for the curving class ONLY. Carried
+        # on the exception rather than re-derived by the caller, so the
+        # classification and the decision cannot drift apart.
+        err.curving = bool(curving)
+        err.degenerate_elements = int(len(bad))
+        err.min_jacobian = worst
+        raise err
     return stats
 
 
