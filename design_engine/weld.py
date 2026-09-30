@@ -197,3 +197,284 @@ def _point_to_segment(p, a, b) -> float:
     t = ((p[0] - ax) * dx + (p[1] - ay) * dy + (p[2] - az) * dz) / L2
     t = max(0.0, min(1.0, t))
     return math.dist(p, (ax + t * dx, ay + t * dy, az + t * dz))
+
+
+# ===========================================================================
+# EN 1999-1-1 (Eurocode 9) 8.6.3.4 - design resistance in the heat-affected
+# zone of a connection.
+#
+# THIS IS A DIFFERENT CHECK FROM THE ONE ABOVE, AND THE DIFFERENCE MATTERS.
+#
+# `HeatAffectedZone.factor` above is rho_o,haz from 6.1.6: it softens the 0.2%
+# PROOF strength for a MEMBER check. That is correct for what it does, and this
+# project already applies it with four sourced factors.
+#
+# 8.6.3.4 is a CONNECTION check, and it is written against f_u,haz - the
+# ULTIMATE strength in the heat-affected zone - divided by gamma_Mw. Reading
+# across from one clause to the other is exactly the mistake this project made
+# once already in the other direction, so the two are kept apart in the code as
+# the standard keeps them apart on the page.
+#
+#     (8.42) butt welds, (8.43) fillet welds:
+#         sqrt(sigma_haz,Ed^2 + 3*tau_haz,Ed^2)  <=  f_u,haz / gamma_Mw
+#     checked at the fusion boundary (HAZ F) and at the toe of the weld
+#     (HAZ T), on the FULL CROSS SECTION.
+#
+#     8.6.2(3):  f_v,haz = f_u,haz / sqrt(3)
+#     Table 8.1: gamma_Mw = 1,25 recommended; a National Annex may set another.
+#
+# Source: EN 1999-1-1:2007+A1:2009, 8.6.3.4, Table 8.1, Table 3.2.
+#
+# NOT IMPLEMENTED, DELIBERATELY: the weld-METAL checks of 8.6.3.2 (butt) and
+# 8.6.3.3 (fillet), which go against f_w from Table 8.8 rather than f_u,haz.
+# Equation (8.33) is typeset as an image in the copy of the standard this was
+# read from and did not extract, so its exact form is not in hand. Writing it
+# from memory would put a wrong number behind a code reference, which is worse
+# than an absent check. `weld_static` therefore covers the HAZ and says so; it
+# is not a complete connection design.
+# ===========================================================================
+
+_ROLES = ("HAZ F", "HAZ T")
+
+# Table 3.2's HAZ columns are stated for MIG welding of material up to 15 mm
+# thick. Outside that the standard requires a further reduction, and this
+# engine does not hold its value. The condition is enforced rather than
+# footnoted because the jetpack crossbeam is 15.875 mm: the one part this was
+# built for is already outside the range, and a note in a docstring would not
+# have stopped it being used anyway.
+_HAZ_VALID_PROCESS = "MIG"
+_HAZ_VALID_THICKNESS_MM = 15.0
+
+_RESISTANCE_KEYS = {"f_u_haz_MPa", "source", "gamma_Mw", "gamma_Mw_source",
+                    "process", "thickness_mm", "reduction_factor",
+                    "reduction_factor_source"}
+_SECTION_KEYS = {"name", "role", "point_mm", "normal"}
+
+
+class WeldResistance:
+    """f_u,haz / gamma_Mw, with both numbers sourced and the validity checked.
+
+    Nothing here is embedded. f_u,haz depends on alloy, temper and product
+    form - EN 1999-1-1 Table 3.2 lists it row by row, and the sheet/plate row
+    and the extruded row of one alloy are not the same numbers. gamma_Mw is a
+    National Annex parameter. The engine demands both with a citation, the same
+    rule already applied to E, yield, the derating curves and the S-N detail
+    categories.
+    """
+
+    def __init__(self, spec: dict):
+        if not isinstance(spec, dict):
+            raise WeldError(
+                "case.limit_state.resistance: expected a dict carrying "
+                "f_u_haz_MPa, gamma_Mw and their sources")
+        unknown = set(spec) - _RESISTANCE_KEYS
+        if unknown:
+            raise WeldError(
+                f"case.limit_state.resistance: unexpected keys "
+                f"{sorted(unknown)} - allowed: {sorted(_RESISTANCE_KEYS)}")
+
+        f_u = spec.get("f_u_haz_MPa")
+        if not isinstance(f_u, (int, float)) or isinstance(f_u, bool) or f_u <= 0:
+            raise WeldError(
+                "case.limit_state.resistance.f_u_haz_MPa: required, > 0. This "
+                "is the ULTIMATE strength in the heat-affected zone, which is "
+                "what EN 1999-1-1 8.6.3.4 is written against - NOT the proof "
+                "strength rho_o,haz*f_o that 6.1.6 uses for member checks. "
+                "They are different clauses answering different questions, and "
+                "substituting one for the other mis-states the joint in "
+                "whichever direction the swap happens to fall")
+        src = spec.get("source")
+        if not isinstance(src, str) or not src.strip():
+            raise WeldError(
+                "case.limit_state.resistance.source: required - cite the row, "
+                "e.g. 'EN 1999-1-1:2007+A1:2009 Table 3.2, 6061 T6/T651 sheet "
+                "and plate, 12,5 < t <= 80 mm: f_u,haz = 175 N/mm2'. The "
+                "sheet/plate and extruded rows of one alloy carry different "
+                "numbers and the engine cannot tell which product form a spec "
+                "describes")
+
+        g = spec.get("gamma_Mw")
+        if not isinstance(g, (int, float)) or isinstance(g, bool):
+            raise WeldError(
+                "case.limit_state.resistance.gamma_Mw: required. EN 1999-1-1 "
+                "Table 8.1 recommends 1,25 for welded connections and a "
+                "National Annex may set another value, so it is declared "
+                "rather than assumed")
+        if g < 1.0:
+            raise WeldError(
+                f"case.limit_state.resistance.gamma_Mw: {g} is below 1,0, which "
+                f"would make the design resistance exceed the characteristic "
+                f"one. Table 8.1 recommends 1,25")
+        gsrc = spec.get("gamma_Mw_source")
+        if not isinstance(gsrc, str) or not gsrc.strip():
+            raise WeldError(
+                "case.limit_state.resistance.gamma_Mw_source: required - a "
+                "partial factor is a National Annex decision, so name the "
+                "annex, or cite Table 8.1's recommended value explicitly")
+
+        process = spec.get("process")
+        if not isinstance(process, str) or not process.strip():
+            raise WeldError(
+                "case.limit_state.resistance.process: required (e.g. 'MIG', "
+                "'TIG'). Table 3.2's HAZ columns are stated for MIG; TIG "
+                "softens more and needs a further reduction")
+        t = spec.get("thickness_mm")
+        if not isinstance(t, (int, float)) or isinstance(t, bool) or t <= 0:
+            raise WeldError(
+                "case.limit_state.resistance.thickness_mm: required, > 0 - the "
+                "thickness of the material being joined. Table 3.2's HAZ "
+                "columns are stated up to 15 mm, and the engine cannot read "
+                "the governing thickness off the geometry because which of two "
+                "joined parts governs is a judgement about the joint")
+
+        red = spec.get("reduction_factor")
+        redsrc = spec.get("reduction_factor_source")
+        outside = []
+        if process.strip().upper() != _HAZ_VALID_PROCESS:
+            outside.append(f"process {process!r} is not {_HAZ_VALID_PROCESS}")
+        if float(t) > _HAZ_VALID_THICKNESS_MM:
+            outside.append(f"thickness {float(t):g} mm exceeds "
+                           f"{_HAZ_VALID_THICKNESS_MM:g} mm")
+        if outside and red is None:
+            raise WeldError(
+                "case.limit_state.resistance: the tabulated HAZ strength is "
+                "outside its stated validity (" + "; ".join(outside) + "). "
+                "EN 1999-1-1 Table 3.2 gives f_u,haz for MIG welding up to "
+                "15 mm and requires a further reduction beyond that; this "
+                "engine does not hold that reduction and will not invent one. "
+                "Supply reduction_factor with reduction_factor_source, or "
+                "change the joint so the tabulated values apply. A refusal is "
+                "the correct outcome here rather than an obstacle: the "
+                "crossbeam this was built for is 15,875 mm and has been "
+                "outside the range of its own softening factor since the "
+                "factor was first sourced")
+        if red is not None:
+            if (not isinstance(red, (int, float)) or isinstance(red, bool)
+                    or not 0.0 < red <= 1.0):
+                raise WeldError(
+                    f"case.limit_state.resistance.reduction_factor: must be in "
+                    f"(0, 1], got {red!r}. It multiplies f_u,haz downward for a "
+                    f"joint outside the tabulated validity")
+            if not isinstance(redsrc, str) or not redsrc.strip():
+                raise WeldError(
+                    "case.limit_state.resistance.reduction_factor_source: "
+                    "required whenever a reduction factor is given. An "
+                    "unsourced reduction is the same failure as an unsourced "
+                    "strength, one step further from view")
+
+        self.f_u_haz_MPa = float(f_u)
+        self.source = src
+        self.gamma_Mw = float(g)
+        self.gamma_Mw_source = gsrc
+        self.process = process
+        self.thickness_mm = float(t)
+        self.reduction_factor = float(red) if red is not None else None
+        self.reduction_factor_source = redsrc
+        self.outside_validity = outside
+
+    @property
+    def f_u_haz_effective_MPa(self) -> float:
+        r = self.reduction_factor if self.reduction_factor is not None else 1.0
+        return self.f_u_haz_MPa * r
+
+    @property
+    def design_MPa(self) -> float:
+        """f_u,haz / gamma_Mw - the right-hand side of (8.42) and (8.43)."""
+        return self.f_u_haz_effective_MPa / self.gamma_Mw
+
+    @property
+    def shear_design_MPa(self) -> float:
+        """f_v,haz / gamma_Mw, with f_v,haz = f_u,haz / sqrt(3) per 8.6.2(3)."""
+        return self.design_MPa / math.sqrt(3.0)
+
+    def to_dict(self) -> dict:
+        return {
+            "clause": "EN 1999-1-1:2007+A1:2009 8.6.3.4",
+            "f_u_haz_MPa": self.f_u_haz_MPa,
+            "f_u_haz_source": self.source,
+            "reduction_factor": self.reduction_factor,
+            "reduction_factor_source": self.reduction_factor_source,
+            "f_u_haz_effective_MPa": round(self.f_u_haz_effective_MPa, 6),
+            "gamma_Mw": self.gamma_Mw,
+            "gamma_Mw_source": self.gamma_Mw_source,
+            "design_resistance_MPa": round(self.design_MPa, 6),
+            "shear_design_resistance_MPa": round(self.shear_design_MPa, 6),
+            "process": self.process,
+            "thickness_mm": self.thickness_mm,
+            "outside_tabulated_validity": self.outside_validity,
+        }
+
+
+def check_haz(sigma_MPa: float, tau_MPa: float, resistance) -> dict:
+    """EN 1999-1-1 (8.42)/(8.43): sqrt(sigma^2 + 3*tau^2) <= f_u,haz/gamma_Mw.
+
+    Both stresses are taken on the full cross section, which is what the clause
+    asks for and is also why this check is usable where a von Mises peak is
+    not: a section resultant is fixed by equilibrium, so it converges, while a
+    peak at a re-entrant corner has no converged value to fix.
+    """
+    comb = math.sqrt(float(sigma_MPa) ** 2 + 3.0 * float(tau_MPa) ** 2)
+    rd = resistance.design_MPa
+    return {
+        "sigma_haz_Ed_MPa": round(float(sigma_MPa), 6),
+        "tau_haz_Ed_MPa": round(float(tau_MPa), 6),
+        "combined_MPa": round(comb, 6),
+        "design_resistance_MPa": round(rd, 6),
+        "utilisation": round(comb / rd, 6) if rd > 0 else None,
+        "safety_factor": (round(rd / comb, 6) if comb > 0 else math.inf),
+        "passes": comb <= rd,
+    }
+
+
+def sections_from_case(spec) -> list:
+    """Validate the `sections` list of a weld_static limit state."""
+    if not isinstance(spec, list) or not spec:
+        raise WeldError(
+            "case.limit_state.sections: at least one section is required. "
+            "EN 1999-1-1 8.6.3.4 checks the HAZ at the fusion boundary and at "
+            "the toe of the weld on the full cross section, so the engine has "
+            "to be told where to cut. It cannot infer the cut from a weld "
+            "line: which plane carries the joint is a judgement about the load "
+            "path, not a property of the geometry")
+    out = []
+    for i, s in enumerate(spec):
+        if not isinstance(s, dict):
+            raise WeldError(f"case.limit_state.sections[{i}]: expected a dict")
+        unknown = set(s) - _SECTION_KEYS
+        if unknown:
+            raise WeldError(
+                f"case.limit_state.sections[{i}]: unexpected keys "
+                f"{sorted(unknown)} - allowed: {sorted(_SECTION_KEYS)}")
+        missing = {"role", "point_mm", "normal"} - set(s)
+        if missing:
+            raise WeldError(
+                f"case.limit_state.sections[{i}]: missing {sorted(missing)}")
+        if s["role"] not in _ROLES:
+            raise WeldError(
+                f"case.limit_state.sections[{i}].role: must be one of "
+                f"{list(_ROLES)} - 'HAZ F' at the fusion boundary, 'HAZ T' at "
+                f"the toe of the weld. EN 1999-1-1 8.6.3.4 names both, they are "
+                f"different planes, and recording which one a number came from "
+                f"is the difference between a check and a number")
+        for key in ("point_mm", "normal"):
+            v = s[key]
+            if (not isinstance(v, (list, tuple)) or len(v) != 3
+                    or any(not isinstance(x, (int, float)) or isinstance(x, bool)
+                           for x in v)):
+                raise WeldError(
+                    f"case.limit_state.sections[{i}].{key}: three numbers "
+                    f"required")
+        if all(float(x) == 0.0 for x in s["normal"]):
+            raise WeldError(
+                f"case.limit_state.sections[{i}].normal: the zero vector "
+                f"defines no plane")
+        out.append({"name": s.get("name", f"section{i}"), "role": s["role"],
+                    "point_mm": [float(x) for x in s["point_mm"]],
+                    "normal": [float(x) for x in s["normal"]]})
+    names = [s["name"] for s in out]
+    if len(set(names)) != len(names):
+        raise WeldError(
+            f"case.limit_state.sections: duplicate names {sorted(names)} - "
+            f"every section is reported by name, and two sharing one makes the "
+            f"log ambiguous about which plane a stress came from")
+    return out

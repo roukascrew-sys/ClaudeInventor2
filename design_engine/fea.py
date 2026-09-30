@@ -52,6 +52,7 @@ from .interpolate import (InterpolationError, boundary_cards,
                           interpolate, read_frd)
 from .fatigue import SNCurve, stress_range_from_ratio
 from . import weld as _weld
+from . import section as _section
 
 
 class FeaError(RuntimeError):
@@ -101,6 +102,11 @@ _CONSTRAINT_KEYS = {"where", "dof"}
 _LOAD_KEYS = {"where", "force_total_N"}
 _LIMIT_KEYS = {"name", "required_SF", "excitation_hz", "harmonics",
                "required_cycles", "stress_ratio_R"}
+# EN 1999-1-1 8.6.3.4 needs two more keys, and they are admitted ONLY for
+# weld_static. Adding them to _LIMIT_KEYS outright would let a sourced
+# resistance and a set of section planes ride silently on yield_von_mises,
+# where nothing reads them - a case that looks code-checked and is not.
+_WELD_STATIC_KEYS = {"resistance", "sections"}
 
 
 def _reject_extra(d: dict, allowed: set, ctx: str) -> None:
@@ -276,10 +282,13 @@ def validate_case(case: dict) -> None:
             raise FeaError(f"case.loads[{i}].force_total_N: zero load is not a load case")
 
     ls = case["limit_state"]
-    _reject_extra(ls, _LIMIT_KEYS, "case.limit_state")
+    _reject_extra(ls,
+                  (_LIMIT_KEYS | _WELD_STATIC_KEYS
+                   if ls.get("name") == "weld_static" else _LIMIT_KEYS),
+                  "case.limit_state")
     allowed_states = ("yield_von_mises", "elastic_buckling",
                       "thermal_derated_yield", "resonance_separation",
-                      "fatigue_life")
+                      "fatigue_life", "weld_static")
     if ls.get("name") not in allowed_states:
         raise FeaError(
             f"case.limit_state.name: must be one of {allowed_states}, got "
@@ -309,6 +318,34 @@ def validate_case(case: dict) -> None:
                 "case.material.service_temp_C and "
                 "case.material.yield_derate_curve - otherwise it is just "
                 "yield_von_mises wearing a different name")
+    elif ls["name"] == "weld_static":
+        # EN 1999-1-1 8.6.3.4. Both halves are refused rather than defaulted:
+        # the resistance because a strength without a citation is the failure
+        # this engine exists to prevent, and the sections because the clause is
+        # written on a CROSS SECTION and nothing in the geometry says which
+        # plane carries the joint.
+        try:
+            _weld.WeldResistance(ls.get("resistance"))
+            _weld.sections_from_case(ls.get("sections"))
+        except _weld.WeldError as exc:
+            raise FeaError(str(exc)) from None
+        if not case.get("weld"):
+            raise FeaError(
+                "limit_state 'weld_static' requires case.weld: a HAZ check "
+                "with no declared weld line is checking a joint the model does "
+                "not know it has. Declare the zones, or use yield_von_mises")
+        # A partial-factor format already carries its margin in gamma_Mw, so
+        # required_SF below 1,0 would eat into the factor the code sets rather
+        # than adding to it. Above 1,0 it stacks on top, which is conservative
+        # and allowed - and recorded in the details so nobody reads the result
+        # as a bare Eurocode utilisation.
+        if ls["required_SF"] < 1.0:
+            raise FeaError(
+                f"limit_state 'weld_static': required_SF={ls['required_SF']} is "
+                f"below 1,0. EN 1999-1-1 is a partial-factor code - the margin "
+                f"is already in gamma_Mw and the check passes at utilisation "
+                f"1,0. A required_SF under 1,0 does not relax a house rule, it "
+                f"cancels part of the code's own factor")
 
 
 def check_rigid_body_modes(mesh: dict, constraint_sets: list,
@@ -665,6 +702,22 @@ def _check_results_complete(mesh: dict, disp: dict, stress: dict,
                 raise FeaError(
                     f"nonfinite_results: {name} record for node {node} contains "
                     f"NaN or Inf - the solve diverged ({run_dir}/job.frd)")
+
+
+def _governing_section(weld_static: dict) -> dict:
+    """The section carrying the highest combined stress, by name.
+
+    By NAME rather than by index: the sections list is reported in declaration
+    order and the governing one is picked by magnitude, so looking it up any
+    other way would eventually pair one section's name with another's numbers.
+    """
+    name = weld_static["governing_section"]
+    for c in weld_static["sections"]:
+        if c["name"] == name:
+            return c
+    raise FeaError(
+        f"weld_static: governing section {name!r} is not in the reported "
+        f"sections - the result is internally inconsistent and is not used")
 
 
 def von_mises(s: list[float]) -> float:
@@ -1868,6 +1921,91 @@ class ValidationTools:
             sf = math.inf if max_vm == 0 else allowable / max_vm
             required = case["limit_state"]["required_SF"]
 
+            # EN 1999-1-1 (Eurocode 9) 8.6.3.4 - THE GATE MOVES OFF THE PEAK.
+            #
+            # Everything above stays, and stays diagnostic: max_vm, the
+            # outlier ratio, the singularity verdict and the 6.1.6 HAZ
+            # softening are all still computed and still logged. What changes
+            # for this limit state is what the PASS is decided on.
+            #
+            # 8.6.3.4 checks sqrt(sigma^2 + 3*tau^2) against f_u,haz/gamma_Mw
+            # on the FULL CROSS SECTION at the fusion boundary and at the weld
+            # toe. A section resultant is fixed by equilibrium, so unlike a
+            # notch peak it converges - which is the whole reason this limit
+            # state exists. `section.resultants` takes the transmitted force
+            # and moment straight from the solver's nodal-force output, so the
+            # number does not depend on interpolating a stress field at all.
+            weld_static = None
+            if ls_name == "weld_static":
+                ls_spec = case["limit_state"]
+                try:
+                    res = _weld.WeldResistance(ls_spec["resistance"])
+                    secs = _weld.sections_from_case(ls_spec["sections"])
+                    forc = blocks.get("FORC", {})
+                    checked = []
+                    for spec in secs:
+                        r = _section.resultants(m, forc, spec["point_mm"],
+                                                spec["normal"], stress=stress)
+                        chk = _weld.check_haz(r["sigma_extreme_MPa"],
+                                              r["tau_average_MPa"], res)
+                        checked.append({**spec, "resultant": r, "check": chk})
+                except (_weld.WeldError, _section.SectionError) as exc:
+                    raise FeaError(
+                        f"weld_static: {exc}") from None
+
+                gov = max(checked, key=lambda x: x["check"]["combined_MPa"])
+                allowable = res.design_MPa
+                sf = gov["check"]["safety_factor"]
+                # A section whose interpolated field reads far above its own
+                # resultant is a section clipping a local concentration. That
+                # does not invalidate the resultant - it is still the force the
+                # section carries - but it says the stress is not uniform over
+                # the cut, and a reader comparing this against a hand
+                # calculation deserves to know.
+                concentrated = []
+                for c in checked:
+                    fc = c["resultant"].get("field_check") or {}
+                    if fc.get("available") and c["check"]["combined_MPa"] > 0:
+                        ratio = (fc["max_combined_MPa"]
+                                 / c["check"]["combined_MPa"])
+                        c["field_to_section_ratio"] = round(ratio, 4)
+                        if ratio > 2.0:
+                            concentrated.append(c["name"])
+                weld_static = {
+                    "clause": "EN 1999-1-1:2007+A1:2009 8.6.3.4 (8.42)/(8.43)",
+                    "resistance": res.to_dict(),
+                    "governing_section": gov["name"],
+                    "governing_role": gov["role"],
+                    "utilisation": gov["check"]["utilisation"],
+                    "sections": checked,
+                    # Stated, not buried: the clause says "on the full cross
+                    # section" and does not prescribe how to pair a bending
+                    # extreme fibre with a shear. This engine pairs the
+                    # EXTREME-FIBRE normal stress with the SECTION-AVERAGE
+                    # shear. That is conservative in sigma and is NOT
+                    # conservative in tau for a section whose peak shear is
+                    # well above its mean - a stocky section in near-pure
+                    # shear is the case to watch.
+                    "stress_pairing": (
+                        "sigma = extreme-fibre normal stress from N/A + "
+                        "bending about the section centroid; tau = V/A, the "
+                        "section average. Conservative in sigma, not "
+                        "conservative in tau where peak shear much exceeds "
+                        "the mean"),
+                    "field_concentration_sections": concentrated,
+                    "not_checked": (
+                        "weld METAL resistance, EN 1999-1-1 8.6.3.2 (butt) and "
+                        "8.6.3.3 (fillet) against f_w from Table 8.8. Equation "
+                        "(8.33) did not extract from the source copy of the "
+                        "standard and is not implemented. This is a HAZ check "
+                        "only, and it is not a complete connection design"),
+                }
+                if required > 1.0:
+                    weld_static["stacked_margin"] = (
+                        f"required_SF={required} is applied ON TOP of "
+                        f"gamma_Mw={res.gamma_Mw}; the Eurocode check itself "
+                        f"passes at utilisation 1,0")
+
             png_rel = f"validation/{run_dir.name}/von_mises.png"
             _allow_note = (
                 f"derated yield {eff['yield_MPa_effective']:.1f} MPa "
@@ -1877,11 +2015,29 @@ class ValidationTools:
                 else f"yield {mat['yield_MPa']} MPa")
             if haz["in_haz"]:
                 _allow_note += (f", HAZ x{haz['factor']:g} -> "
-                                f"{allowable:.1f} MPa")
+                                f"{haz['allowable_MPa']:.1f} MPa")
+            if weld_static is not None:
+                _r = weld_static["resistance"]
+                _allow_note = (
+                    f"EC9 8.6.3.4 f_u,haz {_r['f_u_haz_effective_MPa']:.1f} / "
+                    f"gamma_Mw {_r['gamma_Mw']:g} = {allowable:.1f} MPa "
+                    f"on section {weld_static['governing_section']!r} "
+                    f"({weld_static['governing_role']})")
+            # The contour plot is still the von Mises field, but the CAPTION
+            # must name the quantity that was actually gated on. For
+            # weld_static that is a section resultant, not the peak the picture
+            # draws attention to, and a caption implying otherwise would make
+            # the image argue against the log.
+            if weld_static is not None:
+                _gov_chk = _governing_section(weld_static)["check"]
+                _png_basis = (f"section sqrt(s^2+3t^2) "
+                              f"{_gov_chk['combined_MPa']:.1f} MPa")
+            else:
+                _png_basis = f"max vM {max_vm:.1f} MPa"
             _diagnostic_png(
                 self.root / png_rel, m, vm,
                 f"{geometry_id} — {ls_name}: SF={sf:.3f} "
-                f"(required {required}) — max vM {max_vm:.1f} MPa vs "
+                f"(required {required}) — {_png_basis} vs "
                 f"{_allow_note} [{mat['name']}]")
 
             details = {
@@ -1893,6 +2049,11 @@ class ValidationTools:
                 "thermal_derating": eff,
                 "weld_haz": haz,
                 "welds": welds.to_dict(),
+                # Present only for limit_state 'weld_static'. Carries the
+                # sourced resistance, every section that was cut, and the two
+                # things the clause does not decide for you: how the normal and
+                # shear stresses were paired, and what is NOT checked.
+                "weld_static": weld_static,
                 "max_von_mises_MPa": round(max_vm, 6),
                 "median_von_mises_MPa": round(median_vm, 6),
                 "p99_9_von_mises_MPa": round(p999, 6),
@@ -1981,6 +2142,25 @@ class ValidationTools:
                     f"inapplicable, NOT the part failing a limit state - blend "
                     f"the corner, or gate on a stress that is defined at a "
                     f"weld rather than on a notch peak"))
+        elif weld_static is not None:
+            _gov = _governing_section(weld_static)
+            self.log.close_action(
+                action_id, "fail", details=details,
+                failure_mode=(
+                    f"weld_static: EN 1999-1-1 8.6.3.4 utilisation "
+                    f"{weld_static['utilisation']:.3f} at section "
+                    f"{_gov['name']!r} ({_gov['role']}) — "
+                    f"sqrt(sigma^2+3tau^2) = "
+                    f"{_gov['check']['combined_MPa']:.2f} MPa exceeds "
+                    f"f_u,haz/gamma_Mw = {allowable:.2f} MPa "
+                    f"[{_allow_note}]. sigma_Ed "
+                    f"{_gov['check']['sigma_haz_Ed_MPa']:.2f} MPa, tau_Ed "
+                    f"{_gov['check']['tau_haz_Ed_MPa']:.2f} MPa on "
+                    f"{_gov['resultant']['area_mm2']:.1f} mm2 carrying N="
+                    f"{_gov['resultant']['axial_N']:.1f} N, V="
+                    f"{_gov['resultant']['shear_N']:.1f} N. This is a "
+                    f"STRENGTH failure of the heat-affected zone, not a gate "
+                    f"refusal - the section resultant converges"))
         else:
             # non-linear gate: mode + magnitude recorded BEFORE control returns
             self.log.close_action(
@@ -2008,6 +2188,7 @@ class ValidationTools:
             "stress_outlier_ratio": outlier_ratio,
             "stress_outlier_warning": outlier_warning,
             "singularity": singularity,
+            "weld_static": weld_static,
             "max_von_mises_at_mm": details["max_von_mises_at_mm"],
             "max_displacement_mm": max_disp,
             "thermal_derating": eff,
