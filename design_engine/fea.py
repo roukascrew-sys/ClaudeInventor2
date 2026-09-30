@@ -2014,8 +2014,19 @@ class ValidationTools:
                 if ls_name == "thermal_derated_yield"
                 else f"yield {mat['yield_MPa']} MPa")
             if haz["in_haz"]:
-                _allow_note += (f", HAZ x{haz['factor']:g} -> "
-                                f"{haz['allowable_MPa']:.1f} MPa")
+                # A zone may carry the HAZ strength ITSELF (EN 1999-1-1 Table
+                # 3.2's f_o,haz) instead of a ratio, in which case there is no
+                # factor to print. Formatting None here crashed a 297,794-node
+                # solve AFTER it had finished, because no solver test paired an
+                # absolute-strength zone with a real run.
+                if haz.get("proof_MPa") is not None:
+                    _allow_note += f", HAZ f_o,haz {haz['proof_MPa']:g}"
+                    if haz.get("reduction"):
+                        _allow_note += f" x{haz['reduction']['factor']:g}"
+                    _allow_note += f" -> {haz['allowable_MPa']:.1f} MPa"
+                else:
+                    _allow_note += (f", HAZ x{haz['factor']:g} -> "
+                                    f"{haz['allowable_MPa']:.1f} MPa")
             if weld_static is not None:
                 _r = weld_static["resistance"]
                 _allow_note = (

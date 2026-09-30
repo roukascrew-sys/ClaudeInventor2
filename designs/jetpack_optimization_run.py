@@ -308,6 +308,39 @@ STEEL_PEAK_DISTANCES_MM = {"P0057@v1": 6.2199, "P0058@v1": 7.2389}
 HAZ_EXTENT_MM = 25.0        # b_haz, EN 1999-1-1 clause 6.1.6.3 worked example
 HAZ_SOURCE = HAZ_RANGE.nominal.source
 
+#: THE PRINTED HAZ PROOF STRENGTH, not a ratio applied to a parent value.
+#:
+#: EN 1999-1-1 Table 3.2b prints f_o,haz and rho_o,haz side by side, and the
+#: ratio is derived from the strength: 115/240 = 0,479 -> 0,48. So multiplying
+#: rho_o,haz by a parent figure repeats a division the table has already done,
+#: against whatever parent number the case happens to carry. This project did
+#: exactly that for a month with 0,48 x 276 = 132,5 N/mm2, for a quantity the
+#: same table row prints as 115.
+#:
+#: Reading the printed value removes the step that went wrong, and makes the
+#: allowable independent of the parent strength entirely.
+HAZ_PROOF_MPa = 115.0
+HAZ_PROOF_SOURCE = (
+    "EN 1999-1-1:2007+A1:2009 Table 3.2b, 6061 T6, extruded profiles/tube/"
+    "rod-bar (EP/ET/ER-B), t < 25 mm: f_o,haz = 115 N/mm2 (f_o = 240, "
+    "rho_o,haz = 0,48, and 115/240 = 0,479 confirms the row reads together). "
+    "T6511 is taken to carry the T6 extruded row - T6511 is T6 plus stress "
+    "relief by stretching - but that mapping is specified in EN 755-2, which "
+    "is NOT in hand: INFERRED, not sourced.")
+
+
+def haz_reduction(v) -> dict:
+    """Table 3.2b footnote 4, evaluated for THIS candidate's thickness.
+
+    Per candidate rather than as a constant, because the crossbeam thickness
+    is a design variable and 15 mm is a cliff: a frame at 14,9 mm keeps the
+    full 115 N/mm2 while one at 15,9 mm takes 0,8 and drops to 92. Freezing
+    the factor at the current thickness would hide that from the search, which
+    is the one place it could actually act on it.
+    """
+    return {"alloy_family": "precipitation_hardening", "process": "MIG",
+            "thickness_mm": float(v["cb_thick"]), "temper": "T6511"}
+
 
 def haz_zones(v) -> list:
     """The four spine/pad junction welds, as heat-affected zones.
@@ -335,8 +368,9 @@ def haz_zones(v) -> list:
     # 1018 is COLD-FINISHED: its 372 MPa yield comes from drawing, and the weld
     # anneals that away locally. See STEEL_HAZ_RANGE.
     if str(v["material"]).startswith("6061"):
-        return [{"name": "spine-pad-weld", "factor": HAZ_FACTOR,
-                 "extent_mm": HAZ_EXTENT_MM, "source": HAZ_SOURCE,
+        return [{"name": "spine-pad-weld", "proof_MPa": HAZ_PROOF_MPa,
+                 "reduction": haz_reduction(v),
+                 "extent_mm": HAZ_EXTENT_MM, "source": HAZ_PROOF_SOURCE,
                  "lines": lines}]
     return [{"name": "spine-pad-weld", "factor": STEEL_HAZ_RANGE.nominal.value,
              "extent_mm": STEEL_HAZ_EXTENT_MM,
@@ -644,6 +678,103 @@ def build_case(cand, ctx) -> dict:
     }
 
 
+
+#: How far outside the spine face to place the "at the fusion boundary" cut.
+#: Not zero: a plane exactly on the face is ambiguous about whether it cuts the
+#: spine as well, and the answer would depend on where the mesher happened to
+#: put nodes. 1 mm is a fifth of an element at the 5 mm global size, so the
+#: section is at the fusion line for every engineering purpose and is
+#: unambiguous for the cutter.
+FUSION_OFFSET_MM = 1.0
+
+
+def weld_sections(v) -> list:
+    """The cross sections EN 1999-1-1 8.6.3.4 checks, for this candidate.
+
+    THE LOAD PATH MAKES THIS THE RIGHT PLANE. The engines push up at
+    |x| = inner_x and outer_x; the lugs hold the spine at |x| <= spine_x/2.
+    So every newton from the two engines on one side crosses a plane normal to
+    X just outside the spine face - and that plane is the crossbeam section the
+    two weld lines at that junction have to carry. The section is not chosen to
+    be convenient; it is the only place the whole joint force passes through.
+
+    THE MODEL HAS NO WELD BEAD, and this is a modelling decision rather than a
+    measurement. 8.6.3.4 names two locations and they are mapped onto the
+    geometry that stands for them:
+
+      HAZ F, the fusion boundary -> the spine face, where the crossbeam meets
+        the spine and the two weld runs lie.
+      HAZ T, the toe of the weld -> the far end of the FILLET_R blend, which
+        build_spec already documents as standing in for a dressed weld
+        transition.
+
+    Both sides are declared rather than assuming symmetry: the frame is
+    symmetric but the check costs one plane cut each, and a result that
+    ASSUMED the two sides agree could not later show that they do.
+    """
+    sx = float(v["spine_x"]) / 2.0
+    out = []
+    for sign in (-1.0, 1.0):
+        tag = "neg" if sign < 0 else "pos"
+        out.append({"name": f"spine_face_{tag}", "role": "HAZ F",
+                    "point_mm": [sign * (sx + FUSION_OFFSET_MM), 0.0,
+                                 SPINE_Z / 2.0],
+                    "normal": [1.0, 0.0, 0.0]})
+        out.append({"name": f"weld_toe_{tag}", "role": "HAZ T",
+                    "point_mm": [sign * (sx + FILLET_R), 0.0, SPINE_Z / 2.0],
+                    "normal": [1.0, 0.0, 0.0]})
+    return out
+
+
+def weld_resistance(v) -> dict:
+    """f_u,haz / gamma_Mw for this candidate, all of it sourced.
+
+    Note this is the ULTIMATE strength in the HAZ, which is what 8.6.3.4 is
+    written against - NOT the proof strength HAZ_PROOF_MPa that the member
+    check uses under 6.1.6. Two clauses, two quantities, deliberately not
+    shared between them.
+    """
+    return {
+        "f_u_haz_MPa": 175.0,
+        "source": (
+            "EN 1999-1-1:2007+A1:2009 Table 3.2b, 6061 T6, extruded "
+            "profiles/tube/rod-bar (EP/ET/ER-B), t < 25 mm: f_u,haz = 175 "
+            "N/mm2 (f_u = 260, rho_u,haz = 0,67, and 175/260 = 0,673 confirms "
+            "the row reads together). T6511 is taken to carry the T6 extruded "
+            "row; that mapping is in EN 755-2, which is NOT in hand: INFERRED."),
+        "gamma_Mw": 1.25,
+        "gamma_Mw_source": (
+            "EN 1999-1-1:2007+A1:2009 Table 8.1, recommended value for welded "
+            "connections. No National Annex applied."),
+        "process": "MIG",
+        "thickness_mm": float(v["cb_thick"]),
+        "alloy_family": "precipitation_hardening",
+        "temper": "T6511",
+    }
+
+
+def build_weld_case(cand, ctx) -> dict:
+    """build_case, gated on EN 1999-1-1 8.6.3.4 instead of on a notch peak.
+
+    Same geometry, same loads, same restraints, same mesh - only the question
+    changes. That matters: it means the two gates can be run on ONE solve and
+    compared, rather than being two studies that might differ for reasons
+    nobody tracked.
+
+    required_SF is 1,0 because the Eurocode is a partial-factor format and
+    carries its margin in gamma_Mw. REQUIRED_SF = 3,0 is this project's own
+    judgement call on a yield gate and stacking it here would double-count.
+    """
+    case = build_case(cand, ctx)
+    case["limit_state"] = {
+        "name": "weld_static",
+        "required_SF": 1.0,
+        "resistance": weld_resistance(cand.values),
+        "sections": weld_sections(cand.values),
+    }
+    return case
+
+
 # ---------------------------------------------------------------- problem
 def make_space() -> DesignSpace:
     return DesignSpace(name="jetpack-frame", version=1, variables=[
@@ -829,6 +960,25 @@ def haz_verdict(sf_at_parent: float = 4.633, required_sf: float = REQUIRED_SF,
     4.633 * 0.500 = 2.317 and 4.633 * 0.375 = 1.738 - which is the check that
     the assumption holds for this case. It would NOT hold for a parameter that
     moves stiffness, load path or geometry.
+
+    SUPERSEDED AS A DESIGN ROUTE, 2026-09-30, and kept as a robustness study.
+
+    This sweep asks "which sourced value of rho_o,haz should the gate use?".
+    EN 1999-1-1 Table 3.2b answers it directly: for extruded 6061-T6 it prints
+    f_o,haz = 115 N/mm2, and the engine now reads that instead of multiplying a
+    ratio by a parent strength. With footnote 4's 0,8 for the 15,875 mm
+    crossbeam the gate allowable is 92 N/mm2 - see HAZ_PROOF_MPa.
+
+    So the `allowable_MPa` column below is rho x parent, exactly as labelled,
+    and it is NOT what the gate uses. What the sweep still answers is the
+    different and live question of what happens if the real joint is softer
+    than the code value - which the 0,375 row, from as-welded 6061-T6 test
+    data, says is possible.
+
+    The default `sf_at_parent` of 4.633 is a HISTORICAL figure carrying two
+    faults of its own: its denominator is a peak the engine has since
+    classified singular, and its allowable was the 276 MPa supplier value.
+    Passing a current number is the only way to get a current answer.
     """
     out = verdict_across(
         HAZ_RANGE,
@@ -843,6 +993,11 @@ def haz_verdict(sf_at_parent: float = 4.633, required_sf: float = REQUIRED_SF,
     if emit:
         print(f"\nHAZ sensitivity - {HAZ_RANGE.name} across every sourced "
               f"value, gate SF {required_sf}")
+        print("  NOTE: a robustness study, not the gate. The "
+              f"gate reads f_o,haz = {HAZ_PROOF_MPa:g} N/mm2 from "
+              f"EN 1999-1-1 Table 3.2b directly; allowable_MPa "
+              f"below is rho x parent ({PARENT_PROOF_MPa:g} MPa) "
+              f"and excludes footnote 4.")
         print(f"  {'rho':>6}  {'sf':>7}  {'verdict':<8} source")
         for r in out["evaluated"]:
             print(f"  {r['value']:>6.3f}  {r['sf']:>7.3f}  "

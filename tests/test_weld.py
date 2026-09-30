@@ -183,3 +183,147 @@ def test_both_jetpack_peaks_fall_inside_the_spine_pad_HAZ():
     # SF 4.633 would fall below its own 3.0 gate
     softened = welds.allowable_at([29.513, -0.024, 199.225], 251.16)
     assert softened["allowable_MPa"] / 54.206986 < 3.0
+
+
+# =========================================================================
+# Reading f_o,haz instead of reconstructing it from rho_o,haz.
+#
+# EN 1999-1-1 Table 3.2b prints both, and the ratio is DERIVED from the
+# strength: 115/240 = 0,479 -> 0,48. Multiplying the published ratio by a
+# parent value therefore repeats a division the table has already done,
+# against whatever parent figure the case happens to carry.
+#
+# This project did exactly that for a month: rho_o,haz = 0,48 times 276 MPa
+# from a supplier page, giving 132,5 N/mm2 for a quantity the same row
+# prints as 115. Reading the printed value removes the step that went wrong.
+# =========================================================================
+
+PROOF_SRC = ("EN 1999-1-1:2007+A1:2009 Table 3.2b, 6061 T6 EP/ET/ER-B, "
+             "t < 25 mm: f_o,haz = 115 N/mm2")
+FN4 = {"alloy_family": "precipitation_hardening", "process": "MIG",
+       "thickness_mm": 15.875, "temper": "T6511"}
+
+
+def _proof_zone(**kw):
+    base = dict(name="z", extent_mm=25.0, source=PROOF_SRC, proof_MPa=115.0,
+                lines=[[[0.0, 0.0, 0.0], [100.0, 0.0, 0.0]]])
+    base.update(kw)
+    return HeatAffectedZone(**base)
+
+
+def test_an_absolute_proof_strength_ignores_the_parent_value():
+    """The whole point: 115 N/mm2 is 115 N/mm2 whatever the case carries."""
+    z = _proof_zone()
+    assert z.allowable(240.0) == pytest.approx(115.0)
+    assert z.allowable(276.0) == pytest.approx(115.0)
+    assert z.allowable(1.0) == pytest.approx(115.0)
+
+
+def test_a_ratio_still_multiplies_the_parent():
+    """`factor` stays supported - some alloys publish only a ratio."""
+    z = _proof_zone(proof_MPa=None, factor=0.48)
+    assert z.allowable(240.0) == pytest.approx(115.2)
+
+
+def test_giving_both_a_ratio_and_a_strength_is_refused():
+    with pytest.raises(WeldError, match="exactly one"):
+        _proof_zone(factor=0.48)
+
+
+def test_giving_neither_is_refused():
+    with pytest.raises(WeldError, match="exactly one"):
+        _proof_zone(proof_MPa=None)
+
+
+def test_the_refusal_says_which_one_to_prefer():
+    with pytest.raises(WeldError) as e:
+        _proof_zone(proof_MPa=None)
+    assert "Prefer proof_MPa" in str(e.value)
+    assert "DERIVED" in str(e.value)
+
+
+def test_a_negative_proof_strength_is_refused():
+    with pytest.raises(WeldError, match="must be > 0"):
+        _proof_zone(proof_MPa=-5.0)
+
+
+def test_a_ratio_passed_as_a_strength_is_not_silently_accepted_as_one():
+    """0,48 MPa is a legal number and an absurd proof strength.
+
+    The engine cannot tell them apart, so this test records what it does: it
+    accepts it. The refusal that catches this in practice is the REQUIRED
+    source, which has to name a row - and no row prints 0,48 N/mm2.
+    """
+    assert _proof_zone(proof_MPa=0.48).allowable(240.0) == pytest.approx(0.48)
+
+
+# ---------------------------------------------- the footnote 4 reduction
+def test_the_thickness_reduction_applies_to_an_absolute_strength():
+    """115 x 0,8 = 92 N/mm2 at 15,875 mm - the crossbeam."""
+    z = _proof_zone(reduction=dict(FN4))
+    assert z.reduction_factor == pytest.approx(0.8)
+    assert z.allowable(240.0) == pytest.approx(92.0)
+
+
+def test_the_thickness_reduction_applies_to_a_ratio_too():
+    """Footnote 4 reduces 'the HAZ values AND rho-factors' - both."""
+    z = _proof_zone(proof_MPa=None, factor=0.48, reduction=dict(FN4))
+    assert z.allowable(240.0) == pytest.approx(240.0 * 0.48 * 0.8)
+
+
+def test_below_15mm_there_is_no_reduction():
+    z = _proof_zone(reduction={**FN4, "thickness_mm": 14.9})
+    assert z.allowable(240.0) == pytest.approx(115.0)
+
+
+def test_an_incomplete_reduction_block_is_refused():
+    with pytest.raises(WeldError, match="missing"):
+        _proof_zone(reduction={"process": "MIG", "thickness_mm": 20.0})
+
+
+def test_an_unknown_reduction_key_is_refused():
+    with pytest.raises(WeldError, match="unexpected keys"):
+        _proof_zone(reduction={**FN4, "filler": "5356"})
+
+
+# ------------------------------------------------------------- governing
+def test_overlapping_zones_are_ranked_by_allowable_not_by_factor():
+    """A zone carrying an absolute strength has no factor to compare.
+
+    Ranking a mixed set by factor alone would silently ignore those zones,
+    which is how the softest weld stops governing.
+    """
+    line = [[[0.0, 0.0, 0.0], [100.0, 0.0, 0.0]]]
+    soft = HeatAffectedZone(name="absolute", extent_mm=25.0, source=PROOF_SRC,
+                            proof_MPa=92.0, lines=line)
+    mild = HeatAffectedZone(name="ratio", extent_mm=25.0, source=PROOF_SRC,
+                            factor=0.48, lines=line)
+    wm = WeldMap([mild, soft])
+    r = wm.allowable_at([50.0, 0.0, 0.0], 240.0)
+    # 0,48 x 240 = 115,2 against 92 - the absolute zone governs.
+    assert r["zone"] == "absolute"
+    assert r["allowable_MPa"] == pytest.approx(92.0)
+
+
+def test_the_basis_says_the_strength_was_read_not_reconstructed():
+    wm = WeldMap([_proof_zone(reduction=dict(FN4))])
+    r = wm.allowable_at([50.0, 0.0, 0.0], 240.0)
+    assert "read directly rather than reconstructed" in r["basis"]
+    assert "thickness/process reduction" in r["basis"]
+    assert r["proof_MPa"] == 115.0
+    assert r["factor"] is None
+
+
+# ------------------------------------------------------------- from_case
+def test_a_case_can_declare_an_absolute_haz_strength():
+    wm = from_case([{"name": "w", "proof_MPa": 115.0, "reduction": dict(FN4),
+                     "extent_mm": 25.0, "source": PROOF_SRC,
+                     "lines": [[[0.0, 0.0, 0.0], [100.0, 0.0, 0.0]]]}])
+    assert wm.allowable_at([50.0, 0.0, 0.0], 240.0)["allowable_MPa"] == \
+        pytest.approx(92.0)
+
+
+def test_a_case_with_neither_factor_nor_proof_is_refused():
+    with pytest.raises(WeldError, match="exactly one"):
+        from_case([{"name": "w", "extent_mm": 25.0, "source": PROOF_SRC,
+                    "lines": [[[0.0, 0.0, 0.0], [100.0, 0.0, 0.0]]]}])

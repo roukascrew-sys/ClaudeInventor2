@@ -52,8 +52,9 @@ class HeatAffectedZone:
     and is refused as a likely placeholder.
     """
 
-    def __init__(self, name: str, factor: float, extent_mm: float,
-                 source: str, lines: list | None = None):
+    def __init__(self, name: str, extent_mm: float, source: str,
+                 factor: float | None = None, lines: list | None = None,
+                 proof_MPa: float | None = None, reduction: dict | None = None):
         if not isinstance(source, str) or not source.strip():
             raise WeldError(
                 f"HeatAffectedZone({name!r}).source: required — cite the "
@@ -61,23 +62,80 @@ class HeatAffectedZone:
                 f"6.4, 6082-T6 MIG, t<=15mm'). The factor depends on alloy, "
                 f"temper, process, joint type and thickness; this engine will "
                 f"not supply one")
-        if not 0.0 < factor <= 1.0:
+
+        # PREFER THE ABSOLUTE STRENGTH OVER THE RATIO.
+        #
+        # EN 1999-1-1 Table 3.2 prints BOTH f_o,haz and rho_o,haz, and the
+        # ratio is derived from the strength - for 6061 extruded,
+        # 115/240 = 0,479 -> 0,48. Reconstructing the strength by multiplying
+        # the published ratio by a parent value therefore does a
+        # multiplication the table has already done, and does it against
+        # whatever parent number the case happens to carry. This project spent
+        # a month with rho_o,haz = 0,48 multiplying 276 MPa - a supplier
+        # figure - to get 132,5 N/mm2 for a quantity the same table row prints
+        # as 115. Reading the printed value removes the step that went wrong.
+        #
+        # `factor` stays supported: for an alloy or process where only a ratio
+        # is published, a ratio is what there is.
+        if (factor is None) == (proof_MPa is None):
             raise WeldError(
-                f"HeatAffectedZone({name!r}).factor: must be in (0, 1], got "
-                f"{factor}. It multiplies the parent proof strength")
-        if factor == 1.0:
-            raise WeldError(
-                f"HeatAffectedZone({name!r}).factor: 1.0 asserts that welding "
-                f"costs no strength at all. That is not true of 6xxx aluminium "
-                f"— if this joint genuinely has no HAZ (bonded, bolted, "
-                f"machined from solid), do not declare a zone for it")
+                f"HeatAffectedZone({name!r}): give exactly one of proof_MPa "
+                f"(the HAZ proof strength itself, e.g. EN 1999-1-1 Table 3.2's "
+                f"f_o,haz) or factor (a ratio multiplying the parent strength, "
+                f"e.g. rho_o,haz). Prefer proof_MPa where the table prints it: "
+                f"the ratio is DERIVED from it, so multiplying the ratio by a "
+                f"parent value from some other document reconstructs a number "
+                f"the standard already states")
+        if factor is not None:
+            if not 0.0 < factor <= 1.0:
+                raise WeldError(
+                    f"HeatAffectedZone({name!r}).factor: must be in (0, 1], got "
+                    f"{factor}. It multiplies the parent proof strength")
+            if factor == 1.0:
+                raise WeldError(
+                    f"HeatAffectedZone({name!r}).factor: 1.0 asserts that welding "
+                    f"costs no strength at all. That is not true of 6xxx aluminium "
+                    f"— if this joint genuinely has no HAZ (bonded, bolted, "
+                    f"machined from solid), do not declare a zone for it")
+        if proof_MPa is not None:
+            if (not isinstance(proof_MPa, (int, float))
+                    or isinstance(proof_MPa, bool) or proof_MPa <= 0):
+                raise WeldError(
+                    f"HeatAffectedZone({name!r}).proof_MPa: must be > 0, got "
+                    f"{proof_MPa!r}. It is the proof strength IN the zone, in "
+                    f"MPa - not a ratio")
         if extent_mm <= 0:
             raise WeldError(
                 f"HeatAffectedZone({name!r}).extent_mm: must be > 0. A zone "
                 f"with no extent softens nothing and would silently pass")
 
+        # Table 3.2b footnote 4 reduces "the HAZ values AND rho-factors", so
+        # the same factor applies whichever of the two this zone carries.
+        self.reduction = None
+        if reduction is not None:
+            if not isinstance(reduction, dict):
+                raise WeldError(
+                    f"HeatAffectedZone({name!r}).reduction: expected a dict "
+                    f"with alloy_family, process and thickness_mm")
+            unknown = set(reduction) - {"alloy_family", "process",
+                                        "thickness_mm", "temper"}
+            if unknown:
+                raise WeldError(
+                    f"HeatAffectedZone({name!r}).reduction: unexpected keys "
+                    f"{sorted(unknown)}")
+            missing = {"alloy_family", "process", "thickness_mm"} - set(reduction)
+            if missing:
+                raise WeldError(
+                    f"HeatAffectedZone({name!r}).reduction: missing "
+                    f"{sorted(missing)} - EN 1999-1-1 Table 3.2b footnote 4 "
+                    f"needs all three to decide a factor")
+            self.reduction = en1999_haz_reduction(
+                reduction["alloy_family"], reduction["process"],
+                reduction["thickness_mm"], reduction.get("temper"))
+
         self.name = name
-        self.factor = float(factor)
+        self.factor = float(factor) if factor is not None else None
+        self.proof_MPa = float(proof_MPa) if proof_MPa is not None else None
         self.extent_mm = float(extent_mm)
         self.source = source
         self.lines = [_check_line(l, f"{name}.lines[{i}]")
@@ -102,9 +160,26 @@ class HeatAffectedZone:
     def contains(self, point) -> bool:
         return self.distance_to(point) <= self.extent_mm
 
+    @property
+    def reduction_factor(self) -> float:
+        return self.reduction["factor"] if self.reduction else 1.0
+
+    def allowable(self, parent_MPa: float) -> float:
+        """The proof strength in this zone, in MPa.
+
+        Absolute when the zone was given one, and then `parent_MPa` is not used
+        at all - which is the point: a published f_o,haz does not depend on
+        which parent figure the case happens to carry.
+        """
+        base = (self.proof_MPa if self.proof_MPa is not None
+                else float(parent_MPa) * self.factor)
+        return base * self.reduction_factor
+
     def to_dict(self) -> dict:
         return {"name": self.name, "factor": self.factor,
+                "proof_MPa": self.proof_MPa,
                 "extent_mm": self.extent_mm, "source": self.source,
+                "reduction": self.reduction,
                 "weld_lines": len(self.lines)}
 
 
@@ -114,15 +189,19 @@ class WeldMap:
     def __init__(self, zones: list | None = None):
         self.zones = list(zones or [])
 
-    def governing(self, point):
+    def governing(self, point, parent_MPa: float):
         """The zone that softens this point most, or None if it is parent metal.
 
         Most, not first: overlapping welds — a T-joint welded on both sides, a
         repair over an original run — leave the worst softening in force, not
         whichever zone happened to be declared earliest.
+
+        Ranked by the ALLOWABLE each zone produces, not by its factor. A zone
+        carrying an absolute f_o,haz has no factor to compare, and ranking a
+        mixed set by factor alone would silently ignore those zones.
         """
         hits = [z for z in self.zones if z.contains(point)]
-        return min(hits, key=lambda z: z.factor) if hits else None
+        return min(hits, key=lambda z: z.allowable(parent_MPa)) if hits else None
 
     def allowable_at(self, point, parent_MPa: float) -> dict:
         """The proof strength actually available at this point.
@@ -130,7 +209,7 @@ class WeldMap:
         Returns the value AND why, so a safety factor can always say which
         material state it was computed against.
         """
-        z = self.governing(point)
+        z = self.governing(point, parent_MPa)
         if z is None:
             nearest = (min((zz.distance_to(point) for zz in self.zones),
                            default=None) if self.zones else None)
@@ -139,10 +218,20 @@ class WeldMap:
                     "nearest_haz_mm": (round(nearest, 4)
                                        if nearest is not None else None),
                     "basis": "parent metal"}
-        return {"allowable_MPa": float(parent_MPa) * z.factor, "in_haz": True,
-                "zone": z.name, "factor": z.factor,
+        allow = z.allowable(parent_MPa)
+        if z.proof_MPa is not None:
+            basis = (f"HAZ proof strength {z.proof_MPa:g} MPa, read directly "
+                     f"rather than reconstructed from a ratio ({z.source})")
+        else:
+            basis = f"HAZ softening x{z.factor:g} ({z.source})"
+        if z.reduction:
+            basis += (f"; x{z.reduction['factor']:g} thickness/process "
+                      f"reduction ({z.reduction['basis']})")
+        return {"allowable_MPa": allow, "in_haz": True,
+                "zone": z.name, "factor": z.factor, "proof_MPa": z.proof_MPa,
+                "reduction": z.reduction,
                 "distance_mm": round(z.distance_to(point), 4),
-                "basis": f"HAZ softening x{z.factor:g} ({z.source})"}
+                "basis": basis}
 
     def to_dict(self) -> dict:
         return {"zones": [z.to_dict() for z in self.zones]}
@@ -158,16 +247,19 @@ def from_case(weld_spec) -> WeldMap:
     for i, z in enumerate(weld_spec):
         if not isinstance(z, dict):
             raise WeldError(f"case.weld[{i}]: expected a dict")
-        unknown = set(z) - {"name", "factor", "extent_mm", "source", "lines"}
+        allowed = {"name", "factor", "extent_mm", "source", "lines",
+                   "proof_MPa", "reduction"}
+        unknown = set(z) - allowed
         if unknown:
             raise WeldError(
                 f"case.weld[{i}]: unexpected keys {sorted(unknown)} — allowed: "
-                f"['extent_mm', 'factor', 'lines', 'name', 'source']")
-        missing = {"factor", "extent_mm", "source", "lines"} - set(z)
+                f"{sorted(allowed)}")
+        missing = {"extent_mm", "source", "lines"} - set(z)
         if missing:
             raise WeldError(f"case.weld[{i}]: missing {sorted(missing)}")
         zones.append(HeatAffectedZone(
-            name=z.get("name", f"weld{i}"), factor=z["factor"],
+            name=z.get("name", f"weld{i}"), factor=z.get("factor"),
+            proof_MPa=z.get("proof_MPa"), reduction=z.get("reduction"),
             extent_mm=z["extent_mm"], source=z["source"], lines=z["lines"]))
     return WeldMap(zones)
 

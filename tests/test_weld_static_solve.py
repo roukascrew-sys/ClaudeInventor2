@@ -42,10 +42,15 @@ RESISTANCE = {
     "thickness_mm": 10.0,
 }
 
-WELD = [{"name": "girth", "factor": 0.5, "extent_mm": 25.0,
+#: At the BASE, not mid-length. The peak on an axially loaded encastre bar
+#: sits at the restrained end, so a zone at z=50 with a 25 mm extent never
+#: contained it: `in_haz` came back False on every run and NEITHER branch of
+#: the HAZ report line was covered by a solve. That is how a crash in it
+#: survived a green suite.
+WELD = [{"name": "girth", "factor": 0.5, "extent_mm": 60.0,
          "source": ("test fixture standing in for a sourced rho_o,haz; the "
                     "6.1.6 member softening is not what this gate uses"),
-         "lines": [[[0.0, 5.0, 50.0], [10.0, 5.0, 50.0]]]}]
+         "lines": [[[0.0, 5.0, 0.0], [10.0, 5.0, 0.0]]]}]
 
 #: Clear of any obvious mesh plane, and clear of the load and restraint faces
 #: so Saint-Venant has room - though a section resultant does not need it.
@@ -152,7 +157,10 @@ def test_the_von_mises_peak_is_still_recorded_but_is_not_the_gate(eng, run):
     d = _details(eng, run)
     assert d["max_von_mises_MPa"] > 0
     assert d["singularity"] is not None
-    assert d["weld_haz"] is not None
+    # in_haz, not merely present: a zone that never contains the peak exercises
+    # nothing, which is exactly how the report line went untested.
+    assert d["weld_haz"]["in_haz"] is True
+    assert d["weld_haz"]["factor"] == 0.5
     # The peak at the loaded face is higher than the section stress, and the
     # safety factor does not come from it.
     assert run["safety_factor"] != pytest.approx(
@@ -216,3 +224,51 @@ def test_a_stacked_house_margin_is_recorded_as_stacked(eng, gid):
     ws = json.loads(_row(eng, out["action_id"])["details_json"])["weld_static"]
     assert "stacked_margin" in ws
     assert "gamma_Mw=1.25" in ws["stacked_margin"]
+
+
+# ------------------------------- the absolute-strength zone, through a solve
+#: EN 1999-1-1 Table 3.2 prints the HAZ proof strength itself, and a zone may
+#: carry that instead of a ratio. Until 2026-09-30 no SOLVER test paired an
+#: absolute-strength zone with a real run, so `haz["factor"]` being None went
+#: unnoticed until it crashed the report line of a 297,794-node solve - after
+#: the solve had finished. The gap was a missing combination, not a missing
+#: assertion: both halves were covered on their own.
+PROOF_WELD = [{"name": "girth", "proof_MPa": 115.0,
+               "reduction": {"alloy_family": "precipitation_hardening",
+                             "process": "MIG", "thickness_mm": 15.875,
+                             "temper": "T6511"},
+               "extent_mm": 60.0,
+               "source": ("EN 1999-1-1:2007+A1:2009 Table 3.2b, 6061 T6 "
+                          "EP/ET/ER-B, t < 25 mm: f_o,haz = 115 N/mm2"),
+               "lines": [[[0.0, 5.0, 0.0], [10.0, 5.0, 0.0]]]}]
+
+
+def test_a_zone_carrying_an_absolute_strength_survives_a_real_solve(eng, gid):
+    """The regression: it is the REPORT line that broke, not the arithmetic."""
+    case = _case(1000)
+    case["weld"] = PROOF_WELD
+    out = eng.run_fea_static(
+        gid, case, reason="weld_static with an absolute HAZ proof strength")
+    assert out["result"] == "pass"
+    d = json.loads(_row(eng, out["action_id"])["details_json"])
+    haz = d["weld_haz"]
+    assert haz["in_haz"] is True
+    assert haz["factor"] is None
+    assert haz["proof_MPa"] == 115.0
+    # 115 x 0,8 for 15,875 mm - the member-check allowable, NOT the gate here.
+    assert haz["allowable_MPa"] == pytest.approx(92.0)
+    assert "read directly rather than reconstructed" in haz["basis"]
+
+
+def test_the_diagnostic_image_is_still_written_for_such_a_zone(eng, gid):
+    """The crash was inside the string that titles the contour plot.
+
+    A run that solves and then cannot describe itself produces no artifact and
+    no row worth reading, so the artifact is what this asserts.
+    """
+    case = _case(1000)
+    case["weld"] = PROOF_WELD
+    out = eng.run_fea_static(gid, case, reason="weld_static artifact check")
+    d = json.loads(_row(eng, out["action_id"])["details_json"])
+    png = eng.validation.root / d["artifacts"][0]
+    assert png.is_file() and png.stat().st_size > 1000
