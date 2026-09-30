@@ -309,3 +309,136 @@ def test_other_limit_states_still_reject_the_weld_keys():
     case = _case(limit_state={"name": "yield_von_mises"})
     with pytest.raises(FeaError):
         validate_case(case)
+
+
+# =========================================================================
+# Table 3.2b footnote 4 - the thickness/process reduction.
+#
+# weld_static shipped on 2026-09-30 REFUSING a joint outside the tabulated
+# validity, on the grounds that the engine did not hold the reduction and
+# would not invent one. The footnote turned out to hold it. The refusal was
+# right at the time and is wrong now, and what changed is a source rather
+# than a policy - so these tests pin the factor to the clause, not to a
+# preference.
+#
+#   MIG, valid to 15 mm.  TIG on 6xxx/7xxx to 6 mm takes 0,8.
+#   Above those: a further 0,8 (6xxx/7xxx) or 0,9 (3xxx/5xxx/8011A).
+#   Not in temper O.
+#
+# "Higher thickness" is fixed at >15 mm MIG / >6 mm TIG by Table 3.2c
+# footnote 2, which sends exactly those two cases to footnote 4.
+# =========================================================================
+
+from design_engine.weld import en1999_haz_reduction
+
+PRECIP = "precipitation_hardening"
+STRAIN = "strain_hardening"
+
+
+def test_mig_inside_the_range_is_not_reduced():
+    assert en1999_haz_reduction(PRECIP, "MIG", 12.0)["factor"] == 1.0
+    assert en1999_haz_reduction(STRAIN, "MIG", 15.0)["factor"] == 1.0
+
+
+def test_mig_above_15mm_takes_0_8_for_6xxx():
+    """The crossbeam case: 15,875 mm of 6061."""
+    r = en1999_haz_reduction(PRECIP, "MIG", 15.875)
+    assert r["factor"] == pytest.approx(0.8)
+    assert "15 mm MIG limit" in r["basis"]
+
+
+def test_mig_above_15mm_takes_0_9_for_strain_hardening():
+    assert en1999_haz_reduction(STRAIN, "MIG", 20.0)["factor"] == pytest.approx(0.9)
+
+
+def test_tig_on_6xxx_is_reduced_even_inside_6mm():
+    assert en1999_haz_reduction(PRECIP, "TIG", 5.0)["factor"] == pytest.approx(0.8)
+
+
+def test_tig_on_6xxx_above_6mm_compounds_to_0_64():
+    """'a FURTHER 0,8' - the TIG branch has already taken one."""
+    assert en1999_haz_reduction(PRECIP, "TIG", 10.0)["factor"] == pytest.approx(0.64)
+
+
+def test_tig_on_strain_hardening_inside_6mm_is_not_reduced():
+    assert en1999_haz_reduction(STRAIN, "TIG", 3.0)["factor"] == 1.0
+
+
+def test_tig_on_strain_hardening_above_6mm_takes_0_9():
+    assert en1999_haz_reduction(STRAIN, "TIG", 9.0)["factor"] == pytest.approx(0.9)
+
+
+def test_temper_O_is_exempt():
+    """'These reductions do not apply in temper O.'"""
+    assert en1999_haz_reduction(STRAIN, "TIG", 40.0, temper="O")["factor"] == 1.0
+    assert en1999_haz_reduction(PRECIP, "MIG", 40.0, temper="o")["factor"] == 1.0
+
+
+def test_an_undeclared_alloy_family_is_refused():
+    with pytest.raises(WeldError, match="alloy_family"):
+        en1999_haz_reduction("6xxx", "MIG", 20.0)
+
+
+def test_a_process_the_footnote_does_not_cover_is_refused():
+    """Footnote 4 covers MIG and TIG. FSW, laser and MMA are not in it."""
+    with pytest.raises(WeldError, match="MIG and TIG only"):
+        en1999_haz_reduction(PRECIP, "FSW", 10.0)
+
+
+# ------------------------------------------- derivation through WeldResistance
+def test_the_crossbeam_now_resolves_instead_of_refusing():
+    """15,875 mm of 6061-T6511, MIG: 175 -> 140 -> 112 MPa.
+
+    This is the case the limit state was built for and could not check on the
+    day it shipped.
+    """
+    r = WeldResistance(_res(thickness_mm=15.875, alloy_family=PRECIP,
+                            temper="T6511"))
+    assert r.reduction_factor == pytest.approx(0.8)
+    assert r.f_u_haz_effective_MPa == pytest.approx(140.0)
+    assert r.design_MPa == pytest.approx(112.0)
+    assert r.derived is not None
+    assert "Table 3.2b footnote 4" in r.derived["source"]
+    assert "Table 3.2c footnote 2" in r.derived["source"]
+
+
+def test_the_derived_reduction_is_marked_as_derived_in_the_record():
+    """A code value and a declared one must be distinguishable in the log."""
+    auto = WeldResistance(_res(thickness_mm=15.875, alloy_family=PRECIP)).to_dict()
+    declared = WeldResistance(_res(
+        thickness_mm=15.875, reduction_factor=0.75,
+        reduction_factor_source="test fixture")).to_dict()
+    assert auto["reduction_derived"] is not None
+    assert declared["reduction_derived"] is None
+    assert declared["reduction_factor"] == 0.75
+
+
+def test_a_declared_reduction_still_overrides_the_code_value():
+    """The engine applies the clause; it does not insist on it.
+
+    A National Annex, a qualified procedure or test data can justify another
+    number, and supplying one with its source stays available.
+    """
+    r = WeldResistance(_res(thickness_mm=15.875, alloy_family=PRECIP,
+                            reduction_factor=0.95,
+                            reduction_factor_source="test fixture"))
+    assert r.reduction_factor == pytest.approx(0.95)
+    assert r.derived is None
+
+
+def test_declaring_a_family_inside_the_range_changes_nothing():
+    a = WeldResistance(_res()).design_MPa
+    b = WeldResistance(_res(alloy_family=PRECIP)).design_MPa
+    assert a == pytest.approx(b)
+    assert a == pytest.approx(140.0)
+
+
+def test_the_refusal_now_names_the_clause_and_the_two_families():
+    """Refusing without saying what would clear it is a dead end, not a gate."""
+    with pytest.raises(WeldError) as e:
+        WeldResistance(_res(thickness_mm=15.875))
+    msg = str(e.value)
+    assert "Table 3.2b footnote 4" in msg
+    assert "0,8 for 6xxx/7xxx" in msg
+    assert "0,9 for 3xxx/5xxx/8011A" in msg
+    assert "alloy_family" in msg

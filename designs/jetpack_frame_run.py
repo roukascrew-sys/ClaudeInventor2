@@ -95,11 +95,17 @@ from design_engine.geometry import SpecError
 ROOT = Path(__file__).parent.parent / "data"
 eng = DesignEngine(ROOT)
 
-AL = {"name": "6061-T6511", "E_MPa": 68900, "nu": 0.33, "yield_MPa": 276,
-      "source": "OnlineMetals product pages (pid 1145, 1087), reused from "
-                "this project's ladder build: yield 40 ksi, ultimate 42 ksi. "
-                "E, nu are standard published values for wrought aluminum "
-                "alloys (E~69 GPa, nu~0.33)."}
+AL = {"name": "6061-T6511", "E_MPa": 68900, "nu": 0.33, "yield_MPa": 240,
+      "source": "EN 1999-1-1:2007+A1:2009 Table 3.2b, 6061 T6, extruded "
+                "profiles/tube/rod-bar (EP/ET/ER-B), t < 25 mm: "
+                "f_o = 240, f_u = 260 N/mm2. SUPERSEDES the 276 MPa "
+                "(40 ksi) taken from OnlineMetals product pages on "
+                "2026-09-30: a supplier minimum is not the code "
+                "characteristic value, and mixing it with Table "
+                "3.2b's rho_o,haz - which is DEFINED against "
+                "f_o = 240 - overstates the HAZ allowable by 15%. "
+                "E and nu remain standard published values for "
+                "wrought aluminium."}
 REQUIRED_SF = 3.0   # my judgment call -- see module docstring, not a code cite
 
 # --- sourced propulsion (JetCat P400-PRO x5) --------------------------------

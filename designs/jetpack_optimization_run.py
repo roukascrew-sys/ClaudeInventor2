@@ -106,10 +106,18 @@ REQUIRED_SF = 3.0         # engineer's judgment, NOT a code citation
 
 MATERIALS = {
     "6061-T6511": {
-        "name": "6061-T6511", "E_MPa": 68900, "nu": 0.33, "yield_MPa": 276,
+        "name": "6061-T6511", "E_MPa": 68900, "nu": 0.33, "yield_MPa": 240,
         "density_kg_m3": 2700,
-        "source": "OnlineMetals product pages (pid 1145, 1087): yield 40 ksi. "
-                  "E and nu standard published values for wrought aluminium.",
+        "source": "EN 1999-1-1:2007+A1:2009 Table 3.2b, 6061 T6, extruded "
+                  "profiles/tube/rod-bar (EP/ET/ER-B), t < 25 mm: "
+                  "f_o = 240, f_u = 260 N/mm2. SUPERSEDES the 276 MPa "
+                  "(40 ksi) taken from OnlineMetals product pages on "
+                  "2026-09-30: a supplier minimum is not the code "
+                  "characteristic value, and mixing it with Table "
+                  "3.2b's rho_o,haz - which is DEFINED against "
+                  "f_o = 240 - overstates the HAZ allowable by 15%. "
+                  "E and nu remain standard published values for "
+                  "wrought aluminium.",
         "service_temp_C": FRAME_TEMP_C, "yield_derate_curve": K02_6061,
         "E_derate_curve": KE_6XXX, "derate_source": EC9_SRC},
     "1018-cold-finish": {
@@ -120,6 +128,12 @@ MATERIALS = {
         "service_temp_C": FRAME_TEMP_C, "yield_derate_curve": KY_STEEL,
         "E_derate_curve": KE_STEEL, "derate_source": EC3_SRC},
 }
+
+#: Read from the declaration above, never written twice. A literal 276.0 lived
+#: in the HAZ sensitivity report until 2026-09-30 and went on reporting the old
+#: parent strength after the material was corrected to the Eurocode value -
+#: which is how a number the log calls sourced stops matching its own source.
+PARENT_PROOF_MPa = MATERIALS["6061-T6511"]["yield_MPa"]
 
 # --- L0 calibration against real FEA. THREE data points, all named. -------
 # Kt at the doubler step, from the hand build:
@@ -819,7 +833,7 @@ def haz_verdict(sf_at_parent: float = 4.633, required_sf: float = REQUIRED_SF,
     out = verdict_across(
         HAZ_RANGE,
         lambda rho: (sf_at_parent * rho >= required_sf,
-                     {"allowable_MPa": round(276.0 * rho, 1),
+                     {"allowable_MPa": round(PARENT_PROOF_MPa * rho, 1),
                       "sf": round(sf_at_parent * rho, 3)}))
     need = required_value(sf_at_parent * HAZ_RANGE.nominal.value,
                           HAZ_RANGE.nominal.value, required_sf)

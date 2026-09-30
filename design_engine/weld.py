@@ -245,9 +245,103 @@ _ROLES = ("HAZ F", "HAZ T")
 _HAZ_VALID_PROCESS = "MIG"
 _HAZ_VALID_THICKNESS_MM = 15.0
 
+_PRECIPITATION = "precipitation_hardening"
+_STRAIN = "strain_hardening"
+#: 6xxx and 7xxx are precipitation hardening; 3xxx, 5xxx and 8011A are strain
+#: hardening. The engine does NOT infer this from an alloy designation - the
+#: material name in a case is a free string, and parsing a strength-governing
+#: decision out of one is the class of guess this module exists to refuse.
+_ALLOY_FAMILIES = (_PRECIPITATION, _STRAIN)
+
+_MIG_VALID_THICKNESS_MM = 15.0
+_TIG_VALID_THICKNESS_MM = 6.0
+
+_FOOTNOTE_4 = (
+    "EN 1999-1-1:2007+A1:2009 Table 3.2b footnote 4 (identically Table 3.2a "
+    "footnote 2): HAZ values are valid for MIG welding up to 15 mm; TIG on "
+    "6xxx/7xxx up to 6 mm takes 0,8; above those thicknesses the HAZ values "
+    "and rho-factors are reduced by a further 0,8 (6xxx/7xxx) or 0,9 "
+    "(3xxx/5xxx/8011A); the reductions do not apply in temper O. 'Higher "
+    "thickness' is fixed at >15 mm for MIG and >6 mm for TIG by Table 3.2c "
+    "footnote 2, which points at footnote 4 for exactly those two cases")
+
+
+def en1999_haz_reduction(alloy_family: str, process: str, thickness_mm: float,
+                         temper: str | None = None) -> dict:
+    """The reduction Table 3.2b footnote 4 puts on the tabulated HAZ values.
+
+    This is a SOURCED factor, not a house rule, which is why the engine may
+    apply it without being handed a number. It was previously refused outright
+    because the footnote had not been read: on 2026-09-30 `weld_static` shipped
+    demanding a `reduction_factor` the standard turns out to supply itself.
+
+    What the footnote does NOT do is say which family an alloy belongs to, so
+    that stays a declaration. 6061 is 6xxx and therefore precipitation
+    hardening, but the engine is not in the business of reading that off a
+    string.
+
+    One word is being interpreted. The footnote says the values are reduced by
+    "a further 0,8" above the thickness limit, and "further" is natural for the
+    TIG branch, which has already taken 0,8, but loose for the MIG branch,
+    which has taken nothing. It is read here as: apply 0,8 to whatever the
+    process branch already gives. Under the other reading MIG above 15 mm would
+    be entirely uncovered - which Table 3.2c footnote 2 forbids, since it sends
+    thicknesses over 15 mm MIG to this very footnote for an answer.
+    """
+    if alloy_family not in _ALLOY_FAMILIES:
+        raise WeldError(
+            f"alloy_family: must be one of {list(_ALLOY_FAMILIES)}, got "
+            f"{alloy_family!r}. EN 1999-1-1 Table 3.2b footnote 4 reduces "
+            f"6xxx/7xxx and 3xxx/5xxx/8011A by different factors, and this "
+            f"engine will not read the family off an alloy designation")
+    if not isinstance(thickness_mm, (int, float)) or thickness_mm <= 0:
+        raise WeldError("thickness_mm: must be a positive number")
+
+    precip = alloy_family == _PRECIPITATION
+    steps = []
+
+    if temper is not None and str(temper).strip().upper() == "O":
+        return {"factor": 1.0,
+                "basis": "temper O: footnote 4 says these reductions do not "
+                         "apply in temper O",
+                "source": _FOOTNOTE_4,
+                "process": process, "thickness_mm": float(thickness_mm),
+                "alloy_family": alloy_family, "temper": temper}
+
+    proc = str(process).strip().upper()
+    if proc == "MIG":
+        limit = _MIG_VALID_THICKNESS_MM
+        factor = 1.0
+        steps.append("MIG: tabulated values apply as printed up to 15 mm")
+    elif proc == "TIG":
+        limit = _TIG_VALID_THICKNESS_MM
+        factor = 0.8 if precip else 1.0
+        steps.append(
+            "TIG on 6xxx/7xxx up to 6 mm: x0,8" if precip
+            else "TIG on 3xxx/5xxx/8011A up to 6 mm: tabulated values apply")
+    else:
+        raise WeldError(
+            f"process {process!r}: EN 1999-1-1 Table 3.2b footnote 4 covers MIG "
+            f"and TIG only. A different process needs its own source, and this "
+            f"engine will not extrapolate one from the two it has")
+
+    if float(thickness_mm) > limit:
+        step = 0.8 if precip else 0.9
+        factor *= step
+        steps.append(
+            f"thickness {float(thickness_mm):g} mm exceeds the {limit:g} mm "
+            f"{proc} limit: a further x{step:g} for "
+            f"{'6xxx/7xxx' if precip else '3xxx/5xxx/8011A'}")
+
+    return {"factor": round(factor, 6), "basis": "; ".join(steps),
+            "source": _FOOTNOTE_4, "process": process,
+            "thickness_mm": float(thickness_mm),
+            "alloy_family": alloy_family, "temper": temper}
+
+
 _RESISTANCE_KEYS = {"f_u_haz_MPa", "source", "gamma_Mw", "gamma_Mw_source",
                     "process", "thickness_mm", "reduction_factor",
-                    "reduction_factor_source"}
+                    "reduction_factor_source", "alloy_family", "temper"}
 _SECTION_KEYS = {"name", "role", "point_mm", "normal"}
 
 
@@ -329,25 +423,41 @@ class WeldResistance:
 
         red = spec.get("reduction_factor")
         redsrc = spec.get("reduction_factor_source")
+        family = spec.get("alloy_family")
+        temper = spec.get("temper")
         outside = []
         if process.strip().upper() != _HAZ_VALID_PROCESS:
             outside.append(f"process {process!r} is not {_HAZ_VALID_PROCESS}")
         if float(t) > _HAZ_VALID_THICKNESS_MM:
             outside.append(f"thickness {float(t):g} mm exceeds "
                            f"{_HAZ_VALID_THICKNESS_MM:g} mm")
+
+        # THE REDUCTION IS IN THE STANDARD, so the engine derives it rather
+        # than demanding a number. It refused to on 2026-09-30 because the
+        # footnote had not been read; that refusal was right at the time and is
+        # wrong now, and the difference is a source, not a change of policy.
+        #
+        # What still is NOT derived is which family the alloy belongs to.
+        # Footnote 4 reduces 6xxx/7xxx and 3xxx/5xxx/8011A differently, and
+        # reading that off a free-text alloy name would be the guess this
+        # module exists to refuse.
+        derived = None
         if outside and red is None:
-            raise WeldError(
-                "case.limit_state.resistance: the tabulated HAZ strength is "
-                "outside its stated validity (" + "; ".join(outside) + "). "
-                "EN 1999-1-1 Table 3.2 gives f_u,haz for MIG welding up to "
-                "15 mm and requires a further reduction beyond that; this "
-                "engine does not hold that reduction and will not invent one. "
-                "Supply reduction_factor with reduction_factor_source, or "
-                "change the joint so the tabulated values apply. A refusal is "
-                "the correct outcome here rather than an obstacle: the "
-                "crossbeam this was built for is 15,875 mm and has been "
-                "outside the range of its own softening factor since the "
-                "factor was first sourced")
+            if family is None:
+                raise WeldError(
+                    "case.limit_state.resistance: the tabulated HAZ strength "
+                    "is outside its stated validity ("
+                    + "; ".join(outside) + "), and EN 1999-1-1 Table 3.2b "
+                    "footnote 4 gives the reduction that applies - 0,8 for "
+                    "6xxx/7xxx, 0,9 for 3xxx/5xxx/8011A. The engine will apply "
+                    "it, but not guess which family this alloy is in. Declare "
+                    "alloy_family as 'precipitation_hardening' (6xxx, 7xxx) or "
+                    "'strain_hardening' (3xxx, 5xxx, 8011A), and temper if it "
+                    "is O. To override the code value instead, supply "
+                    "reduction_factor with reduction_factor_source")
+            derived = en1999_haz_reduction(family, process, float(t), temper)
+            red = derived["factor"]
+            redsrc = derived["source"] + " | " + derived["basis"]
         if red is not None:
             if (not isinstance(red, (int, float)) or isinstance(red, bool)
                     or not 0.0 < red <= 1.0):
@@ -371,6 +481,9 @@ class WeldResistance:
         self.reduction_factor = float(red) if red is not None else None
         self.reduction_factor_source = redsrc
         self.outside_validity = outside
+        self.alloy_family = family
+        self.temper = temper
+        self.derived = derived
 
     @property
     def f_u_haz_effective_MPa(self) -> float:
@@ -401,7 +514,13 @@ class WeldResistance:
             "shear_design_resistance_MPa": round(self.shear_design_MPa, 6),
             "process": self.process,
             "thickness_mm": self.thickness_mm,
+            "alloy_family": self.alloy_family,
+            "temper": self.temper,
             "outside_tabulated_validity": self.outside_validity,
+            # Present when the reduction came from the standard rather than
+            # from the case, so a reader can tell a code value from a declared
+            # one without comparing source strings.
+            "reduction_derived": self.derived,
         }
 
 
