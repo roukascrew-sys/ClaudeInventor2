@@ -1978,7 +1978,7 @@ class ValidationTools:
 
     # ------------------------------------------------------------ submodel
     def _write_submodel_inp(self, path: Path, mesh: dict, case: dict,
-                            fragment: dict) -> None:
+                            fragment: dict, solver: str = "direct") -> None:
         """A submodel deck: same material and elements, different restraint.
 
         There is no `*BOUNDARY` fixity and no `*CLOAD` here, and that is not
@@ -2001,7 +2001,22 @@ class ValidationTools:
         lines += ["*MATERIAL, NAME=MAT", "*ELASTIC",
                   f"{eff['E_MPa_effective']:.9g}, {mat['nu']:.9g}",
                   "*SOLID SECTION, ELSET=EALL, MATERIAL=MAT",
-                  "*STEP", "*STATIC"]
+                  "*STEP"]
+        # Same solver choice as fea_static, and for a sharper reason here:
+        # the submodel is where the memory wall actually bit. A 420,896-node
+        # rung was refused at a predicted 7,498 MB and a 1,176,235-node one
+        # timed out holding 7,246 MB. Those are the meshes an iterative
+        # solver exists for.
+        #
+        # It is NOT a free transfer from the fea_static measurement. That
+        # was a force-loaded cantilever; a submodel deck is driven by
+        # thousands of *BOUNDARY cards on the cut face, which changes the
+        # conditioning, and PCG is sensitive to conditioning where a direct
+        # factorisation is not. Hence the same rule: opt-in, and recorded.
+        if solver not in _SOLVERS:
+            raise FeaError(f"unknown solver {solver!r}; have {sorted(_SOLVERS)}")
+        opt = _SOLVERS[solver]
+        lines.append("*STATIC" if opt is None else f"*STATIC, {opt}")
         lines += fragment["inside_step"]
         lines += ["*NODE FILE", "U", "*EL FILE", "S", "*END STEP", ""]
         path.write_text("\n".join(lines), encoding="ascii")
@@ -2030,6 +2045,7 @@ class ValidationTools:
                      standoff_elements: float, standoff_source: str = "",
                      centre=None, start_mesh_mm: float | None = None,
                      base_mesh_mm: float | None = None,
+                     solver: str = "direct",
                      max_projection_mm: float = 0.0,
                      ladder_steps: int = 3,
                      ladder_factor: float = 2.0, tol_pct: float = 5.0) -> dict:
@@ -2283,9 +2299,11 @@ class ValidationTools:
                             f"outside the global tet mesh's faceted boundary")
                     frag = {"before_step": [],
                             "inside_step": boundary_cards(interp["values"])}
-                    self._write_submodel_inp(run_dir / "job.inp", m, case, frag)
+                    self._write_submodel_inp(run_dir / "job.inp", m, case,
+                                             frag, solver=solver)
                     _, binary, threads, solve_s = self._solve(
-                        run_dir, len(m["node_tags"]), what=f"submodel {mm:g}mm")
+                        run_dir, len(m["node_tags"]),
+                        what=f"submodel {mm:g}mm", solver=solver)
                     blocks = _parse_frd(run_dir / "job.frd")
                     stress = blocks.get("STRESS", {})
                     if not stress:
@@ -2329,6 +2347,7 @@ class ValidationTools:
                                   # a reader could not tell a graded rung from
                                   # a uniform one.
                                   "base_mm": base_mm,
+                                  "solver_equations": solver,
                                   "nodes": len(m["node_tags"]),
                                   "projected_nodes": len(interp["projected"]),
                                   "worst_projection_mm": (
