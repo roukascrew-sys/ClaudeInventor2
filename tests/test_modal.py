@@ -309,3 +309,121 @@ def test_a_mode_inside_the_separation_band_fails_the_gate(tmp_path):
     assert out["safety_factor"] < 0.2
     row = eng.log.rows(action="fea_modal", result="fail")[-1]
     assert "resonance_separation" in row["failure_mode"]
+
+
+# ===========================================================================
+# A HARMONIC IS NOT CHECKED IF NO MODE WAS COMPUTED NEAR IT.
+#
+# The clash search walks the modes that exist. Modes above the highest one
+# computed were never asked for, so finding no clash near a harmonic proves
+# nothing unless the spectrum actually reaches past that harmonic's band.
+#
+# Action 228 on the jetpack frame is the case in point: 20 modes topping out
+# at 1668.49 Hz, recorded against harmonics at 1633.3 / 3266.7 / 4900.0 Hz
+# whose 20% bands reach 1960.0 / 3920.0 / 5880.0 Hz. All three were logged as
+# checked. None was covered — and even harmonic 1 was only partly seen, so its
+# four clashes are a lower bound. That run failed on the clashes it did find,
+# which is the only reason the hole never showed up as a false pass.
+#
+# Test cantilever, 10 x 10 x 200 mm S235JR: modes 209.02, 209.02, 1294.95,
+# 1294.95 Hz with n_modes=4.
+# ===========================================================================
+
+@pytest.fixture(scope="module")
+def modal_bar(tmp_path_factory):
+    if not _solver_available():
+        pytest.skip("CalculiX not installed")
+    from design_engine import DesignEngine
+    eng = DesignEngine(tmp_path_factory.mktemp("cov") / "data")
+    eng.validation = ValidationTools(
+        eng.validation.root, eng.log, eng.parts, eng.validation.ccx_path,
+        solve_timeout_s=900)
+    gid = eng.create_part(
+        {"name": "coverage-bar", "units": "mm",
+         "features": [{"op": "box", "x": 10.0, "y": 10.0, "z": 200.0}]},
+        reason="harmonic coverage checks")["geometry_id"]
+    return eng, gid
+
+
+def _modal(eng, gid, exc, harmonics, reason, n_modes=4):
+    return eng.validation.fea_modal(
+        gid, _case(mesh={"max_size_mm": 3.0},
+                   limit_state={"name": "resonance_separation",
+                                "required_SF": 0.2, "excitation_hz": exc,
+                                "harmonics": harmonics}),
+        reason=reason, n_modes=n_modes)
+
+
+def _last(eng):
+    import json
+    return json.loads(eng.log.rows(action="fea_modal")[-1]["details_json"])
+
+
+def test_a_covered_harmonic_with_no_clash_still_passes(modal_bar):
+    """The gate must not become unusable. 600 Hz: band 480–720, and the
+    spectrum reaches 1294.95, so the clearance is genuinely established."""
+    eng, gid = modal_bar
+    out = _modal(eng, gid, 600.0, 1, "a harmonic the spectrum covers")
+    assert out["result"] == "pass"
+    d = _last(eng)
+    assert d["highest_mode_hz"] == pytest.approx(1294.95, abs=1.0)
+    assert [c["covered"] for c in d["harmonic_coverage"]] == [True]
+    assert "coverage_undefined" not in d
+
+
+def test_a_harmonic_above_the_spectrum_is_refused_not_passed(modal_bar):
+    """5000 Hz is 3.9x the highest computed mode, so no clash CAN be found.
+
+    Before 2026-10-01 this returned a pass: no clash among the modes present,
+    therefore clear. It is not clear, it is unexamined.
+    """
+    eng, gid = modal_bar
+    out = _modal(eng, gid, 5000.0, 1, "a harmonic far above the spectrum")
+    assert out["result"] == "fail"
+    d = _last(eng)
+    assert d["clashes"] == [], "there is no clash to find up there"
+    assert [c["covered"] for c in d["harmonic_coverage"]] == [False]
+    cu = d["coverage_undefined"]
+    assert cu["reason"] == "spectrum_stops_below_harmonic_band"
+    assert cu["uncovered"][0]["band_upper_hz"] == pytest.approx(6000.0)
+    assert "UNDETERMINED" in cu["note"]
+
+
+def test_the_refusal_names_the_frequency_the_solve_must_reach(modal_bar):
+    """A refusal that does not say what would satisfy it is a dead end."""
+    eng, gid = modal_bar
+    _modal(eng, gid, 5000.0, 1, "refusal message check")
+    mode = eng.log.rows(action="fea_modal")[-1]["failure_mode"]
+    assert mode.startswith("resonance_separation_undetermined")
+    assert "6000.0 Hz" in mode
+    assert "n_modes" in mode
+    # It is the GATE that is inapplicable, not the structure that failed.
+    assert "NOT" in mode and "the structure failing" in mode
+
+
+def test_a_real_clash_still_reports_as_a_clash_and_flags_the_lower_bound(modal_bar):
+    """600 Hz with 2 harmonics: h2 = 1200 Hz clashes with the 1294.95 mode
+    (7.9%), AND its band reaches 1440 Hz, past the spectrum. Both are true and
+    the message has to carry both without letting either hide the other."""
+    eng, gid = modal_bar
+    out = _modal(eng, gid, 600.0, 2, "a clash on an uncovered harmonic")
+    assert out["result"] == "fail"
+    d = _last(eng)
+    assert d["clashes"], "harmonic 2 at 1200 Hz sits 7.9% from mode 3"
+    assert [c["covered"] for c in d["harmonic_coverage"]] == [True, False]
+    mode = eng.log.rows(action="fea_modal")[-1]["failure_mode"]
+    assert mode.startswith("resonance_separation:")
+    assert "LOWER BOUND" in mode
+
+
+def test_coverage_is_decided_by_the_band_edge_not_the_excitation(modal_bar):
+    """The band reaches 1.2x the harmonic, so a harmonic BELOW the highest
+    mode can still be uncovered. 1100 Hz < 1294.95, but its band ends at
+    1320 Hz, which is above it."""
+    eng, gid = modal_bar
+    out = _modal(eng, gid, 1100.0, 1, "excitation under the top mode, band over it")
+    d = _last(eng)
+    assert d["excitation_hz"] < d["highest_mode_hz"]
+    assert d["harmonic_coverage"][0]["band_upper_hz"] == pytest.approx(1320.0)
+    assert d["harmonic_coverage"][0]["covered"] is False
+    assert out["result"] == "fail"

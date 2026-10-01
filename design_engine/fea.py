@@ -1756,12 +1756,47 @@ class ValidationTools:
                             "separation": round(sep, 6)})
 
             required = float(ls["required_SF"])
+
+            # A HARMONIC IS NOT "CHECKED" IF NO MODE WAS COMPUTED NEAR IT.
+            #
+            # The clash search above walks the modes that exist. Modes above
+            # the highest one computed are not absent - they were never asked
+            # for - so finding no clash near a harmonic says nothing unless
+            # the spectrum actually reaches past that harmonic's band.
+            #
+            # Action 228 is the case in point: 20 modes topping out at
+            # 1668.49 Hz, against harmonics at 1633.3, 3266.7 and 4900.0 Hz
+            # and a 20% band reaching 1960.0, 3920.0 and 5880.0 Hz. It
+            # recorded all three as checked. Not one of them was covered, and
+            # even harmonic 1 was only partly seen - so its four clashes are a
+            # LOWER BOUND. That run failed anyway on the clashes it did find,
+            # which is the only reason the hole did not show as a false pass.
+            #
+            # Same shape as the singular-peak refusal in fea_static: the gate
+            # is inapplicable rather than the part being sound, and it says so
+            # in those terms.
+            highest_hz = max(freqs) if freqs else 0.0
+            coverage = []
+            for h_i, f_exc in enumerate(checked, start=1):
+                edge = f_exc * (1.0 + required)
+                coverage.append({
+                    "harmonic": h_i,
+                    "excitation_hz": round(f_exc, 4),
+                    "band_upper_hz": round(edge, 4),
+                    "covered": bool(highest_hz >= edge)})
+            uncovered = [c for c in coverage if not c["covered"]]
+
             details = {
                 "limit_state": "resonance_separation",
                 "required_SF": required,
                 "safety_factor": round(separation, 6),
                 "excitation_hz": exc_hz,
+                # The harmonic frequencies the gate was ASKED to clear. Whether
+                # the spectrum reached them is harmonic_coverage, below - the
+                # two were conflated until 2026-10-01.
                 "harmonics_checked": [round(f, 4) for f in checked],
+                "harmonic_coverage": coverage,
+                "highest_mode_hz": round(highest_hz, 4),
                 "mode_frequencies_hz": [round(f, 4) for f in freqs],
                 "n_modes": len(freqs),
                 "clashes": clashes,
@@ -1773,12 +1808,31 @@ class ValidationTools:
                 "peak_rss_mb": proc.peak_rss_mb,
                 "artifacts": [],
             }
-            passed = not clashes
+            if uncovered:
+                details["coverage_undefined"] = {
+                    "reason": "spectrum_stops_below_harmonic_band",
+                    "highest_mode_hz": round(highest_hz, 4),
+                    "uncovered": uncovered,
+                    "modes_requested": n_modes,
+                    "note": ("no mode was computed up to these harmonics' "
+                             "upper band edges, so their clearance is "
+                             "UNDETERMINED - not clear. Raise n_modes until "
+                             "the highest mode exceeds the largest "
+                             "band_upper_hz, or lower limit_state.harmonics "
+                             "to what the solve can actually reach"),
+                }
+            passed = not clashes and not uncovered
 
         if passed:
             self.log.close_action(action_id, "pass", details=details)
-        else:
+        elif clashes:
             worst = min(clashes, key=lambda c: c["separation"])
+            extra = ""
+            if uncovered:
+                extra = (f" Separately, {len(uncovered)} of {len(coverage)} "
+                         f"harmonics reach above the highest computed mode "
+                         f"({highest_hz:.1f} Hz), so the clash count is a "
+                         f"LOWER BOUND.")
             self.log.close_action(
                 action_id, "fail", details=details,
                 failure_mode=(
@@ -1786,7 +1840,22 @@ class ValidationTools:
                     f"{worst['mode_hz']:.1f} Hz is {worst['separation'] * 100:.1f}% "
                     f"from harmonic {worst['harmonic']} of the excitation "
                     f"({worst['excitation_hz']:.1f} Hz), inside the required "
-                    f"{required * 100:.0f}% separation"))
+                    f"{required * 100:.0f}% separation." + extra))
+        else:
+            worst_gap = max(uncovered, key=lambda c: c["band_upper_hz"])
+            self.log.close_action(
+                action_id, "fail", details=details,
+                failure_mode=(
+                    f"resonance_separation_undetermined: no clash was found "
+                    f"among the {len(freqs)} modes computed, but the spectrum "
+                    f"stops at {highest_hz:.1f} Hz and harmonic "
+                    f"{worst_gap['harmonic']} needs modes out to "
+                    f"{worst_gap['band_upper_hz']:.1f} Hz. "
+                    f"{len(uncovered)} of {len(coverage)} harmonics were not "
+                    f"covered, so their clearance is UNDETERMINED rather than "
+                    f"established. This is the GATE being inapplicable, NOT "
+                    f"the structure failing - raise n_modes past "
+                    f"{worst_gap['band_upper_hz']:.1f} Hz and re-run"))
         return {"result": "pass" if passed else "fail",
                 "action_id": action_id,
                 "failure_id": None if passed else action_id,
