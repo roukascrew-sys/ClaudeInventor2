@@ -12,6 +12,7 @@ wrong returns confident, plausible, wrong numbers, and the only way to catch
 that is to check it against an answer computed independently.
 """
 
+import json
 import math
 import textwrap
 
@@ -427,3 +428,205 @@ def test_coverage_is_decided_by_the_band_edge_not_the_excitation(modal_bar):
     assert d["harmonic_coverage"][0]["band_upper_hz"] == pytest.approx(1320.0)
     assert d["harmonic_coverage"][0]["covered"] is False
     assert out["result"] == "fail"
+
+
+# ===========================================================================
+# NON-STRUCTURAL MASS.
+#
+# Every frequency this project computed before 2026-10-01 was the bare frame.
+# The jetpack carries four turbines at 3.65 kg dry on the ends of a 1280 mm
+# crossbeam - 14.6 kg of engine on a 5.15 kg structure - and f = sqrt(k/m), so
+# leaving them out does not make the answer slightly optimistic. It makes every
+# frequency an upper bound of unknown looseness.
+#
+# The check that matters is closed form. A cantilever with a tip mass M is an
+# SDOF oscillator with k = 3EI/L^3 and m_eff = M + (33/140) m_beam:
+#
+#   10 x 10 x 200 mm S235JR, M = 0.5 kg
+#   k       = 3 x 210000 x 833.333 / 200^3      = 65.625 N/mm
+#   m_beam  = 7.85e-9 x 100 x 200               = 1.570e-4 t
+#   m_eff   = 5.0e-4 + (33/140) x 1.570e-4      = 5.370e-4 t
+#   f1      = sqrt(k/m_eff) / 2pi               = 55.6 Hz
+#
+# against 209.0 Hz bare. A factor of 3.76 is not a tolerance argument.
+# ===========================================================================
+
+MASS_SRC = "test fixture, not a datasheet value"
+
+
+def _mass_case(mass_kg=0.5, where=None, **over):
+    c = _case(mesh={"max_size_mm": 3.0},
+              limit_state={"name": "resonance_separation", "required_SF": 0.2,
+                           "excitation_hz": 40.0, "harmonics": 1})
+    c["point_masses"] = [{"name": "tip", "mass_kg": mass_kg,
+                          "where": where or {"axis": "z", "at": "max"},
+                          "source": MASS_SRC}]
+    c.update(over)
+    return c
+
+
+# ------------------------------------------------------------------ refusals
+def test_an_unsourced_mass_is_refused():
+    c = _mass_case()
+    c["point_masses"][0]["source"] = "  "
+    with pytest.raises(FeaError, match="source"):
+        validate_case(c)
+
+
+def test_the_refusal_says_why_a_mass_needs_a_source():
+    c = _mass_case()
+    del c["point_masses"][0]["source"]
+    with pytest.raises(FeaError, match="missing"):
+        validate_case(c)
+    c["point_masses"][0]["source"] = ""
+    with pytest.raises(FeaError) as e:
+        validate_case(c)
+    assert "divides into every natural frequency" in str(e.value)
+
+
+def test_a_zero_or_negative_mass_is_refused():
+    for bad in (0.0, -1.0):
+        c = _mass_case(mass_kg=bad)
+        with pytest.raises(FeaError, match="mass_kg"):
+            validate_case(c)
+
+
+def test_an_empty_mass_list_is_refused_rather_than_ignored():
+    c = _mass_case()
+    c["point_masses"] = []
+    with pytest.raises(FeaError, match="non-empty"):
+        validate_case(c)
+
+
+def test_a_mass_on_a_static_case_is_refused_not_silently_dropped():
+    """A static solve here applies FORCE boundary conditions and has no gravity
+    term, so a mass contributes nothing. Accepting the key would let a case
+    look like it models the engines when it does not."""
+    c = _mass_case()
+    c["limit_state"] = {"name": "yield_von_mises", "required_SF": 2.0}
+    # a static case needs loads, or that refusal fires first
+    c["loads"] = [{"where": {"axis": "z", "at": "max"},
+                   "force_total_N": [0.0, 0.0, 1000.0]}]
+    with pytest.raises(FeaError) as e:
+        validate_case(c)
+    assert "only read by a modal solve" in str(e.value)
+
+
+def test_duplicate_mass_names_are_refused():
+    c = _mass_case()
+    c["point_masses"].append(dict(c["point_masses"][0]))
+    with pytest.raises(FeaError, match="duplicate names"):
+        validate_case(c)
+
+
+def test_an_unknown_mass_key_is_refused():
+    c = _mass_case()
+    c["point_masses"][0]["inertia_kg_m2"] = 0.01
+    with pytest.raises(FeaError, match="unexpected keys"):
+        validate_case(c)
+
+
+# ---------------------------------------------------------------- the deck
+def test_the_mass_is_converted_to_tonnes_in_the_deck(tmp_path):
+    """THE UNIT TRAP, second time. 1 N = 1 t x 1 mm/s^2, so a mass in kg fed
+    straight in makes every frequency wrong by sqrt(1000) = 31.6."""
+    mesh = {"node_tags": [1, 2], "coords": [(0.0, 0.0, 0.0), (0.0, 0.0, 1.0)],
+            "connectivity": [[1] * 10]}
+    inp = tmp_path / "job.inp"
+    _write_inp(inp, mesh, _mass_case(), [[1]], [], analysis="frequency",
+               n_modes=4,
+               mass_sets=[{"name": "tip", "mass_kg": 0.5, "source": MASS_SRC,
+                           "tags": [1, 2], "nodes": 2}])
+    text = inp.read_text()
+    assert "*ELEMENT, TYPE=MASS, ELSET=EMASS0" in text
+    per = float(text.split("*MASS, ELSET=EMASS0\n")[1].splitlines()[0])
+    # 0.5 kg over 2 nodes = 0.25 kg each = 2.5e-4 t
+    assert per == pytest.approx(2.5e-4, rel=1e-9)
+
+
+def test_mass_elements_do_not_reuse_solid_element_ids(tmp_path):
+    """A MASS element sharing an id with a C3D10 silently redefines it, and
+    CalculiX solves the resulting deck without complaint."""
+    mesh = {"node_tags": [1, 2], "coords": [(0.0, 0.0, 0.0), (0.0, 0.0, 1.0)],
+            "connectivity": [[1] * 10, [2] * 10]}
+    inp = tmp_path / "job.inp"
+    _write_inp(inp, mesh, _mass_case(), [[1]], [], analysis="frequency",
+               n_modes=4,
+               mass_sets=[{"name": "tip", "mass_kg": 1.0, "source": MASS_SRC,
+                           "tags": [1, 2], "nodes": 2}])
+    text = inp.read_text()
+    block = text.split("*ELEMENT, TYPE=MASS, ELSET=EMASS0\n")[1]
+    ids = [int(l.split(",")[0]) for l in block.splitlines()[:2]]
+    assert ids == [3, 4], f"2 solids exist, so mass ids start at 3; got {ids}"
+
+
+def test_a_static_deck_carries_no_mass_element(tmp_path):
+    mesh = {"node_tags": [1], "coords": [(0.0, 0.0, 0.0)],
+            "connectivity": [[1] * 10]}
+    inp = tmp_path / "job.inp"
+    _write_inp(inp, mesh, _case(), [[1]], [], analysis="static",
+               mass_sets=[{"name": "x", "mass_kg": 1.0, "source": MASS_SRC,
+                           "tags": [1], "nodes": 1}])
+    assert "TYPE=MASS" not in inp.read_text()
+
+
+# --------------------------------------------------------- the closed form
+@pytest.mark.skipif(not _solver_available(), reason="CalculiX not installed")
+def test_a_tip_mass_lowers_the_first_mode_to_the_closed_form(tmp_path):
+    """0.5 kg on a 0.157 kg cantilever: 209.0 Hz -> 55.6 Hz, predicted
+    independently. A modal solve that mishandles added mass returns confident,
+    plausible numbers, and only an outside answer catches it."""
+    from design_engine import DesignEngine
+
+    eng = DesignEngine(tmp_path / "data")
+    eng.validation = ValidationTools(
+        eng.validation.root, eng.log, eng.parts, eng.validation.ccx_path,
+        solve_timeout_s=900)
+    gid = eng.create_part(
+        {"name": "tip-mass", "units": "mm",
+         "features": [{"op": "box", "x": 10.0, "y": 10.0, "z": 200.0}]},
+        reason="tip-mass closed form")["geometry_id"]
+
+    E, b, h, L = 210000.0, 10.0, 10.0, 200.0
+    k = 3.0 * E * (b * h ** 3 / 12.0) / L ** 3          # N/mm
+    m_beam = 7.85e-9 * (b * h) * L                       # tonnes
+    m_eff = 0.5e-3 + (33.0 / 140.0) * m_beam             # tonnes
+    f_expect = math.sqrt(k / m_eff) / (2.0 * math.pi)
+
+    eng.validation.fea_modal(gid, _mass_case(0.5), n_modes=4,
+                             reason="tip mass against the SDOF closed form")
+    d = json.loads(eng.log.rows(action="fea_modal")[-1]["details_json"])
+    f1 = d["mode_frequencies_hz"][0]
+
+    assert f1 == pytest.approx(f_expect, rel=0.06), (
+        f"first mode {f1:.2f} Hz vs closed form {f_expect:.2f} Hz")
+    # And it is a large, unmistakable shift from the bare 209.0 Hz.
+    assert 3.0 < 209.0175 / f1 < 4.5
+    assert d["non_structural_mass_kg"] == pytest.approx(0.5)
+    assert d["point_masses"][0]["nodes"] > 1
+    assert d["point_masses"][0]["source"] == MASS_SRC
+
+
+@pytest.mark.skipif(not _solver_available(), reason="CalculiX not installed")
+def test_a_bare_run_records_an_empty_mass_list(tmp_path):
+    """An empty list in the log is the signal that every frequency in that row
+    is an upper bound. It has to be present, not absent."""
+    from design_engine import DesignEngine
+    eng = DesignEngine(tmp_path / "data")
+    eng.validation = ValidationTools(
+        eng.validation.root, eng.log, eng.parts, eng.validation.ccx_path,
+        solve_timeout_s=900)
+    gid = eng.create_part(
+        {"name": "bare", "units": "mm",
+         "features": [{"op": "box", "x": 10.0, "y": 10.0, "z": 200.0}]},
+        reason="bare reference")["geometry_id"]
+    eng.validation.fea_modal(
+        gid, _case(mesh={"max_size_mm": 3.0},
+                   limit_state={"name": "resonance_separation",
+                                "required_SF": 0.2, "excitation_hz": 600.0,
+                                "harmonics": 1}),
+        n_modes=4, reason="bare structure reference")
+    d = json.loads(eng.log.rows(action="fea_modal")[-1]["details_json"])
+    assert d["point_masses"] == []
+    assert d["non_structural_mass_kg"] == 0
+    assert d["mode_frequencies_hz"][0] == pytest.approx(209.0, abs=1.0)

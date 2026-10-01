@@ -79,6 +79,7 @@ from design_engine.inventor import (AnalyticStage, CallableStage, Candidate,
 ROOT = Path(__file__).parent.parent / "data"
 
 # ---------------------------------------------------------------- sourced
+SHAFT_RPM = 98000.0        # JetCat P400-PRO max shaft speed
 THRUST_N = 397.0          # JetCat P400-PRO, cross-checked across 3 sources
 ENGINE_DRY_KG = 3.65
 ENGINE_DIA = 148.4
@@ -771,6 +772,87 @@ def build_weld_case(cand, ctx) -> dict:
         "required_SF": 1.0,
         "resistance": weld_resistance(cand.values),
         "sections": weld_sections(cand.values),
+    }
+    return case
+
+
+
+#: JetCat P400-PRO dry mass, each. 3,65 kg against a 5,15 kg frame, four of
+#: them, on the ends of a 1280 mm crossbeam: 14,6 kg of non-structural mass on
+#: a structure that masses a third of it, at the worst possible station for
+#: modal effect.
+#:
+#: PROVENANCE GAP, stated rather than glossed: the vault records this as
+#: "cross-checked across three sources" and does not name them. The value is
+#: used because it is the project's own recorded figure and the thrust and
+#: diameter beside it have held up, but a reader auditing this number will not
+#: find the three sources from here.
+ENGINE_DRY_KG = 3.65
+ENGINE_MASS_SOURCE = (
+    "JetCat P400-PRO dry mass 3,65 kg, recorded in the project vault at "
+    "02_Designs/Approved/Jetpack Frame.md as cross-checked across three "
+    "sources - which that note does not name. Dry: no fuel, no fuel pump, no "
+    "ECU, no mount hardware.")
+
+
+def engine_masses(v) -> list:
+    """The four turbines as non-structural mass at their own stations.
+
+    Same selectors as the thrust loads, because the mass hangs where the thrust
+    is applied - any other pairing would model a frame whose engines push in
+    one place and weigh in another.
+
+    WHAT IS STILL MISSING, and both make the frequencies an UPPER BOUND:
+      - fuel. No tank mass or location is recorded anywhere in this project,
+        and a P400-PRO burns enough that the tank is not a rounding error.
+        Inventing one would be the same failure as inventing a softening
+        factor.
+      - rotary inertia and CG standoff. A MASS element carries translational
+        inertia only, so a 148,4 mm diameter turbine whose centre of mass
+        stands off its mounting face is modelled as if that mass sat on the
+        face. The omitted pitching term lowers frequencies further.
+
+    The pilot is NOT missing. Pilot mass reacts through the two lugs, which
+    this case fully restrains, and a mass at a fixed node contributes nothing
+    to a free-vibration solve. Leaving it out is correct here, not a gap.
+    """
+    cb_underside_z = SPINE_Z / 2.0 - float(v["cb_height"]) / 2.0
+    out = []
+    for key in ("inner_x", "outer_x"):
+        for sx in (-1.0, 1.0):
+            tag = "neg" if sx < 0 else "pos"
+            out.append({
+                "name": f"engine_{key.split('_')[0]}_{tag}",
+                "mass_kg": ENGINE_DRY_KG,
+                "source": ENGINE_MASS_SOURCE,
+                "where": {"all": [{"axis": "z", "at": cb_underside_z,
+                                   "tol": 1.0},
+                                  {"axis": "x", "at": sx * float(v[key]),
+                                   "tol": 30.0}]}})
+    return out
+
+
+def build_modal_case(cand, ctx, n_harmonics: int = 1) -> dict:
+    """build_case as a free-vibration case, carrying the engine masses.
+
+    Free vibration takes no loads - frequencies depend on stiffness, mass and
+    restraint only - so case.loads is emptied, and validate_case enforces that
+    rather than trusting it.
+
+    required_SF is the FRACTIONAL separation, 0,2 = every mode at least 20%
+    clear of the excitation and of each harmonic checked. Note what the
+    measured spectrum already says about whether that is reachable at this
+    rpm: it is not. See the vault note "The frame cannot be separated at
+    98,000 rpm". This case exists to get HONEST frequencies, not to pass.
+    """
+    case = build_case(cand, ctx)
+    case["loads"] = []
+    case["point_masses"] = engine_masses(cand.values)
+    case["limit_state"] = {
+        "name": "resonance_separation",
+        "required_SF": 0.2,
+        "excitation_hz": SHAFT_RPM / 60.0,
+        "harmonics": int(n_harmonics),
     }
     return case
 

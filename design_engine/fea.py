@@ -76,7 +76,9 @@ class FeaError(RuntimeError):
         self.details = dict(details) if details else None
 
 
+_POINT_MASS_KEYS = {"name", "mass_kg", "where", "source"}
 _CASE_KEYS = {"material", "mesh", "constraints", "loads", "limit_state",
+              "point_masses",
               "weld", "symmetry"}
 # `weld` is OPTIONAL: a machined or bonded part has no heat-affected zone, and
 # requiring an empty declaration from every case would be noise. _CASE_KEYS is
@@ -87,7 +89,7 @@ _CASE_KEYS = {"material", "mesh", "constraints", "loads", "limit_state",
 # always correct, and a half model is an optimisation the caller opts into and
 # must then justify. Making it required would invert that - the default has to
 # be the answer that needs no assumption.
-_REQUIRED_CASE_KEYS = _CASE_KEYS - {"weld", "symmetry"}
+_REQUIRED_CASE_KEYS = _CASE_KEYS - {"weld", "symmetry", "point_masses"}
 _MATERIAL_KEYS = {"name", "E_MPa", "nu", "yield_MPa", "source",
                   "fatigue",
                   "service_temp_C", "yield_derate_curve", "E_derate_curve",
@@ -281,6 +283,8 @@ def validate_case(case: dict) -> None:
         if all(x == 0 for x in f):
             raise FeaError(f"case.loads[{i}].force_total_N: zero load is not a load case")
 
+    validate_point_masses(case)
+
     ls = case["limit_state"]
     _reject_extra(ls,
                   (_LIMIT_KEYS | _WELD_STATIC_KEYS
@@ -346,6 +350,85 @@ def validate_case(case: dict) -> None:
                 f"is already in gamma_Mw and the check passes at utilisation "
                 f"1,0. A required_SF under 1,0 does not relax a house rule, it "
                 f"cancels part of the code's own factor")
+
+
+def validate_point_masses(case: dict) -> list:
+    """Non-structural mass: what hangs on the structure without stiffening it.
+
+    WHY THIS EXISTS. Every frequency this project had computed before
+    2026-10-01 was the BARE frame. The jetpack carries four turbines at 3.65 kg
+    dry on the ends of a 1280 mm crossbeam - 14.6 kg of engine on a 5.15 kg
+    structure - and a natural frequency is sqrt(stiffness/mass), so leaving
+    them out does not make the answer slightly optimistic. It makes every
+    frequency an upper bound of unknown looseness, and the vault's resonance
+    finding carried exactly that caveat for five weeks.
+
+    A MASS element adds TRANSLATIONAL inertia at a node and nothing else. It
+    carries no rotary inertia and no CG offset, so an engine whose centre of
+    mass stands off its mounting face is modelled as though that mass sat on
+    the face. That omits a pitching inertia term which lowers frequencies
+    further, so the result stays an upper bound - a tighter one, not a true
+    one. Said here because a number that moved a lot invites being trusted.
+
+    The mass is REQUIRED to be sourced, like every other number that sets an
+    answer: it divides into the frequency exactly as the stiffness does.
+    """
+    spec = case.get("point_masses")
+    if spec is None:
+        return []
+    if not isinstance(case.get("limit_state"), dict):
+        raise FeaError("case.limit_state: required before point_masses can be "
+                       "checked against it")
+    if not isinstance(spec, list) or not spec:
+        raise FeaError(
+            "case.point_masses: expected a non-empty list, or omit the key. An "
+            "empty list asserts that nothing hangs on the structure, which is "
+            "a modelling claim worth making explicitly by leaving it out")
+    if case["limit_state"]["name"] != "resonance_separation":
+        raise FeaError(
+            f"case.point_masses is only read by a modal solve, and this case "
+            f"is {case['limit_state']['name']!r}. A static stress solve under "
+            f"FORCE boundary conditions has no gravity term, so a mass would "
+            f"be silently ignored here - which is how a case that looks like "
+            f"it models the engines stops doing so. Remove the key, or use "
+            f"limit_state 'resonance_separation'")
+    out = []
+    for i, pm in enumerate(spec):
+        if not isinstance(pm, dict):
+            raise FeaError(f"case.point_masses[{i}]: expected a dict")
+        unknown = set(pm) - _POINT_MASS_KEYS
+        if unknown:
+            raise FeaError(
+                f"case.point_masses[{i}]: unexpected keys {sorted(unknown)} — "
+                f"allowed: {sorted(_POINT_MASS_KEYS)}")
+        missing = {"mass_kg", "where", "source"} - set(pm)
+        if missing:
+            raise FeaError(
+                f"case.point_masses[{i}]: missing {sorted(missing)}")
+        kg = pm["mass_kg"]
+        if (not isinstance(kg, (int, float)) or isinstance(kg, bool)
+                or kg <= 0):
+            raise FeaError(
+                f"case.point_masses[{i}].mass_kg: must be > 0, got {kg!r}")
+        src = pm["source"]
+        if not isinstance(src, str) or not src.strip():
+            raise FeaError(
+                f"case.point_masses[{i}].source: required. A non-structural "
+                f"mass divides into every natural frequency exactly as the "
+                f"stiffness does, so it is sourced like E, yield and the HAZ "
+                f"factors — cite the datasheet or the weighing")
+        if not isinstance(pm["where"], dict):
+            raise FeaError(
+                f"case.point_masses[{i}].where: a node selector dict is "
+                f"required")
+        out.append({"name": pm.get("name", f"mass{i}"), "mass_kg": float(kg),
+                    "where": pm["where"], "source": src})
+    names = [o["name"] for o in out]
+    if len(set(names)) != len(names):
+        raise FeaError(
+            f"case.point_masses: duplicate names {sorted(names)} — each is "
+            f"reported by name and two sharing one makes the log ambiguous")
+    return out
 
 
 def check_rigid_body_modes(mesh: dict, constraint_sets: list,
@@ -495,7 +578,7 @@ _SOLVERS = {
 def _write_inp(path: Path, mesh: dict, case: dict,
                constraint_sets: list, load_sets: list,
                analysis: str = "static", n_modes: int = 4,
-               solver: str = "direct") -> None:
+               solver: str = "direct", mass_sets: list | None = None) -> None:
     mat = case["material"]
     lines = ["*HEADING", f"design-engine fea_static, material {mat['name']}",
              "*NODE, NSET=NALL"]
@@ -504,6 +587,39 @@ def _write_inp(path: Path, mesh: dict, case: dict,
     lines.append("*ELEMENT, TYPE=C3D10, ELSET=EALL")
     for eid, row in enumerate(mesh["connectivity"], start=1):
         lines.append(f"{eid}, " + ", ".join(str(t) for t in row))
+
+    # NON-STRUCTURAL MASS, as one single-node MASS element per selected node.
+    #
+    # Numbered on from the last C3D10: a MASS element sharing an id with a
+    # solid one would silently redefine it, and CalculiX would solve the
+    # resulting deck without complaint.
+    #
+    # Only a frequency step gets them. A static solve here applies FORCE
+    # boundary conditions with no gravity, so a mass contributes nothing to
+    # it, and `validate_point_masses` refuses the combination rather than
+    # letting a case look like it models the engines when it does not.
+    mass_cards = []
+    if analysis == "frequency":
+        eid = len(mesh["connectivity"])
+        for i, ms in enumerate(mass_sets or []):
+            tags = list(ms["tags"])
+            if not tags:
+                raise FeaError(
+                    f"point_masses[{i}] ({ms['name']!r}): selector matched 0 "
+                    f"nodes, so {ms['mass_kg']:g} kg would be added nowhere "
+                    f"and the frequencies would come out as the bare "
+                    f"structure's")
+            lines.append(f"*ELEMENT, TYPE=MASS, ELSET=EMASS{i}")
+            for t in tags:
+                eid += 1
+                lines.append(f"{eid}, {t}")
+            # THE UNIT TRAP AGAIN. This deck is mm/N/MPa, so the consistent
+            # mass unit is the tonne: 1 N = 1 t * 1 mm/s^2. A mass in kg fed
+            # straight in makes every frequency wrong by sqrt(1000) = 31.6.
+            # Lumped equally over the matched nodes - a patch is how an engine
+            # actually bolts on, and concentrating it at one node would add a
+            # local mode that is an artefact of the selector.
+            mass_cards.append((i, (ms["mass_kg"] / len(tags)) * 1e-3))
     for i, tags in enumerate(constraint_sets):
         lines.append(f"*NSET, NSET=FIX{i}")
         lines += [", ".join(str(t) for t in tags[j:j + 8])
@@ -528,8 +644,10 @@ def _write_inp(path: Path, mesh: dict, case: dict,
         #   steel 7850 kg/m^3 -> 7.85e-9 t/mm^3
         # With that, eigenfrequencies come out in Hz.
         lines += ["*DENSITY", f"{float(mat['density_kg_m3']) * 1e-12:.9g}"]
-    lines += ["*SOLID SECTION, ELSET=EALL, MATERIAL=MAT",
-              "*STEP"]
+    lines += ["*SOLID SECTION, ELSET=EALL, MATERIAL=MAT"]
+    for i, per_tonne in mass_cards:
+        lines += [f"*MASS, ELSET=EMASS{i}", f"{per_tonne:.9g}"]
+    lines += ["*STEP"]
     if analysis == "buckle":
         # Linear (eigenvalue) buckling. CalculiX returns load MULTIPLIERS on
         # the applied reference load, so the lowest positive factor IS the
@@ -1730,8 +1848,19 @@ class ValidationTools:
 
             symmetry.assert_static_only("frequency",
                                         symmetry.parse(case.get("symmetry")))
+
+            # Non-structural mass. Resolved here rather than in _write_inp so
+            # the node counts land in the log: a selector that drifts off the
+            # geometry would otherwise add the mass somewhere else and report
+            # nothing about it.
+            mass_sets = []
+            for pm in validate_point_masses(case):
+                tags = [int(t) for t in select_nodes(m, pm["where"])]
+                mass_sets.append({**pm, "tags": tags, "nodes": len(tags)})
+
             _write_inp(run_dir / "job.inp", m, case, si.constraint_sets, [],
-                       analysis="frequency", n_modes=n_modes)
+                       analysis="frequency", n_modes=n_modes,
+                       mass_sets=mass_sets)
             # force_single: an eigenvalue solve is never multithreaded here,
             # for the same reason buckling is not. See ccx_MT.
             # require_finished=False: a *FREQUENCY step does not print the
@@ -1797,6 +1926,17 @@ class ValidationTools:
                 "harmonics_checked": [round(f, 4) for f in checked],
                 "harmonic_coverage": coverage,
                 "highest_mode_hz": round(highest_hz, 4),
+                # Present and non-empty only when the case declared one. An
+                # EMPTY list in the log means the run was the bare structure,
+                # and every frequency in it is an upper bound.
+                "point_masses": [
+                    {"name": ms["name"], "mass_kg": ms["mass_kg"],
+                     "nodes": ms["nodes"],
+                     "mass_per_node_kg": round(ms["mass_kg"] / ms["nodes"], 9)
+                     if ms["nodes"] else None,
+                     "source": ms["source"]} for ms in mass_sets],
+                "non_structural_mass_kg": round(
+                    sum(ms["mass_kg"] for ms in mass_sets), 6),
                 "mode_frequencies_hz": [round(f, 4) for f in freqs],
                 "n_modes": len(freqs),
                 "clashes": clashes,
